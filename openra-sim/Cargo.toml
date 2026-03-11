@@ -1,0 +1,9 @@
+[package]
+name = "openra-sim"
+description = "Deterministic OpenRA game simulation engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+openra-data = { path = "../openra-data" }
