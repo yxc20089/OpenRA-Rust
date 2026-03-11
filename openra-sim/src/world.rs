@@ -56,10 +56,18 @@ impl Default for LobbyInfo {
     }
 }
 
+/// A game order parsed from the replay, ready for dispatch.
+#[derive(Debug, Clone)]
+pub struct GameOrder {
+    pub order_string: String,
+    pub subject_id: Option<u32>,
+    pub target_string: Option<String>,
+    pub extra_data: Option<u32>,
+}
+
 /// The game world state.
 pub struct World {
     /// All actors in creation order (ActorID order).
-    /// Includes world actor (ID=0), player actors, and map actors.
     all_actor_ids: Vec<u32>,
     /// Actors with ISync traits, in ActorID order.
     sync_actors: Vec<sync::ActorSync>,
@@ -69,6 +77,29 @@ pub struct World {
     pub rng: MersenneTwister,
     /// Player actor IDs with UnlockedRenderPlayer = true.
     unlocked_render_player_ids: Vec<u32>,
+    /// Whether the world simulation is paused.
+    pub paused: bool,
+    /// Current simulation tick (incremented each unpaused frame).
+    pub world_tick: u32,
+    /// Current frame number (incremented every process_frame call).
+    pub frame_number: u32,
+    /// Network order latency (empty frames before game starts). Default=15.
+    pub order_latency: u32,
+    /// Next actor ID to assign when creating actors.
+    next_actor_id: u32,
+    /// Pending frame-end tasks (actor removals/creations from Transform, etc.)
+    frame_end_tasks: Vec<FrameEndTask>,
+    /// Actor IDs with pending DeployTransform (queued, will execute next tick).
+    pending_deploy: Vec<u32>,
+    /// Actor cell locations (actor_id → (x, y)) for position lookups.
+    actor_locations: std::collections::HashMap<u32, (i32, i32)>,
+}
+
+/// A deferred action to execute at the end of World.Tick().
+#[derive(Debug)]
+enum FrameEndTask {
+    /// Deploy an MCV into a Construction Yard.
+    DeployTransform { old_actor_id: u32, location: (i32, i32) },
 }
 
 impl World {
@@ -127,6 +158,156 @@ impl World {
         eprintln!("RNG_LAST={}", self.rng.last);
         ret = ret.wrapping_add(self.rng.last);
         eprintln!("FINAL ret={}", ret);
+    }
+
+    /// Process one frame of the simulation.
+    ///
+    /// C# execution order per frame:
+    /// 1. Auto-unpause after orderLatency buffer period
+    /// 2. ProcessOrders() — resolve orders from replay
+    /// 3. SyncHash() — computed (this is what the replay records)
+    /// 4. World.Tick() — advance simulation if not paused
+    ///
+    /// Returns the SyncHash as it would be recorded for this frame.
+    pub fn process_frame(&mut self, orders: &[GameOrder]) -> i32 {
+        self.frame_number += 1;
+
+        // Auto-unpause after orderLatency buffer period.
+        // In C#, the server sends orderLatency empty frames before real orders flow.
+        // The world effectively pauses for that period.
+        if self.paused && self.frame_number > self.order_latency {
+            self.paused = false;
+            self.update_debug_pause_state();
+        }
+
+        // 1. Process orders (modifies state before SyncHash)
+        for order in orders {
+            self.process_order(order);
+        }
+
+        // 2. Compute SyncHash (this is what gets verified against replay)
+        let hash = self.sync_hash();
+
+        // 3. Tick the world if not paused
+        if !self.paused {
+            self.world_tick += 1;
+            self.tick_actors();
+            self.execute_frame_end_tasks();
+        }
+
+        hash
+    }
+
+    /// Update DebugPauseState hash in sync_actors (world actor, ID=0).
+    fn update_debug_pause_state(&mut self) {
+        if let Some(world_sync) = self.sync_actors.iter_mut().find(|a| a.actor_id == 0) {
+            // DebugPauseState is the only trait on the world actor (index 0)
+            if !world_sync.trait_hashes.is_empty() {
+                world_sync.trait_hashes[0] = hash_bool(self.paused);
+            }
+        }
+    }
+
+    /// Process a single game order.
+    fn process_order(&mut self, order: &GameOrder) {
+        match order.order_string.as_str() {
+            "PauseGame" => {
+                if let Some(ref ts) = order.target_string {
+                    self.paused = ts == "Pause";
+                }
+            }
+            "DeployTransform" => {
+                if let Some(subject_id) = order.subject_id {
+                    // Queue the transform as an activity on the actor.
+                    // The actual deployment happens when the activity ticks
+                    // and adds a frame-end task.
+                    // For now, find the actor's location and queue the task.
+                    if let Some(loc) = self.find_actor_location(subject_id) {
+                        self.pending_deploy.push(subject_id);
+                        eprintln!("ORDER: DeployTransform subject={} location={:?}", subject_id, loc);
+                    }
+                }
+            }
+            "StartProduction" => {
+                // Production queue order — affects player actor's production state.
+                eprintln!("ORDER: StartProduction subject={:?} item={:?}",
+                    order.subject_id, order.target_string);
+            }
+            "StartGame" | "Command" => {
+                // Lobby/control orders — no simulation effect
+            }
+            other => {
+                eprintln!("ORDER: unhandled '{}' subject={:?}", other, order.subject_id);
+            }
+        }
+    }
+
+    /// Tick all actors (activities and ITick traits).
+    fn tick_actors(&mut self) {
+        // Process pending deployments: queue transform activity.
+        // The transform activity takes 1 tick to resolve (make animation),
+        // then adds a frame-end task to destroy old actor and create new one.
+        let pending: Vec<u32> = self.pending_deploy.drain(..).collect();
+        for actor_id in pending {
+            if let Some(loc) = self.find_actor_location(actor_id) {
+                self.frame_end_tasks.push(FrameEndTask::DeployTransform {
+                    old_actor_id: actor_id,
+                    location: loc,
+                });
+            }
+        }
+    }
+
+    /// Execute frame-end tasks (actor removal/creation from Transform, etc.)
+    fn execute_frame_end_tasks(&mut self) {
+        let tasks: Vec<_> = self.frame_end_tasks.drain(..).collect();
+        for task in tasks {
+            match task {
+                FrameEndTask::DeployTransform { old_actor_id, location } => {
+                    self.deploy_transform(old_actor_id, location);
+                }
+            }
+        }
+    }
+
+    /// Deploy an MCV: remove it and create a Construction Yard.
+    fn deploy_transform(&mut self, mcv_actor_id: u32, location: (i32, i32)) {
+        eprintln!("DEPLOY: removing MCV actor {} at {:?}, creating FACT", mcv_actor_id, location);
+
+        // Remove MCV from actor lists
+        self.all_actor_ids.retain(|&id| id != mcv_actor_id);
+        self.sync_actors.retain(|a| a.actor_id != mcv_actor_id);
+
+        // Create Construction Yard (fact) with new actor ID
+        let fact_id = self.next_actor_id;
+        self.next_actor_id += 1;
+
+        // Insert into actor lists maintaining ActorID sort order
+        let insert_pos = self.all_actor_ids.partition_point(|&id| id < fact_id);
+        self.all_actor_ids.insert(insert_pos, fact_id);
+
+        // FACT ISync traits (construction order):
+        // 1. Building: [VerifySync] CPos TopLeft
+        // 2. Health: [VerifySync] int HP = 70000 (fact HP)
+        // TODO: determine exact trait set and order for FACT
+        let top_left = CPos::new(location.0, location.1);
+        let fact_sync = sync::ActorSync {
+            actor_id: fact_id,
+            trait_hashes: vec![
+                building_sync_hash(top_left),  // Building
+                health_sync_hash(70000),       // Health (FACT has 70000 HP in RA)
+            ],
+        };
+        let sync_pos = self.sync_actors.partition_point(|a| a.actor_id < fact_id);
+        self.sync_actors.insert(sync_pos, fact_sync);
+
+        eprintln!("DEPLOY: created FACT actor {} at {:?}", fact_id, location);
+    }
+
+    /// Find an actor's cell location from its sync trait data.
+    fn find_actor_location(&self, actor_id: u32) -> Option<(i32, i32)> {
+        // Look up the actor in our location map
+        self.actor_locations.get(&actor_id).copied()
     }
 }
 
@@ -447,6 +628,7 @@ pub fn build_world(
     let mut rng = MersenneTwister::new(random_seed);
     let mut all_actor_ids: Vec<u32> = Vec::new();
     let mut sync_actors: Vec<sync::ActorSync> = Vec::new();
+    let mut actor_locations: std::collections::HashMap<u32, (i32, i32)> = std::collections::HashMap::new();
     let mut next_id: u32 = 0;
 
     // === Actor ID 0: World actor ===
@@ -507,6 +689,7 @@ pub fn build_world(
     for actor in &map.actors {
         let id = next_id;
         all_actor_ids.push(id);
+        actor_locations.insert(id, actor.location);
         next_id += 1;
 
         let mut trait_hashes = Vec::new();
@@ -572,6 +755,7 @@ pub fn build_world(
         eprintln!("MCV[{}] spawn=({},{}) facing={}", pi, spawn_x, spawn_y, facing);
         let id = next_id;
         all_actor_ids.push(id);
+        actor_locations.insert(id, (spawn_x, spawn_y));
         sync_actors.push(sync::ActorSync {
             actor_id: id,
             trait_hashes: mcv_trait_hashes(spawn_x, spawn_y, facing),
@@ -585,6 +769,14 @@ pub fn build_world(
         synced_effects: Vec::new(),
         rng,
         unlocked_render_player_ids: Vec::new(),
+        paused: true, // Game starts paused during orderLatency buffer period
+        world_tick: 0,
+        frame_number: 0,
+        order_latency: 15, // Default for "normal" game speed
+        next_actor_id: next_id,
+        frame_end_tasks: Vec::new(),
+        pending_deploy: Vec::new(),
+        actor_locations,
     }
 }
 
