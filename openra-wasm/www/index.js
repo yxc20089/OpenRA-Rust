@@ -401,25 +401,35 @@ async function startGame() {
         const mapIdx = parseInt(document.getElementById('map-select').value) || 0;
         const diff = parseInt(document.getElementById('difficulty-select').value) || 1;
         session = new GameSession(mapIdx, diff);
-        mode = 'game'; humanPlayerId = session.human_player_id();
-        selectedUnits = []; placementMode = null; playing = true;
-        exploredCells = new Set(); // Reset fog of war for new game
-        PLAYER_COLORS[humanPlayerId] = '#4488dd';
-        PLAYER_COLORS[humanPlayerId+1] = '#dd4444';
-        PLAYER_COLORS_RGB[humanPlayerId] = [68,136,221];
-        PLAYER_COLORS_RGB[humanPlayerId+1] = [221,68,68];
-        mapTiles = JSON.parse(session.map_tiles_json());
-        await pregenPlayerSprites(humanPlayerId);
-        await pregenPlayerSprites(humanPlayerId+1);
-        replayControlsEl.style.display = 'none';
-        document.getElementById('cmd-deploy').parentElement.style.display = 'flex';
-        showScreen('game'); resizeCanvas();
-        lastSnapshot = JSON.parse(session.snapshot_json());
-        buildTerrainCanvas(lastSnapshot);
-        centerCamera(lastSnapshot);
-        refreshBuildable();
-        gameLoop();
+        await _initGame();
     } catch (e) { alert(`Failed: ${e}`); }
+}
+
+// Start a bot-vs-bot game (both players are bots, human observes)
+async function startBotVsBot(mapIdx, diff) {
+    session = GameSession.new_bot_vs_bot(mapIdx, diff);
+    await _initGame();
+}
+
+async function _initGame() {
+    mode = 'game'; humanPlayerId = session.human_player_id();
+    selectedUnits = []; placementMode = null; playing = true;
+    exploredCells = new Set();
+    PLAYER_COLORS[humanPlayerId] = '#4488dd';
+    PLAYER_COLORS[humanPlayerId+1] = '#dd4444';
+    PLAYER_COLORS_RGB[humanPlayerId] = [68,136,221];
+    PLAYER_COLORS_RGB[humanPlayerId+1] = [221,68,68];
+    mapTiles = JSON.parse(session.map_tiles_json());
+    await pregenPlayerSprites(humanPlayerId);
+    await pregenPlayerSprites(humanPlayerId+1);
+    replayControlsEl.style.display = 'none';
+    document.getElementById('cmd-deploy').parentElement.style.display = 'flex';
+    showScreen('game'); resizeCanvas();
+    lastSnapshot = JSON.parse(session.snapshot_json());
+    buildTerrainCanvas(lastSnapshot);
+    centerCamera(lastSnapshot);
+    refreshBuildable();
+    gameLoop();
 }
 
 function centerCamera(snapshot) {
@@ -1279,29 +1289,27 @@ function drawResources(snapshot) {
         const sx = res.x * cellPx - camX, sy = res.y * cellPx - camY;
         if (sx + cellPx < 0 || sx > canvas.width || sy + cellPx < 0 || sy > canvas.height) continue;
         const d = res.density || 1;
+        // Select sprite sequence based on density (1-3→01, 4-6→02, 7-9→03, 10-12→04)
+        const seqIdx = Math.min(Math.ceil(d / 3), 4);
+        const seqNum = seqIdx.toString().padStart(2, '0');
+        const prefix = res.kind === 1 ? 'gold' : 'gem';
+        const spriteName = `ter:${prefix}${seqNum}.tem`;
+        const frames = spriteImages[spriteName];
+        if (frames && frames.length > 0) {
+            // Pick frame based on cell position for variety
+            const fi = ((res.x * 7 + res.y * 13) & 0x7FFFFFFF) % frames.length;
+            if (frames[fi]) {
+                ctx.drawImage(frames[fi], sx, sy, cellPx, cellPx);
+                continue;
+            }
+        }
+        // Fallback: simple colored rectangle if sprites not loaded
         if (res.kind === 1) {
-            // Ore: golden-brown specks, density affects count and opacity
-            ctx.fillStyle = `rgba(160,128,32,${0.15 + d * 0.05})`;
+            ctx.fillStyle = `rgba(160,128,32,${0.2 + d * 0.04})`;
             ctx.fillRect(sx + 1, sy + 1, cellPx - 2, cellPx - 2);
-            ctx.fillStyle = '#c8a020';
-            const seed = res.x * 31 + res.y * 17;
-            for (let i = 0; i < Math.min(d, 6); i++) {
-                const ox = ((seed + i * 7) % (cellPx - 4)) + 2;
-                const oy = ((seed + i * 13) % (cellPx - 4)) + 2;
-                const sz = d > 6 ? 3 : 2;
-                ctx.fillRect(sx + ox, sy + oy, sz, sz);
-            }
         } else {
-            // Gems: purple/blue specks
-            ctx.fillStyle = `rgba(100,40,180,${0.15 + d * 0.06})`;
+            ctx.fillStyle = `rgba(100,40,180,${0.2 + d * 0.05})`;
             ctx.fillRect(sx + 1, sy + 1, cellPx - 2, cellPx - 2);
-            ctx.fillStyle = '#c060e0';
-            const seed = res.x * 23 + res.y * 11;
-            for (let i = 0; i < Math.min(d, 4); i++) {
-                const ox = ((seed + i * 9) % (cellPx - 4)) + 2;
-                const oy = ((seed + i * 11) % (cellPx - 4)) + 2;
-                ctx.fillRect(sx + ox, sy + oy, 3, 3);
-            }
         }
     }
 }
@@ -1709,8 +1717,9 @@ function drawSelectionBrackets(a) {
         sx = a.x * cellPx - camX; sy = a.y * cellPx - camY;
         bw = fp[0] * cellPx; bh = fp[1] * cellPx;
     } else {
-        // Use cell bounds for units
-        sx = a.x * cellPx - camX; sy = a.y * cellPx - camY;
+        // Use sub-cell center position for smooth tracking during movement
+        sx = (a.cx !== undefined ? a.cx * cellPx / 1024 : a.x * cellPx) - camX;
+        sy = (a.cy !== undefined ? a.cy * cellPx / 1024 : a.y * cellPx) - camY;
         bw = cellPx; bh = cellPx;
     }
 
@@ -1975,5 +1984,8 @@ Object.defineProperties(window, {
         selectedUnits, placementMode, commandMode, controlGroups,
         gamePaused, buildableItems, exploredCells: exploredCells.size,
         activeEffects, buildAnims, sellAnims,
+        startBotVsBot, render, updateHUD, centerCamera, GameSession, spriteInfo,
+        setCam: (x, y) => { camX = x; camY = y; },
+        setFog: (on) => { if (!on) humanPlayerId = null; },
     }) },
 });

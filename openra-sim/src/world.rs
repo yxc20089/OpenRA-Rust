@@ -338,6 +338,22 @@ impl World {
         None
     }
 
+    /// Find all enemy actors (id, x, y) for a player.
+    pub fn find_enemy_actors(&self, player_id: u32) -> Vec<(u32, i32, i32)> {
+        self.actors.values()
+            .filter(|a| {
+                if let Some(owner) = a.owner_id {
+                    owner != player_id
+                        && owner != 1 && owner != 2 // skip World, Neutral
+                        && matches!(a.kind, ActorKind::Building | ActorKind::Infantry | ActorKind::Vehicle | ActorKind::Mcv)
+                } else {
+                    false
+                }
+            })
+            .filter_map(|a| a.location.map(|(x, y)| (a.id, x, y)))
+            .collect()
+    }
+
     /// Compute SyncHash components separately for debugging.
     pub fn sync_hash_debug(&self) -> SyncHashDebug {
         let actor_ids: Vec<u32> = self.actors.keys().copied().collect();
@@ -739,10 +755,10 @@ impl World {
                         current_facing
                     };
                     if current_facing != desired_facing {
-                        // Turn first, then move
+                        // Turn first, then move (C# default TurnSpeed: 20)
                         actor.activity = Some(Activity::Turn {
                             target: desired_facing,
-                            speed: 128, // ~45 degrees per tick (matching C# TurnSpeed)
+                            speed: 20,
                             then: Some(Box::new(move_activity)),
                         });
                     } else {
@@ -1527,6 +1543,7 @@ impl World {
 
         // Tick Move activities: advance position along path.
         let mut move_completions: Vec<u32> = Vec::new();
+        let mut turn_before_move: Vec<u32> = Vec::new();
         let mut occupancy_updates: Vec<(u32, (i32, i32), (i32, i32))> = Vec::new(); // (id, from, to)
         for actor in self.actors.values_mut() {
             if let Some(Activity::Move { ref path, ref mut path_index, speed }) = actor.activity {
@@ -1537,23 +1554,20 @@ impl World {
                 let target_cell = path[*path_index];
                 let target_center = center_of_cell(target_cell.0, target_cell.1);
 
-                // Update facing during movement for path direction changes
+                // C# TurnsWhileMoving=false: at each path cell, if facing doesn't
+                // match the next segment, stop and Turn in place first.
+                // Reference: OpenRA Move.cs lines 207-213.
                 if let Some(current_loc) = actor.location {
                     let desired_facing = pathfinder::facing_between(current_loc, target_cell);
-                    for t in &mut actor.traits {
-                        if let TraitState::Mobile { facing, .. } = t {
-                            // Smooth turn: move facing toward desired by turn_speed per tick
-                            let turn_speed = 128; // ~45 degrees per tick
-                            let diff = ((desired_facing - *facing) + 1024) % 1024;
-                            if diff != 0 {
-                                if diff <= 512 {
-                                    *facing = (*facing + diff.min(turn_speed)) % 1024;
-                                } else {
-                                    *facing = (*facing + 1024 - (1024 - diff).min(turn_speed)) % 1024;
-                                }
-                            }
-                            break;
-                        }
+                    let current_facing = actor.traits.iter()
+                        .find_map(|t| {
+                            if let TraitState::Mobile { facing, .. } = t { Some(*facing) } else { None }
+                        })
+                        .unwrap_or(0);
+                    if current_facing != desired_facing {
+                        // Need to turn first — convert Move to Turn→Move
+                        turn_before_move.push(actor.id);
+                        continue;
                     }
                 }
 
@@ -1613,6 +1627,24 @@ impl World {
         for (actor_id, from, to) in occupancy_updates {
             self.terrain.clear_occupant(from.0, from.1);
             self.terrain.set_occupant(to.0, to.1, actor_id);
+        }
+        // Convert Move→Turn→Move for actors needing to turn at a direction change
+        for id in turn_before_move {
+            if let Some(actor) = self.actors.get_mut(&id) {
+                if let Some(Activity::Move { ref path, path_index, .. }) = actor.activity {
+                    if path_index < path.len() {
+                        let target_cell = path[path_index];
+                        let from = actor.location.unwrap_or((0, 0));
+                        let desired_facing = pathfinder::facing_between(from, target_cell);
+                        let move_activity = actor.activity.take().unwrap();
+                        actor.activity = Some(Activity::Turn {
+                            target: desired_facing,
+                            speed: 20,
+                            then: Some(Box::new(move_activity)),
+                        });
+                    }
+                }
+            }
         }
         // Clear completed Move activities
         for id in move_completions {
@@ -2227,6 +2259,100 @@ impl World {
     pub fn player_ids(&self) -> &[u32] {
         &self.player_actor_ids
     }
+
+    /// Find the MCV actor ID for a player (if any).
+    pub fn player_mcv(&self, player_id: u32) -> Option<u32> {
+        self.actors.values()
+            .find(|a| a.owner_id == Some(player_id) && a.kind == ActorKind::Mcv)
+            .map(|a| a.id)
+    }
+
+    /// Check if a player has a construction yard (fact).
+    pub fn player_has_conyard(&self, player_id: u32) -> bool {
+        self.actors.values().any(|a| {
+            a.owner_id == Some(player_id)
+                && a.kind == ActorKind::Building
+                && a.actor_type.as_deref() == Some("fact")
+        })
+    }
+
+    /// Check if a player has any items currently in production (not yet complete).
+    pub fn player_has_pending_production(&self, player_id: u32) -> bool {
+        if let Some(items) = self.production.get(&player_id) {
+            items.iter().any(|item| !item.is_done())
+        } else {
+            false
+        }
+    }
+
+    /// Get the first completed building in the production queue awaiting placement.
+    pub fn player_ready_building(&self, player_id: u32) -> Option<String> {
+        if let Some(items) = self.production.get(&player_id) {
+            for item in items {
+                if item.is_done() {
+                    return Some(item.item_name.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Find a valid placement location for a building near the player's base.
+    /// Searches in a spiral around existing buildings.
+    pub fn find_placement_location(&self, player_id: u32, building_type: &str) -> Option<(i32, i32)> {
+        let (fw, fh, _) = match self.rules.actor(building_type) {
+            Some(s) => (s.footprint.0, s.footprint.1, s.hp),
+            None => return None,
+        };
+
+        // Find center of player's buildings
+        let buildings: Vec<(i32, i32)> = self.actors.values()
+            .filter(|a| a.owner_id == Some(player_id) && a.kind == ActorKind::Building)
+            .filter_map(|a| a.location)
+            .collect();
+
+        if buildings.is_empty() {
+            return None;
+        }
+
+        let cx = buildings.iter().map(|b| b.0).sum::<i32>() / buildings.len() as i32;
+        let cy = buildings.iter().map(|b| b.1).sum::<i32>() / buildings.len() as i32;
+
+        // Spiral search around base center
+        for radius in 1i32..15 {
+            for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    if dx.abs() != radius && dy.abs() != radius {
+                        continue; // only check perimeter of each ring
+                    }
+                    let x = cx + dx;
+                    let y = cy + dy;
+                    if self.can_place_building(player_id, building_type, x, y) {
+                        return Some((x, y));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Get actor location.
+    pub fn actor_location(&self, actor_id: u32) -> Option<(i32, i32)> {
+        self.actors.get(&actor_id).and_then(|a| a.location)
+    }
+
+    /// Get actor activity name (for AI decision making).
+    pub fn actor_activity(&self, actor_id: u32) -> Option<&str> {
+        self.actors.get(&actor_id).map(|a| {
+            match &a.activity {
+                None => "idle",
+                Some(Activity::Move { .. }) => "moving",
+                Some(Activity::Turn { .. }) => "turning",
+                Some(Activity::Attack { .. }) => "attacking",
+                _ => "other",
+            }
+        })
+    }
 }
 
 /// Tick facing toward target by step, matching C#'s Util.TickFacing(WAngle).
@@ -2756,44 +2882,39 @@ mod tests {
 
     /// C#'s Util.TickFacing: advance facing toward desired by step.
     /// Reference: OpenRA.Mods.Common/Util.cs lines 52-63.
+    /// OpenRA facings are counter-clockwise: 0=N, 128=NW, 256=W, 384=SW,
+    /// 512=S, 640=SE, 768=E, 896=NE.
     #[test]
     fn tick_facing_matches_csharp() {
-        // Turning right from North(0) toward East(256) at speed 128:
-        // C#: rightTurn=(256-0)&1023=256, leftTurn=(0-256)&1023=768
-        //     rightTurn < leftTurn => facing = (0 + 128) = 128
+        // Turning from North(0) toward West(256) at speed 128:
+        // rightTurn=(256-0)&1023=256, leftTurn=(0-256)&1023=768
+        // rightTurn < leftTurn => facing = (0 + 128) = 128 (NW)
         assert_eq!(tick_facing(0, 256, 128), 128);
 
         // Second tick: from 128 toward 256 at speed 128
-        // rightTurn=(256-128)&1023=128 < 128? No (not strictly less). leftTurn=896.
-        // rightTurn < leftTurn => (128+128)=256
         assert_eq!(tick_facing(128, 256, 128), 256);
 
-        // Turning left from South(512) toward East(256) at speed 128:
+        // Turning from South(512) toward West(256) at speed 128:
         // rightTurn=(256-512)&1023=768, leftTurn=(512-256)&1023=256
-        // rightTurn(768) >= leftTurn(256) => facing = (512 - 128) = 384
+        // rightTurn >= leftTurn => (512-128)=384 (SW)
         assert_eq!(tick_facing(512, 256, 128), 384);
 
-        // Continue: from 384 toward 256 at speed 128
-        // rightTurn=(256-384)&1023=896, leftTurn=(384-256)&1023=128 < 128? No.
-        // rightTurn >= leftTurn => (384-128)=256
+        // Continue: from 384 toward 256
         assert_eq!(tick_facing(384, 256, 128), 256);
 
-        // Already at target — should return target
+        // Already at target
         assert_eq!(tick_facing(256, 256, 128), 256);
 
-        // Close enough to snap: from 250 toward 256 at speed 128
-        // rightTurn=6, leftTurn=1018. rightTurn < step => return desired
+        // Close enough to snap
         assert_eq!(tick_facing(250, 256, 128), 256);
     }
 
-    /// C#'s ClassicIndexFacing for 32-frame sprites.
-    /// Reference: OpenRA.Mods.Cnc/Util.cs SpriteRanges table.
+    /// C#'s ClassicIndexFacing maps facing angles to sprite frames.
+    /// SHP frames go clockwise: 0=N, 4=NE, 8=E, 12=SE, 16=S, 20=SW, 24=W, 28=NW.
+    /// But OpenRA facings go counter-clockwise: 0=N, 128=NW, 256=W, etc.
+    /// So facing 128(NW) → frame 28, facing 768(East) → frame 8.
     #[test]
     fn classic_index_facing_matches_csharp() {
-        // SpriteRanges: [20, 56, 88, 132, 156, 184, 212, 240,
-        //                268, 296, 324, 352, 384, 416, 452, 488,
-        //                532, 568, 604, 644, 668, 696, 724, 752,
-        //                780, 808, 836, 864, 896, 928, 964, 1000]
         let ranges = [
             20, 56, 88, 132, 156, 184, 212, 240,
             268, 296, 324, 352, 384, 416, 452, 488,
@@ -2805,22 +2926,22 @@ mod tests {
             for (i, &r) in ranges.iter().enumerate() {
                 if angle < r as usize { return i; }
             }
-            0 // wraps: 1000-1023 → frame 0
+            0
         };
 
-        // Cardinal directions
-        assert_eq!(classic_index(0), 0, "North → frame 0");
-        assert_eq!(classic_index(256), 8, "East → frame 8");
-        assert_eq!(classic_index(512), 16, "South → frame 16");
-        assert_eq!(classic_index(768), 24, "West → frame 24");
+        // Cardinal directions (CCW facings → CW sprite frames)
+        assert_eq!(classic_index(0), 0, "North(0) → frame 0");
+        assert_eq!(classic_index(256), 8, "West(256) → frame 8");
+        assert_eq!(classic_index(512), 16, "South(512) → frame 16");
+        assert_eq!(classic_index(768), 24, "East(768) → frame 24");
 
         // Diagonal directions
-        assert_eq!(classic_index(128), 3, "NE → frame 3");
-        assert_eq!(classic_index(384), 13, "SE → frame 13");
-        assert_eq!(classic_index(640), 19, "SW → frame 19");
-        assert_eq!(classic_index(896), 29, "NW → frame 29");
+        assert_eq!(classic_index(128), 3, "NW(128) → frame 3");
+        assert_eq!(classic_index(384), 13, "SW(384) → frame 13");
+        assert_eq!(classic_index(640), 19, "SE(640) → frame 19");
+        assert_eq!(classic_index(896), 29, "NE(896) → frame 29");
 
-        // Edge cases: wrap-around
+        // Edge cases
         assert_eq!(classic_index(1000), 0, "facing 1000 wraps to frame 0");
         assert_eq!(classic_index(1023), 0, "facing 1023 wraps to frame 0");
         assert_eq!(classic_index(19), 0, "facing 19 still frame 0");
@@ -2829,51 +2950,44 @@ mod tests {
 
     /// Verify Turn-then-Move: unit facing South ordered to move East.
     /// C# behavior: Turn in place first (TurnsWhileMoving=false), then Move.
-    /// Turn speed = 128 per tick. South(512) → East(256) = 256 angular distance.
-    /// Shortest turn is counter-clockwise (left): 512 → 384 → 256 (2 ticks).
+    /// South=512, East=768. Shortest turn is clockwise (right): 512→640→768 (2 ticks).
     #[test]
     fn turn_before_move_trajectory() {
-        // Simulate the turn from South to East at speed 128
-        let mut facing = 512;
-        let target = 256;
+        let mut facing = 512; // South
+        let target = 768;     // East
         let speed = 128;
 
-        // Tick 1: 512 → 384
+        // Tick 1: 512 → 640 (SE)
         facing = tick_facing(facing, target, speed);
-        assert_eq!(facing, 384, "Tick 1: should turn left from 512 to 384");
+        assert_eq!(facing, 640, "Tick 1: should turn right from South(512) to SE(640)");
 
-        // Tick 2: 384 → 256
+        // Tick 2: 640 → 768 (East)
         facing = tick_facing(facing, target, speed);
-        assert_eq!(facing, 256, "Tick 2: should reach target 256 (East)");
-
-        // Now the Move activity starts — unit is already facing East
-        // Position advances by speed world units per tick along the path
+        assert_eq!(facing, 768, "Tick 2: should reach target East(768)");
     }
 
-    /// Full trajectory test: unit at (5,5) facing South(512), ordered to move East to (10,5).
-    /// Expected: Turn 2 ticks, then Move at 56 wu/tick (MCV default speed).
+    /// Full trajectory test: unit at (5,5) facing South(512), ordered to move East to (6,5).
+    /// East = 768 in counter-clockwise convention.
     #[test]
     fn trajectory_east_move() {
         let start = (5, 5);
-        let target_cell = (6, 5); // first path cell after start
-        let speed = 56; // typical MCV speed in world units/tick
+        let target_cell = (6, 5);
+        let speed = 56;
 
-        // Verify facing_between
+        // Verify facing_between gives East=768
         let desired = pathfinder::facing_between(start, target_cell);
-        assert_eq!(desired, 256, "Facing from (5,5) to (6,5) should be East(256)");
+        assert_eq!(desired, 768, "Facing from (5,5) to (6,5) should be East(768)");
 
         // Verify movement interpolation
         let from_center = center_of_cell(5, 5);
         let to_center = center_of_cell(6, 5);
         assert_eq!(from_center.x, 5 * 1024 + 512);
         assert_eq!(to_center.x, 6 * 1024 + 512);
-        let total_dist = 1024; // ortho = 1024 world units
+        let total_dist = 1024;
 
-        // After 1 tick at speed 56: progress = 56/1024 of the way
         let cx_tick1 = from_center.x + (1024i64 * 56 / 1024) as i32;
         assert_eq!(cx_tick1, from_center.x + 56, "CX after 1 tick");
 
-        // Ticks to cross one cell: ceil(1024 / 56) = 19 ticks
         let ticks_per_cell = (total_dist + speed - 1) / speed;
         assert_eq!(ticks_per_cell, 19, "MCV takes 19 ticks to cross one cell");
     }

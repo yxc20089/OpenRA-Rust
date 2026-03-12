@@ -1,6 +1,6 @@
 //! Simple bot AI for Red Alert.
 //!
-//! Generates orders each tick: builds power, barracks, war factory,
+//! Generates orders each tick: deploys MCV, builds power, barracks, war factory,
 //! produces units, sends them to attack. Roughly based on OpenRA's
 //! HackyAI bot modules.
 
@@ -34,6 +34,8 @@ pub struct Bot {
     ticks_idle: u32,
     /// Current strategic state.
     state: BotState,
+    /// Whether we've deployed our MCV.
+    mcv_deployed: bool,
     /// Whether we've placed our first power plant.
     has_power: bool,
     /// Whether we've queued barracks.
@@ -58,6 +60,8 @@ pub struct Bot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BotState {
+    /// Deploy MCV first.
+    DeployMcv,
     /// Building up base infrastructure.
     BuildUp,
     /// Producing army units.
@@ -73,14 +77,15 @@ impl Bot {
 
     pub fn new_with_difficulty(player_id: u32, difficulty: Difficulty) -> Self {
         let (tick_interval, attack_threshold) = match difficulty {
-            Difficulty::Easy => (45, 5),
-            Difficulty::Medium => (30, 8),
-            Difficulty::Hard => (15, 6),
+            Difficulty::Easy => (45, 4),
+            Difficulty::Medium => (30, 3),
+            Difficulty::Hard => (15, 3),
         };
         Bot {
             player_id,
             ticks_idle: 0,
-            state: BotState::BuildUp,
+            state: BotState::DeployMcv,
+            mcv_deployed: false,
             has_power: false,
             has_barracks: false,
             has_war_factory: false,
@@ -104,7 +109,13 @@ impl Bot {
         }
         self.ticks_idle = 0;
 
+        // Always try to place ready buildings first
+        self.try_place_buildings(world, &mut orders);
+
         match self.state {
+            BotState::DeployMcv => {
+                self.do_deploy_mcv(world, &mut orders);
+            }
             BotState::BuildUp => {
                 self.do_build_up(world, &mut orders);
             }
@@ -119,118 +130,119 @@ impl Bot {
         orders
     }
 
+    fn do_deploy_mcv(&mut self, world: &World, orders: &mut Vec<GameOrder>) {
+        // Check if we already have a conyard
+        if world.player_has_conyard(self.player_id) {
+            self.mcv_deployed = true;
+            self.state = BotState::BuildUp;
+            return;
+        }
+
+        // Find our MCV and deploy it
+        if let Some(mcv_id) = world.player_mcv(self.player_id) {
+            orders.push(GameOrder {
+                order_string: "DeployTransform".to_string(),
+                subject_id: Some(mcv_id),
+                target_string: None,
+                extra_data: None,
+            });
+            self.mcv_deployed = true;
+            // Wait a few ticks then transition to BuildUp
+            self.state = BotState::BuildUp;
+        }
+    }
+
+    fn try_place_buildings(&mut self, world: &World, orders: &mut Vec<GameOrder>) {
+        // Check if there's a completed building waiting to be placed
+        if let Some(building_type) = world.player_ready_building(self.player_id) {
+            if let Some((x, y)) = world.find_placement_location(self.player_id, &building_type) {
+                orders.push(GameOrder {
+                    order_string: "PlaceBuilding".to_string(),
+                    subject_id: Some(self.player_id),
+                    target_string: Some(format!("{},{},{}", building_type, x, y)),
+                    extra_data: None,
+                });
+            }
+        }
+    }
+
     fn do_build_up(&mut self, world: &World, orders: &mut Vec<GameOrder>) {
         let cash = self.player_cash(world);
 
-        // Check what buildings we have
+        // Wait for conyard before building
+        if !world.player_has_conyard(self.player_id) {
+            if world.player_mcv(self.player_id).is_some() {
+                self.state = BotState::DeployMcv;
+            }
+            return;
+        }
+
+        // Don't queue if there's already something in production or waiting to be placed
+        if world.player_ready_building(self.player_id).is_some() {
+            return;
+        }
+        if world.player_has_pending_production(self.player_id) {
+            return;
+        }
+
+        // Check what buildings we actually have placed
         self.survey_buildings(world);
 
+        // Build order: powr(300) → tent(400) → produce some units → weap(2000) if affordable
         if !self.has_power && cash >= 300 {
-            orders.push(GameOrder {
-                order_string: "StartProduction".to_string(),
-                subject_id: Some(self.player_id),
-                target_string: Some("powr".to_string()),
-                extra_data: None,
-            });
-            self.has_power = true;
+            self.queue_building(orders, "powr");
             return;
         }
 
         if self.has_power && !self.has_barracks && cash >= 400 {
-            orders.push(GameOrder {
-                order_string: "StartProduction".to_string(),
-                subject_id: Some(self.player_id),
-                target_string: Some("barr".to_string()),
-                extra_data: None,
-            });
-            self.has_barracks = true;
+            self.queue_building(orders, "tent");
             return;
         }
 
-        if self.has_barracks && !self.has_refinery && cash >= 1400 {
-            orders.push(GameOrder {
-                order_string: "StartProduction".to_string(),
-                subject_id: Some(self.player_id),
-                target_string: Some("proc".to_string()),
-                extra_data: None,
-            });
-            self.has_refinery = true;
-            return;
-        }
-
-        if self.has_refinery && !self.has_war_factory && cash >= 2000 {
-            orders.push(GameOrder {
-                order_string: "StartProduction".to_string(),
-                subject_id: Some(self.player_id),
-                target_string: Some("weap".to_string()),
-                extra_data: None,
-            });
-            self.has_war_factory = true;
-            return;
-        }
-
-        // Medium/Hard: build radar dome
-        if self.difficulty != Difficulty::Easy && self.has_war_factory && !self.has_radar && cash >= 1000 {
-            orders.push(GameOrder {
-                order_string: "StartProduction".to_string(),
-                subject_id: Some(self.player_id),
-                target_string: Some("dome".to_string()),
-                extra_data: None,
-            });
-            self.has_radar = true;
-            return;
-        }
-
-        // Medium/Hard: build defenses
-        if self.difficulty != Difficulty::Easy && self.has_barracks && self.defenses_built < 2 && cash >= 600 {
-            let defense = if self.defenses_built == 0 { "gun" } else { "sam" };
-            orders.push(GameOrder {
-                order_string: "StartProduction".to_string(),
-                subject_id: Some(self.player_id),
-                target_string: Some(defense.to_string()),
-                extra_data: None,
-            });
-            self.defenses_built += 1;
-            return;
-        }
-
-        // Once we have basic infrastructure, switch to producing
+        // Once we have barracks, switch to producing units
+        // We'll build weap later if we get more cash
         if self.has_power && self.has_barracks {
             self.state = BotState::Producing;
         }
     }
 
+    fn queue_building(&self, orders: &mut Vec<GameOrder>, building_type: &str) {
+        orders.push(GameOrder {
+            order_string: "StartProduction".to_string(),
+            subject_id: Some(self.player_id),
+            target_string: Some(building_type.to_string()),
+            extra_data: None,
+        });
+    }
+
     fn do_produce(&mut self, world: &World, orders: &mut Vec<GameOrder>) {
         let cash = self.player_cash(world);
 
-        // Diversify units based on difficulty
-        let unit = match self.difficulty {
-            Difficulty::Easy => {
-                if self.has_war_factory && cash >= 800 { "2tnk" }
-                else if cash >= 100 { "e1" }
-                else { return; }
+        // Don't produce if something is already in production
+        if world.player_has_pending_production(self.player_id) {
+            return;
+        }
+
+        // Re-survey buildings in case they were destroyed
+        self.survey_buildings(world);
+
+        // Build war factory if we can afford it and don't have one
+        if !self.has_war_factory && cash >= 2000 {
+            if !world.player_ready_building(self.player_id).is_some() {
+                self.queue_building(orders, "weap");
+                return;
             }
-            Difficulty::Medium => {
-                // Cycle through unit types
-                match self.units_produced % 4 {
-                    0 if self.has_war_factory && cash >= 800 => "2tnk",
-                    1 if self.has_war_factory && cash >= 700 => "1tnk",
-                    2 if cash >= 300 => "e3",  // Rocket soldier
-                    _ if cash >= 100 => "e1",
-                    _ => return,
-                }
-            }
-            Difficulty::Hard => {
-                match self.units_produced % 6 {
-                    0 if self.has_war_factory && cash >= 800 => "2tnk",
-                    1 if self.has_war_factory && cash >= 950 => "3tnk",
-                    2 if self.has_war_factory && cash >= 600 => "v2rl",
-                    3 if cash >= 300 => "e3",
-                    4 if cash >= 500 => "e4",  // Flamethrower
-                    _ if cash >= 100 => "e1",
-                    _ => return,
-                }
-            }
+        }
+
+        // Produce units — prioritize cheap infantry to get attacking quickly
+        let unit = if self.has_war_factory && cash >= 800 && self.units_produced % 3 == 0 {
+            "2tnk"
+        } else if self.has_barracks && cash >= 300 && self.units_produced % 2 == 1 {
+            "e3"
+        } else if self.has_barracks && cash >= 100 {
+            "e1"
+        } else {
+            return;
         };
 
         orders.push(GameOrder {
@@ -262,37 +274,69 @@ impl Bot {
 
     fn do_attack(&mut self, world: &World, orders: &mut Vec<GameOrder>) {
         // Find enemy actors to attack
-        let enemy_target = self.find_enemy_target(world);
-        if let Some((target_x, target_y)) = enemy_target {
-            // Send all our military units to attack
-            let our_units: Vec<u32> = world.actor_ids_for_player(self.player_id)
-                .into_iter()
-                .filter(|&id| {
-                    world.actor_kind(id).map(|k| {
-                        matches!(k, ActorKind::Infantry | ActorKind::Vehicle)
-                    }).unwrap_or(false)
-                })
-                .collect();
+        let enemies = world.find_enemy_actors(self.player_id);
+        if enemies.is_empty() {
+            // No enemies found, go back to producing
+            self.state = BotState::Producing;
+            return;
+        }
 
-            for unit_id in our_units {
-                orders.push(GameOrder {
-                    order_string: "AttackMove".to_string(),
-                    subject_id: Some(unit_id),
-                    target_string: Some(format!("{},{}", target_x, target_y)),
-                    extra_data: None,
-                });
+        let our_units: Vec<u32> = world.actor_ids_for_player(self.player_id)
+            .into_iter()
+            .filter(|&id| {
+                world.actor_kind(id).map(|k| {
+                    matches!(k, ActorKind::Infantry | ActorKind::Vehicle)
+                }).unwrap_or(false)
+            })
+            .collect();
+
+        // First, move units toward enemy base
+        if let Some(enemy_loc) = world.find_enemy_location(self.player_id) {
+            for &unit_id in &our_units {
+                // Check if unit is close to any enemy — if so, attack directly
+                let unit_loc = world.actor_location(unit_id).unwrap_or((0, 0));
+                let mut attacked = false;
+                for &(enemy_id, enemy_x, enemy_y) in &enemies {
+                    let dist = (unit_loc.0 - enemy_x).abs() + (unit_loc.1 - enemy_y).abs();
+                    if dist <= 8 {
+                        // Close enough — attack this enemy
+                        orders.push(GameOrder {
+                            order_string: "Attack".to_string(),
+                            subject_id: Some(unit_id),
+                            target_string: None,
+                            extra_data: Some(enemy_id),
+                        });
+                        attacked = true;
+                        break;
+                    }
+                }
+                if !attacked {
+                    // Move toward enemy base
+                    orders.push(GameOrder {
+                        order_string: "Move".to_string(),
+                        subject_id: Some(unit_id),
+                        target_string: Some(format!("{},{}", enemy_loc.0, enemy_loc.1)),
+                        extra_data: None,
+                    });
+                }
             }
         }
 
-        // Go back to producing after attack
-        self.units_produced = 0;
-        let wave_increase = match self.difficulty {
-            Difficulty::Easy => 2,
-            Difficulty::Medium => 3,
-            Difficulty::Hard => 2, // Hard attacks more often with more units
-        };
-        self.attack_threshold += wave_increase;
-        self.state = BotState::Producing;
+        // Check if our units are all idle (attack wave done)
+        let all_idle = our_units.iter().all(|&id| {
+            world.actor_activity(id).map(|a| a == "idle").unwrap_or(true)
+        });
+        if all_idle && !our_units.is_empty() {
+            // Attack wave complete, go back to producing
+            self.units_produced = 0;
+            let wave_increase = match self.difficulty {
+                Difficulty::Easy => 2,
+                Difficulty::Medium => 2,
+                Difficulty::Hard => 1,
+            };
+            self.attack_threshold += wave_increase;
+            self.state = BotState::Producing;
+        }
     }
 
     fn player_cash(&self, world: &World) -> i32 {
@@ -309,7 +353,6 @@ impl Bot {
     }
 
     fn find_enemy_target(&self, world: &World) -> Option<(i32, i32)> {
-        // Find any enemy unit or building location
         world.find_enemy_location(self.player_id)
     }
 }

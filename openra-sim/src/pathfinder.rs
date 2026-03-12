@@ -167,19 +167,21 @@ pub fn find_path(
 
 /// Compute the WAngle facing from cell `from` to cell `to`.
 ///
-/// OpenRA uses 0-1023 angles: 0=North, 256=East, 512=South, 768=West.
+/// OpenRA WAngle: 0-1023 angles, counter-clockwise:
+/// 0=North, 128=NW, 256=West, 384=SW, 512=South, 640=SE, 768=East, 896=NE.
+/// Reference: OpenRA AngleGlobal.cs
 pub fn facing_between(from: (i32, i32), to: (i32, i32)) -> i32 {
     let dx = (to.0 - from.0).signum();
     let dy = (to.1 - from.1).signum();
     match (dx, dy) {
         (0, -1) => 0,     // North
-        (1, -1) => 128,   // NE
-        (1, 0) => 256,    // East
-        (1, 1) => 384,    // SE
+        (-1, -1) => 128,  // NW
+        (-1, 0) => 256,   // West
+        (-1, 1) => 384,   // SW
         (0, 1) => 512,    // South
-        (-1, 1) => 640,   // SW
-        (-1, 0) => 768,   // West
-        (-1, -1) => 896,  // NW
+        (1, 1) => 640,    // SE
+        (1, 0) => 768,    // East
+        (1, -1) => 896,   // NE
         _ => 0,
     }
 }
@@ -239,13 +241,14 @@ mod tests {
 
     #[test]
     fn facing_directions() {
+        // Counter-clockwise convention: 0=N, 128=NW, 256=W, 384=SW, 512=S, 640=SE, 768=E, 896=NE
         assert_eq!(facing_between((5, 5), (5, 4)), 0);    // North
-        assert_eq!(facing_between((5, 5), (6, 4)), 128);  // NE
-        assert_eq!(facing_between((5, 5), (6, 5)), 256);  // East
-        assert_eq!(facing_between((5, 5), (6, 6)), 384);  // SE
+        assert_eq!(facing_between((5, 5), (6, 4)), 896);  // NE
+        assert_eq!(facing_between((5, 5), (6, 5)), 768);  // East
+        assert_eq!(facing_between((5, 5), (6, 6)), 640);  // SE
         assert_eq!(facing_between((5, 5), (5, 6)), 512);  // South
-        assert_eq!(facing_between((5, 5), (4, 6)), 640);  // SW
-        assert_eq!(facing_between((5, 5), (4, 5)), 768);  // West
-        assert_eq!(facing_between((5, 5), (4, 4)), 896);  // NW
+        assert_eq!(facing_between((5, 5), (4, 6)), 384);  // SW
+        assert_eq!(facing_between((5, 5), (4, 5)), 256);  // West
+        assert_eq!(facing_between((5, 5), (4, 4)), 128);  // NW
     }
 }

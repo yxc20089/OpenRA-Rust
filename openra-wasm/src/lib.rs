@@ -25,6 +25,8 @@ const BUNDLED_MAPS: &[(&str, &[u8])] = &[
 const BUNDLED_PALETTE: &[u8] = include_bytes!("../../vendor/OpenRA/mods/ra/maps/chernobyl/temperat.pal");
 /// Bundled temperat.mix for terrain tiles.
 const TEMPERAT_MIX: &[u8] = include_bytes!("../../vendor/ra-content/temperat.mix");
+/// Bundled conquer.mix for resource overlays and misc sprites.
+const CONQUER_MIX: &[u8] = include_bytes!("../../vendor/ra-content/conquer.mix");
 /// Bundled sounds.mix for sound effects.
 const SOUNDS_MIX: &[u8] = include_bytes!("../../vendor/ra-content/sounds.mix");
 /// Bundled speech.mix for voice announcements.
@@ -197,6 +199,15 @@ impl GameSession {
     /// difficulty: 0=Easy, 1=Medium, 2=Hard
     #[wasm_bindgen(constructor)]
     pub fn new(map_index: u8, difficulty: u8) -> Result<GameSession, JsValue> {
+        Self::create(map_index, difficulty, false)
+    }
+
+    /// Start a bot-vs-bot game (human observes).
+    pub fn new_bot_vs_bot(map_index: u8, difficulty: u8) -> Result<GameSession, JsValue> {
+        Self::create(map_index, difficulty, true)
+    }
+
+    fn create(map_index: u8, difficulty: u8, bot_vs_bot: bool) -> Result<GameSession, JsValue> {
         let map_data = BUNDLED_MAPS.get(map_index as usize).unwrap_or(&BUNDLED_MAPS[0]).1;
         let map = oramap::parse(map_data)
             .map_err(|e| JsValue::from_str(&format!("Failed to parse map: {}", e)))?;
@@ -210,7 +221,7 @@ impl GameSession {
                 SlotInfo {
                     player_reference: "Multi0".to_string(),
                     faction: "soviet".to_string(),
-                    is_bot: false,
+                    is_bot: bot_vs_bot,
                 },
                 SlotInfo {
                     player_reference: "Multi1".to_string(),
@@ -222,13 +233,9 @@ impl GameSession {
 
         let map_tiles_json = map_tiles_to_json(&map);
         let world = world::build_world(&map, seed, &lobby, None, difficulty);
-        // Human is first playable player (after World=1, Neutral=2, Creeps=... )
-        // Player IDs: the first two non-system player actors
         let player_ids = world.player_ids().to_vec();
-        // Player IDs: [non-playable..., playable_slot_0, playable_slot_1, Everyone]
-        // Human is the first occupied slot = slot count + 1 from the end
-        let num_slots = lobby.occupied_slots.len(); // 2
-        let human_player_id = player_ids[player_ids.len() - 1 - num_slots]; // skip Everyone, take first
+        let num_slots = lobby.occupied_slots.len();
+        let human_player_id = player_ids[player_ids.len() - 1 - num_slots];
 
         Ok(GameSession {
             world,
@@ -245,6 +252,20 @@ impl GameSession {
         let orders: Vec<GameOrder> = self.pending_orders.drain(..).collect();
         self.world.process_frame(&orders);
         self.world.game_over().is_none()
+    }
+
+    /// Advance N frames without rendering (for fast-forward / bot-vs-bot).
+    /// Returns 0 if game is still running, or winner player ID if game over.
+    pub fn tick_n(&mut self, n: u32) -> u32 {
+        for _ in 0..n {
+            self.frame += 1;
+            let orders: Vec<GameOrder> = self.pending_orders.drain(..).collect();
+            self.world.process_frame(&orders);
+            if let Some(winner) = self.world.game_over() {
+                return winner;
+            }
+        }
+        0
     }
 
     pub fn snapshot_json(&self) -> String {
@@ -273,6 +294,11 @@ impl GameSession {
     pub fn map_tiles_json(&self) -> String { self.map_tiles_json.clone() }
 
     // ── Typed order methods ────────────────────────────────────────────
+
+    /// Debug: compute facing_between two cells (for test verification)
+    pub fn debug_facing_between(&self, fx: i32, fy: i32, tx: i32, ty: i32) -> i32 {
+        openra_sim::pathfinder::facing_between((fx, fy), (tx, ty))
+    }
 
     pub fn order_move(&mut self, unit_id: u32, x: i32, y: i32) {
         self.pending_orders.push(GameOrder {
@@ -722,19 +748,54 @@ impl SpriteAtlas {
                 "t11.tem", "t12.tem", "t13.tem", "t14.tem", "t15.tem",
                 "t16.tem", "t17.tem",
                 "tc01.tem", "tc02.tem", "tc03.tem", "tc04.tem", "tc05.tem",
+                // Resource overlays (ore and gems)
+                "gold01.tem", "gold02.tem", "gold03.tem", "gold04.tem",
+                "gem01.tem", "gem02.tem", "gem03.tem", "gem04.tem",
             ];
+            // Also try conquer.mix for resource overlays
+            let cmix = mix::MixArchive::parse(CONQUER_MIX.to_vec()).ok();
+
             for filename in &extra_tems {
                 let sprite_name = format!("ter:{}", filename);
                 if sprites.contains_key(&sprite_name) { continue; }
-                if let Some(tem_data) = tmix.get(filename) {
-                    if let Ok(tmp_file) = tmp::decode(tem_data) {
+                // Try temperat.mix first, then conquer.mix
+                let tem_data = tmix.get(filename)
+                    .or_else(|| cmix.as_ref().and_then(|c| c.get(filename)));
+                if let Some(tem_data) = tem_data {
+                    let is_resource = filename.starts_with("gold") || filename.starts_with("gem");
+                    // These .tem files are actually SHP format (not TMP RA format).
+                    // Try SHP decode first, fall back to TMP.
+                    if let Ok(shp_file) = shp::decode(tem_data) {
+                        let frames: Vec<SpriteFrame> = shp_file.frames.iter().map(|f| {
+                            let mut rgba = Vec::with_capacity(f.pixels.len() * 4);
+                            for &px in &f.pixels {
+                                if px == 0 {
+                                    rgba.extend_from_slice(&[0, 0, 0, 0]); // transparent
+                                } else {
+                                    let c = pal.rgba(px);
+                                    rgba.extend_from_slice(&c);
+                                }
+                            }
+                            SpriteFrame {
+                                width: f.width,
+                                height: f.height,
+                                rgba,
+                                indexed: f.pixels.clone(),
+                            }
+                        }).collect();
+                        sprites.insert(sprite_name, frames);
+                    } else if let Ok(tmp_file) = tmp::decode(tem_data) {
                         let frames: Vec<SpriteFrame> = tmp_file.tiles.iter().map(|tile| {
                             match tile {
                                 Some(pixels) => {
                                     let mut rgba = Vec::with_capacity(pixels.len() * 4);
                                     for &px in pixels {
                                         if px == 0 {
-                                            rgba.extend_from_slice(&[0, 0, 0, 255]);
+                                            if is_resource {
+                                                rgba.extend_from_slice(&[0, 0, 0, 0]);
+                                            } else {
+                                                rgba.extend_from_slice(&[0, 0, 0, 255]);
+                                            }
                                         } else {
                                             let c = pal.rgba(px);
                                             rgba.extend_from_slice(&c);
@@ -811,6 +872,22 @@ impl SpriteAtlas {
     }
 
     /// Get sprite info as JSON: { name: { width, height, frames } }
+    /// Check if files exist in bundled mix archives (for debugging).
+    pub fn check_mix_files(names: Vec<String>) -> String {
+        let mut results = HashMap::new();
+        if let Ok(tmix) = mix::MixArchive::parse(TEMPERAT_MIX.to_vec()) {
+            for name in &names {
+                results.insert(format!("temperat:{}", name), tmix.contains(name));
+            }
+        }
+        if let Ok(cmix) = mix::MixArchive::parse(CONQUER_MIX.to_vec()) {
+            for name in &names {
+                results.insert(format!("conquer:{}", name), cmix.contains(name));
+            }
+        }
+        serde_json::to_string(&results).unwrap_or_default()
+    }
+
     pub fn info_json(&self) -> String {
         let mut info = HashMap::new();
         for (name, frames) in &self.sprites {

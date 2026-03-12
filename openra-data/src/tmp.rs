@@ -113,4 +113,22 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn decode_gold_as_shp() {
+        // Gold/gem/mine .tem files are actually in SHP format, not TMP RA format
+        let mix_dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../vendor/ra-content/");
+        let mix_data = std::fs::read(format!("{}temperat.mix", mix_dir));
+        if let Ok(data) = mix_data {
+            let mix = crate::mix::MixArchive::parse(data).unwrap();
+            for name in &["gold01.tem", "gold02.tem", "gem01.tem", "mine.tem"] {
+                if let Some(d) = mix.get(name) {
+                    let shp = crate::shp::decode(d).unwrap();
+                    assert!(shp.width == 24 && shp.height == 24,
+                        "{} should be 24x24, got {}x{}", name, shp.width, shp.height);
+                    assert!(!shp.frames.is_empty(), "{} should have frames", name);
+                }
+            }
+        }
+    }
 }
