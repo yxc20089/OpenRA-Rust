@@ -44,6 +44,35 @@ let playerSpriteCache = {};
 let activeTab = 'buildings';
 let currentTick = 0;
 
+// Power state per player (for low-power indicator)
+let playerLowPower = {};
+
+// Animation tracking
+let prevActorIds = new Set();           // Actor IDs from previous snapshot
+let buildAnims = {};                     // { actorId: { type, x, y, startTick, owner } }
+let activeEffects = [];                  // { x, y, sprite, frame, maxFrames, startTick }
+
+// Construction animation sprite mapping
+const BUILD_ANIM_SPRITES = {
+    'fact': 'factmake', 'proc': 'procmake', 'powr': 'powrmake', 'apwr': 'apwrmake',
+    'barr': 'barrmake', 'dome': 'domemake', 'weap': 'weapmake', 'gun': 'gunmake',
+    'agun': 'agunmake', 'sam': 'sammake', 'ftur': 'fturmake', 'tsla': 'tslamake',
+    'pbox': 'pboxmake', 'stek': 'stekmake', 'atek': 'atekmake', 'hpad': 'hpadmake',
+    'fix': 'fixmake', 'gap': 'gapmake', 'iron': 'ironmake', 'spen': 'spenmake',
+    'syrd': 'syrdmake', 'afld': 'afldmake', 'silo': 'silomake', 'tent': 'tentmake',
+    'kenn': 'kennmake', 'pdox': 'pdoxmake', 'hosp': 'hospmake', 'bio': 'biomake',
+    'fcom': 'fcommake', 'miss': 'missmake',
+};
+
+// Death effect sprite mapping
+const DEATH_EFFECTS = {
+    'Building': ['art-exp1', 'fball1'],
+    'Vehicle': ['veh-hit1', 'veh-hit2', 'fball1'],
+    'Ship': ['h2o_exp1', 'h2o_exp2'],
+    'Aircraft': ['fball1', 'frag1'],
+    'Infantry': ['piff', 'piffpiff'],
+};
+
 // Camera
 let mapW = 128, mapH = 128;
 let cellPx = 24;
@@ -423,6 +452,11 @@ function refreshSelection() {
 
 function updateHUD(snapshot) {
     if (!snapshot) return;
+    // Update low-power state for all players
+    playerLowPower = {};
+    for (const p of snapshot.players) {
+        playerLowPower[p.index] = p.power_drained > p.power_provided;
+    }
     const myPlayer = snapshot.players.find(p => p.index === humanPlayerId);
     if (myPlayer) {
         hudCash.textContent = `$${myPlayer.cash}`;
@@ -674,13 +708,14 @@ function render(snapshot) {
     mapW = snapshot.map_width || 128;
     mapH = snapshot.map_height || 128;
 
+    // Detect new/removed actors for animations
+    updateAnimations(snapshot);
+
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-    // Terrain: camX/camY are in screen pixels at current zoom (cellPx).
-    // Terrain canvas is at native CELL_PX resolution.
+    // Terrain
     if (terrainCanvas) {
-        // Convert camera position from screen-space to native terrain pixels
         const ratio = CELL_PX / cellPx;
         const srcX = Math.max(0, camX * ratio);
         const srcY = Math.max(0, camY * ratio);
@@ -710,6 +745,9 @@ function render(snapshot) {
         else drawUnit(a);
     }
 
+    // Draw active effects (explosions, death animations)
+    drawEffects();
+
     // Selection brackets + health bars on selected
     for (const a of sorted) {
         if (selectedUnits.includes(a.id)) drawSelectionBrackets(a);
@@ -720,6 +758,84 @@ function render(snapshot) {
 
     // Minimap
     drawMinimap(snapshot);
+}
+
+// Track actor creation/destruction for animations
+function updateAnimations(snapshot) {
+    const currentIds = new Set();
+    for (const a of snapshot.actors) {
+        currentIds.add(a.id);
+        // New building? Start construction animation
+        if (!prevActorIds.has(a.id) && a.kind === 'Building' && prevActorIds.size > 0) {
+            const makeSprite = BUILD_ANIM_SPRITES[a.actor_type];
+            if (makeSprite && spriteInfo[makeSprite]) {
+                buildAnims[a.id] = {
+                    type: a.actor_type,
+                    sprite: makeSprite,
+                    x: a.x, y: a.y,
+                    startTick: currentTick,
+                    owner: a.owner,
+                    totalFrames: spriteInfo[makeSprite].frames,
+                };
+            }
+        }
+    }
+    // Actors that disappeared: spawn death effects
+    if (prevActorIds.size > 0) {
+        for (const oldId of prevActorIds) {
+            if (!currentIds.has(oldId) && lastSnapshot) {
+                const oldActor = lastSnapshot.actors.find(a => a.id === oldId);
+                if (oldActor && oldActor.kind !== 'Tree' && oldActor.kind !== 'Mine') {
+                    spawnDeathEffect(oldActor);
+                }
+            }
+        }
+    }
+    prevActorIds = currentIds;
+
+    // Clean up finished build anims
+    for (const [id, anim] of Object.entries(buildAnims)) {
+        const elapsed = currentTick - anim.startTick;
+        if (elapsed >= anim.totalFrames) {
+            delete buildAnims[id];
+        }
+    }
+}
+
+function spawnDeathEffect(actor) {
+    const effectList = DEATH_EFFECTS[actor.kind] || DEATH_EFFECTS['Vehicle'];
+    // Pick a random effect from the list
+    const spriteName = effectList[Math.floor(Math.random() * effectList.length)];
+    const info = spriteInfo[spriteName];
+    if (!info) return;
+    activeEffects.push({
+        x: actor.x, y: actor.y,
+        sprite: spriteName,
+        frame: 0,
+        maxFrames: info.frames,
+        startTick: currentTick,
+    });
+}
+
+function drawEffects() {
+    const scale = cellPx / CELL_PX;
+    // Draw remaining effects, advance frame each tick
+    const remaining = [];
+    for (const eff of activeEffects) {
+        const elapsed = currentTick - eff.startTick;
+        if (elapsed >= eff.maxFrames) continue; // expired
+        const info = spriteInfo[eff.sprite];
+        if (!info) continue;
+        const frames = spriteImages[eff.sprite];
+        if (!frames || !frames[elapsed]) continue;
+        const sx = eff.x * cellPx - camX;
+        const sy = eff.y * cellPx - camY;
+        const drawW = info.width * scale;
+        const drawH = info.height * scale;
+        ctx.drawImage(frames[elapsed], sx + cellPx/2 - drawW/2, sy + cellPx/2 - drawH/2, drawW, drawH);
+        remaining.push(eff);
+    }
+    activeEffects = remaining;
 }
 
 function drawResources(snapshot) {
@@ -792,6 +908,22 @@ function drawBuilding(a) {
     const centerX = sx + bw / 2;
     const centerY = sy + bh / 2;
 
+    // Check for active construction animation
+    const buildAnim = buildAnims[a.id];
+    if (buildAnim) {
+        const elapsed = currentTick - buildAnim.startTick;
+        const makeInfo = spriteInfo[buildAnim.sprite];
+        if (makeInfo && spriteImages[buildAnim.sprite]) {
+            const frame = Math.min(elapsed, makeInfo.frames - 1);
+            const drawW = makeInfo.width * scale;
+            const drawH = makeInfo.height * scale;
+            const dx = centerX - drawW / 2;
+            const dy = centerY - drawH / 2;
+            drawSprite(buildAnim.sprite, frame, dx, dy, drawW, drawH, a.owner);
+            return;
+        }
+    }
+
     // Render foundation bib (under building)
     const bibName = BUILDING_BIBS[a.actor_type];
     if (bibName) {
@@ -843,6 +975,21 @@ function drawBuilding(a) {
                     const smokeFrames = spriteImages[smokeSprite];
                     if (smokeFrames[smokeFrame]) {
                         ctx.drawImage(smokeFrames[smokeFrame], centerX - sW/2, centerY - bh/2 - sH/2, sW, sH);
+                    }
+                }
+            }
+            // Low power indicator (flashing)
+            if (playerLowPower[a.owner] && currentTick % 20 < 10) {
+                const npSprite = spriteInfo['poweroff'] || spriteInfo['nopower'];
+                const npName = spriteInfo['poweroff'] ? 'poweroff' : 'nopower';
+                if (npSprite && spriteImages[npName]) {
+                    const npW = npSprite.width * scale;
+                    const npH = npSprite.height * scale;
+                    const npFrames = spriteImages[npName];
+                    if (npFrames[0]) {
+                        ctx.globalAlpha = 0.7;
+                        ctx.drawImage(npFrames[0], centerX - npW/2, centerY - npH/2, npW, npH);
+                        ctx.globalAlpha = 1;
                     }
                 }
             }
@@ -901,6 +1048,22 @@ function drawUnit(a) {
                     const tFrame = Math.floor(((a.facing + step/2) & 1023) / step) % 32;
                     const tCx = sx + cellPx/2 - tW/2, tCy = sy + cellPx/2 - tH/2;
                     drawSprite(turretName, tFrame, tCx, tCy, tW, tH, a.owner);
+                }
+            }
+            // Muzzle flash when attacking
+            if (a.activity === 'attacking' && !huskName && currentTick % 4 < 2) {
+                const muzzle = spriteInfo['piffpiff'] ? 'piffpiff' : 'piff';
+                const mInfo = spriteInfo[muzzle];
+                if (mInfo && spriteImages[muzzle]) {
+                    const mFrame = currentTick % mInfo.frames;
+                    const mW = mInfo.width * scale, mH = mInfo.height * scale;
+                    // Offset muzzle flash in facing direction
+                    const facingRad = (a.facing / 1024) * Math.PI * 2;
+                    const mDist = cellPx * 0.4;
+                    const mx = sx + cellPx/2 + Math.sin(facingRad) * mDist - mW/2;
+                    const my = sy + cellPx/2 - Math.cos(facingRad) * mDist - mH/2;
+                    const mFrames = spriteImages[muzzle];
+                    if (mFrames[mFrame]) ctx.drawImage(mFrames[mFrame], mx, my, mW, mH);
                 }
             }
             // Helicopter rotor overlay (animated)
