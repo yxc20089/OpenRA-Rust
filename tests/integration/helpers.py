@@ -69,19 +69,27 @@ def get_cam(page):
 # -- Canvas interaction --
 
 def click_cell(page, cell_x, cell_y, button="left"):
-    """Click a game world cell on the canvas."""
+    """Click a game world cell on the canvas.
+
+    If the target cell is outside the current viewport (e.g. due to edge-scroll
+    drift), the camera is automatically re-centered on the cell before clicking.
+    """
     cam = get_cam(page)
     canvas = page.locator("#canvas")
     box = canvas.bounding_box()
     px = (cell_x * cam["cellPx"]) - cam["camX"] + cam["cellPx"] // 2
     py = (cell_y * cam["cellPx"]) - cam["camY"] + cam["cellPx"] // 2
-    if 0 <= px <= box["width"] and 0 <= py <= box["height"]:
-        canvas.click(position={"x": px, "y": py}, button=button)
-    else:
-        raise ValueError(
-            f"Cell ({cell_x},{cell_y}) maps to pixel ({px},{py}) "
-            f"outside canvas {box['width']}x{box['height']}"
+    if not (0 <= px <= box["width"] and 0 <= py <= box["height"]):
+        # Re-center camera on the target cell so it's in the viewport
+        page.evaluate(
+            f"{ORA}.setCam("
+            f"{cell_x} * {ORA}.cellPx - document.getElementById('canvas').width / 2, "
+            f"{cell_y} * {ORA}.cellPx - document.getElementById('canvas').height / 2)"
         )
+        cam = get_cam(page)
+        px = (cell_x * cam["cellPx"]) - cam["camX"] + cam["cellPx"] // 2
+        py = (cell_y * cam["cellPx"]) - cam["camY"] + cam["cellPx"] // 2
+    canvas.click(position={"x": px, "y": py}, button=button)
 
 
 def right_click_cell(page, cell_x, cell_y):
@@ -96,12 +104,19 @@ def shift_click_cell(page, cell_x, cell_y):
     box = canvas.bounding_box()
     px = (cell_x * cam["cellPx"]) - cam["camX"] + cam["cellPx"] // 2
     py = (cell_y * cam["cellPx"]) - cam["camY"] + cam["cellPx"] // 2
-    if 0 <= px <= box["width"] and 0 <= py <= box["height"]:
-        page.keyboard.down("Shift")
-        canvas.click(position={"x": px, "y": py})
-        page.keyboard.up("Shift")
-    else:
-        raise ValueError(f"Cell ({cell_x},{cell_y}) outside canvas")
+    if not (0 <= px <= box["width"] and 0 <= py <= box["height"]):
+        # Re-center camera on the target cell
+        page.evaluate(
+            f"{ORA}.setCam("
+            f"{cell_x} * {ORA}.cellPx - document.getElementById('canvas').width / 2, "
+            f"{cell_y} * {ORA}.cellPx - document.getElementById('canvas').height / 2)"
+        )
+        cam = get_cam(page)
+        px = (cell_x * cam["cellPx"]) - cam["camX"] + cam["cellPx"] // 2
+        py = (cell_y * cam["cellPx"]) - cam["camY"] + cam["cellPx"] // 2
+    page.keyboard.down("Shift")
+    canvas.click(position={"x": px, "y": py})
+    page.keyboard.up("Shift")
 
 
 def drag_select(page, x1, y1, x2, y2):
