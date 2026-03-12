@@ -200,6 +200,18 @@ impl TerrainMap {
         cell.resource_type != ResourceType::None && cell.density > 0
     }
 
+    /// Get total resource count (for snapshot summaries).
+    pub fn total_resources(&self) -> i32 {
+        let mut total = 0i32;
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let cell = self.resources.get(x, y);
+                total += cell.density as i32;
+            }
+        }
+        total
+    }
+
     /// Find the nearest cell with resources within a search radius.
     pub fn find_nearest_resource(&self, cx: i32, cy: i32, radius: i32) -> Option<(i32, i32)> {
         let mut best: Option<(i32, i32)> = None;

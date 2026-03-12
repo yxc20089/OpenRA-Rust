@@ -15,7 +15,7 @@ use crate::math::{CPos, WPos};
 use crate::pathfinder;
 use crate::rng::MersenneTwister;
 use crate::sync;
-use crate::terrain::{ResourceType, TerrainMap};
+use crate::terrain::{CellLayer, ResourceType, TerrainMap};
 use crate::traits::{PqType, TraitState};
 
 /// Lobby information extracted from the replay's SyncInfo orders.
@@ -148,6 +148,8 @@ pub struct ActorSnapshot {
 pub struct PlayerSnapshot {
     pub index: u32,
     pub cash: i32,
+    pub power_provided: i32,
+    pub power_drained: i32,
 }
 
 pub struct SyncHashDebug {
@@ -192,6 +194,9 @@ pub struct World {
     /// Map dimensions (cells).
     map_width: i32,
     map_height: i32,
+    /// Per-player shroud: 0=unexplored, 1=fogged, 2=visible.
+    /// Index by player_actor_ids index.
+    shroud: Vec<CellLayer<u8>>,
 }
 
 impl World {
@@ -244,8 +249,19 @@ impl World {
             actors.push(ActorSnapshot { id: actor.id, kind: actor.kind, owner, x, y });
         }
         let players = self.player_actor_ids.iter().map(|&pid| {
-            let cash = self.actors.get(&pid).map(|a| a.cash()).unwrap_or(0);
-            PlayerSnapshot { index: pid, cash }
+            let actor = self.actors.get(&pid);
+            let cash = actor.map(|a| a.cash()).unwrap_or(0);
+            let (power_provided, power_drained) = actor
+                .map(|a| {
+                    for t in &a.traits {
+                        if let TraitState::PowerManager { power_provided, power_drained } = t {
+                            return (*power_provided, *power_drained);
+                        }
+                    }
+                    (0, 0)
+                })
+                .unwrap_or((0, 0));
+            PlayerSnapshot { index: pid, cash, power_provided, power_drained }
         }).collect();
         // Collect resource cells for rendering
         let mut resources = Vec::new();
@@ -336,6 +352,8 @@ impl World {
                 self.tick_actors();
                 self.execute_frame_end_tasks();
             }
+            // Update fog of war after tick
+            self.update_shroud();
         }
 
         hash
@@ -918,6 +936,66 @@ impl World {
             }
         }
         false
+    }
+
+    /// Update shroud for all players based on current unit positions.
+    fn update_shroud(&mut self) {
+        // First, downgrade all "visible" (2) cells to "fogged" (1)
+        for layer in &mut self.shroud {
+            for y in 0..layer.height {
+                for x in 0..layer.width {
+                    if *layer.get(x, y) == 2 {
+                        layer.set(x, y, 1); // Fog previously visible cells
+                    }
+                }
+            }
+        }
+
+        // Reveal cells around each actor for its owner
+        let sight_data: Vec<(u32, (i32, i32), i32)> = self.actors.values()
+            .filter_map(|a| {
+                let owner = a.owner_id?;
+                let loc = a.location?;
+                // Sight range: buildings=5, infantry=4, vehicles=6, MCV=5
+                let sight = match a.kind {
+                    ActorKind::Building => 5,
+                    ActorKind::Infantry => 4,
+                    ActorKind::Vehicle => 6,
+                    ActorKind::Mcv => 5,
+                    _ => 0,
+                };
+                if sight > 0 { Some((owner, loc, sight)) } else { None }
+            })
+            .collect();
+
+        for (owner_id, (cx, cy), sight) in sight_data {
+            // Find which player index this owner corresponds to
+            if let Some(pi) = self.player_actor_ids.iter().position(|&pid| pid == owner_id) {
+                let layer = &mut self.shroud[pi];
+                for dy in -sight..=sight {
+                    for dx in -sight..=sight {
+                        let x = cx + dx;
+                        let y = cy + dy;
+                        if layer.contains(x, y) && dx * dx + dy * dy <= sight * sight {
+                            layer.set(x, y, 2); // Visible
+                        }
+                    }
+                }
+            }
+            // Also reveal for "Everyone" player
+            if let Some(ei) = self.player_actor_ids.iter().position(|&pid| pid == self.everyone_player_id) {
+                let layer = &mut self.shroud[ei];
+                for dy in -sight..=sight {
+                    for dx in -sight..=sight {
+                        let x = cx + dx;
+                        let y = cy + dy;
+                        if layer.contains(x, y) && dx * dx + dy * dy <= sight * sight {
+                            layer.set(x, y, 2);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Get movement speed for an actor (world units per tick).
@@ -1886,7 +1964,12 @@ pub fn build_world(
         }
     }
 
-    World {
+    // Initialize per-player shroud grids
+    let shroud: Vec<CellLayer<u8>> = player_actor_ids.iter()
+        .map(|_| CellLayer::new(map.map_size.0, map.map_size.1))
+        .collect();
+
+    let mut world = World {
         actors,
         synced_effects: Vec::new(),
         rng,
@@ -1904,7 +1987,12 @@ pub fn build_world(
         terrain,
         map_width: map.map_size.0,
         map_height: map.map_size.1,
-    }
+        shroud,
+    };
+
+    // Initial shroud reveal around starting units
+    world.update_shroud();
+    world
 }
 
 #[cfg(test)]
