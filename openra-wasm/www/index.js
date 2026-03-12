@@ -1082,6 +1082,32 @@ function render(snapshot) {
         ctx.fillText(`[${commandMode.toUpperCase()}] Right-click to execute`, 10, canvas.height - 12);
     }
 
+    // Superweapon charge bars (bottom-right of game area)
+    if (snapshot.superweapons && mode === 'game') {
+        const mySW = snapshot.superweapons.filter(sw => sw.owner === humanPlayerId);
+        const swNames = { dome: 'GPS', iron: 'Iron Curtain', pdox: 'Chrono', mslo: 'Nuke' };
+        const swColors = { dome: '#4488dd', iron: '#dd4444', pdox: '#44dd88', mslo: '#dd8844' };
+        let sy = canvas.height - 20 - mySW.length * 22;
+        for (const sw of mySW) {
+            const pct = sw.charge_total > 0 ? 1 - sw.ticks_remaining / sw.charge_total : 1;
+            const ready = sw.ticks_remaining <= 0;
+            const label = swNames[sw.weapon_type] || sw.weapon_type;
+            const color = swColors[sw.weapon_type] || '#888';
+            ctx.fillStyle = 'rgba(10,10,8,0.8)';
+            ctx.fillRect(canvas.width - 180, sy, 170, 18);
+            ctx.fillStyle = ready ? '#4a8a2a' : color;
+            ctx.fillRect(canvas.width - 178, sy + 2, Math.floor(166 * pct), 14);
+            ctx.fillStyle = '#ccc';
+            ctx.font = '10px monospace';
+            ctx.textAlign = 'left';
+            ctx.fillText(ready ? `${label} READY` : `${label} ${Math.round(pct * 100)}%`, canvas.width - 175, sy + 13);
+            if (ready) {
+                // Make it clickable via a hidden overlay approach — for now show in HUD
+            }
+            sy += 22;
+        }
+    }
+
     // Minimap
     drawMinimap(snapshot);
 }

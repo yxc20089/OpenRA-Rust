@@ -129,6 +129,16 @@ pub struct WorldSnapshot {
     pub map_width: i32,
     pub map_height: i32,
     pub resources: Vec<ResourceSnapshot>,
+    /// Superweapon states: [(weapon_type, owner, ticks_remaining, charge_total)]
+    pub superweapons: Vec<SuperweaponSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SuperweaponSnapshot {
+    pub weapon_type: String,
+    pub owner: u32,
+    pub ticks_remaining: i32,
+    pub charge_total: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -238,6 +248,10 @@ pub struct World {
     repairing: HashSet<u32>,
     /// Rally points per building actor ID.
     rally_points: HashMap<u32, (i32, i32)>,
+    /// Superweapon charge timers: (building_type, owner_player_id) → ticks_remaining.
+    superweapon_timers: HashMap<(String, u32), i32>,
+    /// Actors with invulnerability ticks remaining (Iron Curtain).
+    invulnerable: HashMap<u32, i32>,
 }
 
 impl World {
@@ -417,6 +431,18 @@ impl World {
             }
         }
 
+        let charge_totals: HashMap<&str, i32> = [
+            ("dome", 3000), ("iron", 4500), ("pdox", 4500), ("mslo", 6000),
+        ].into_iter().collect();
+        let superweapons: Vec<SuperweaponSnapshot> = self.superweapon_timers.iter()
+            .map(|((wtype, owner), ticks)| SuperweaponSnapshot {
+                weapon_type: wtype.clone(),
+                owner: *owner,
+                ticks_remaining: *ticks,
+                charge_total: *charge_totals.get(wtype.as_str()).unwrap_or(&3000),
+            })
+            .collect();
+
         WorldSnapshot {
             tick: self.world_tick,
             actors,
@@ -424,6 +450,7 @@ impl World {
             map_width: self.map_width,
             map_height: self.map_height,
             resources,
+            superweapons,
         }
     }
 
@@ -637,6 +664,34 @@ impl World {
                     }
                 }
             }
+            "ActivateSuperweapon" => {
+                // target_string = "weapon_type,x,y" (e.g. "iron,15,20")
+                if let Some(target) = &order.target_string {
+                    let parts: Vec<&str> = target.split(',').collect();
+                    if parts.len() >= 1 {
+                        let weapon_type = parts[0];
+                        let owner = order.subject_id.unwrap_or(0);
+                        let key = (weapon_type.to_string(), owner);
+                        let charged = self.superweapon_timers.get(&key).map(|t| *t <= 0).unwrap_or(false);
+                        if charged {
+                            let (tx, ty) = if parts.len() >= 3 {
+                                (parts[1].parse().unwrap_or(0), parts[2].parse().unwrap_or(0))
+                            } else { (0, 0) };
+                            self.activate_superweapon(weapon_type, owner, tx, ty);
+                            // Reset timer
+                            if let Some(t) = self.superweapon_timers.get_mut(&key) {
+                                match weapon_type {
+                                    "dome" => *t = 3000,
+                                    "iron" => *t = 4500,
+                                    "pdox" => *t = 4500,
+                                    "mslo" => *t = 6000,
+                                    _ => *t = 3000,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             "StartGame" | "Command" => {}
             other => {
                 eprintln!("ORDER: unhandled '{}' subject={:?}", other, order.subject_id);
@@ -833,6 +888,128 @@ impl World {
     }
 
     /// Tick all harvesters through their harvest cycle.
+    /// Activate a superweapon effect.
+    fn activate_superweapon(&mut self, weapon_type: &str, owner: u32, target_x: i32, target_y: i32) {
+        match weapon_type {
+            "dome" => {
+                // GPS Satellite: set GpsWatcher.granted = true for this player
+                if let Some(player) = self.actors.get_mut(&owner) {
+                    for t in &mut player.traits {
+                        if let TraitState::GpsWatcher { granted, launched, .. } = t {
+                            *granted = true;
+                            *launched = true;
+                        }
+                    }
+                }
+                eprintln!("SUPERWEAPON: GPS Satellite activated for player {}", owner);
+            }
+            "iron" => {
+                // Iron Curtain: make target actor invulnerable for 750 ticks (~30 seconds)
+                // Find actor at target cell
+                let target_id = self.actors.values()
+                    .find(|a| a.location == Some((target_x, target_y))
+                        && a.owner_id == Some(owner)
+                        && matches!(a.kind, ActorKind::Vehicle | ActorKind::Building))
+                    .map(|a| a.id);
+                if let Some(tid) = target_id {
+                    self.invulnerable.insert(tid, 750);
+                    eprintln!("SUPERWEAPON: Iron Curtain on actor {} for 750 ticks", tid);
+                }
+            }
+            "pdox" => {
+                // Chronosphere: teleport own unit to target cell
+                if let Some(subject_id) = self.actors.values()
+                    .find(|a| a.location == Some((target_x, target_y))
+                        && a.owner_id == Some(owner)
+                        && matches!(a.kind, ActorKind::Vehicle))
+                    .map(|a| a.id)
+                {
+                    // For simplicity, teleport to a random adjacent passable cell
+                    // In a real implementation, this would need a second target
+                    eprintln!("SUPERWEAPON: Chronosphere — not fully implemented yet");
+                    let _ = subject_id;
+                }
+            }
+            "mslo" => {
+                // Nuclear Strike: heavy area damage at target cell
+                let radius = 5;
+                let damage = 500000; // Very high damage
+                let mut damaged: Vec<(u32, i32)> = Vec::new();
+                for actor in self.actors.values() {
+                    if let Some((ax, ay)) = actor.location {
+                        let dist = (ax - target_x).abs() + (ay - target_y).abs();
+                        if dist <= radius {
+                            let dmg = damage * (radius + 1 - dist) / (radius + 1);
+                            damaged.push((actor.id, dmg));
+                        }
+                    }
+                }
+                let mut dead: Vec<u32> = Vec::new();
+                for (actor_id, dmg) in damaged {
+                    if let Some(actor) = self.actors.get_mut(&actor_id) {
+                        for t in &mut actor.traits {
+                            if let TraitState::Health { hp } = t {
+                                *hp -= dmg;
+                                if *hp <= 0 { dead.push(actor_id); }
+                                break;
+                            }
+                        }
+                    }
+                }
+                for id in dead {
+                    if let Some(a) = self.actors.remove(&id) {
+                        if let Some(loc) = a.location {
+                            self.terrain.clear_occupant(loc.0, loc.1);
+                        }
+                    }
+                }
+                eprintln!("SUPERWEAPON: Nuclear Strike at ({},{}) by player {}", target_x, target_y, owner);
+            }
+            _ => {}
+        }
+    }
+
+    /// Tick superweapon charge timers. Start charging when prerequisite building exists.
+    fn tick_superweapons(&mut self) {
+        // Superweapon definitions: (building_type, charge_time_ticks)
+        const SUPERWEAPONS: &[(&str, i32)] = &[
+            ("dome", 3000),   // GPS Satellite (Allied)
+            ("iron", 4500),   // Iron Curtain (Soviet)
+            ("pdox", 4500),   // Chronosphere (Allied)
+            ("mslo", 6000),   // Nuclear Missile (Soviet)
+        ];
+
+        // Find all superweapon buildings and start/continue timers
+        let buildings: Vec<(String, u32)> = self.actors.values()
+            .filter(|a| a.kind == ActorKind::Building)
+            .filter_map(|a| {
+                let atype = a.actor_type.as_deref()?;
+                if SUPERWEAPONS.iter().any(|(bt, _)| *bt == atype) {
+                    Some((atype.to_string(), a.owner_id.unwrap_or(0)))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Start new timers for buildings not yet tracked
+        for &(btype, charge_time) in SUPERWEAPONS {
+            for &(ref found_type, owner) in &buildings {
+                if found_type == btype {
+                    let key = (btype.to_string(), owner);
+                    self.superweapon_timers.entry(key).or_insert(charge_time);
+                }
+            }
+        }
+
+        // Tick down active timers
+        for (_, ticks) in self.superweapon_timers.iter_mut() {
+            if *ticks > 0 {
+                *ticks -= 1;
+            }
+        }
+    }
+
     fn tick_harvesters(&mut self) {
         let harvester_ids: Vec<u32> = self.actors.values()
             .filter(|a| matches!(a.activity, Some(Activity::Harvest { .. })))
@@ -1405,9 +1582,10 @@ impl World {
                 }
             }
         }
-        // Apply damage
+        // Apply damage (skip invulnerable actors)
         let mut dead_actors: Vec<u32> = Vec::new();
         for (_attacker, target_id, damage) in &attacks {
+            if self.invulnerable.contains_key(target_id) { continue; }
             if let Some(target) = self.actors.get_mut(target_id) {
                 for t in &mut target.traits {
                     if let TraitState::Health { hp } = t {
@@ -1477,6 +1655,21 @@ impl World {
             for id in finished {
                 self.repairing.remove(&id);
             }
+        }
+
+        // Tick superweapon charge timers
+        self.tick_superweapons();
+
+        // Tick invulnerability (Iron Curtain)
+        let mut expired_inv: Vec<u32> = Vec::new();
+        for (actor_id, ticks) in self.invulnerable.iter_mut() {
+            *ticks -= 1;
+            if *ticks <= 0 {
+                expired_inv.push(*actor_id);
+            }
+        }
+        for id in expired_inv {
+            self.invulnerable.remove(&id);
         }
 
         // Tick Harvest activities.
@@ -2296,6 +2489,8 @@ pub fn build_world(
         bots,
         repairing: HashSet::new(),
         rally_points: HashMap::new(),
+        superweapon_timers: HashMap::new(),
+        invulnerable: HashMap::new(),
     };
 
     // Initial shroud reveal around starting units

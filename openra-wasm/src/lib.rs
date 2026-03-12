@@ -363,6 +363,15 @@ impl GameSession {
             extra_data: None,
         });
     }
+
+    pub fn order_activate_superweapon(&mut self, weapon_type: &str, x: i32, y: i32) {
+        self.pending_orders.push(GameOrder {
+            order_string: "ActivateSuperweapon".into(),
+            subject_id: Some(self.human_player_id),
+            target_string: Some(format!("{},{},{}", weapon_type, x, y)),
+            extra_data: None,
+        });
+    }
 }
 
 // ── Sprite Atlas ───────────────────────────────────────────────────────────
