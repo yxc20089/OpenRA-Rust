@@ -51,6 +51,8 @@ let playerLowPower = {};
 let prevActorIds = new Set();           // Actor IDs from previous snapshot
 let buildAnims = {};                     // { actorId: { type, x, y, startTick, owner } }
 let activeEffects = [];                  // { x, y, sprite, frame, maxFrames, startTick }
+let exploredCells = new Set();           // Persistent fog-of-war: cells ever seen
+let wallMap = {};                        // Rebuilt each frame: "x,y" -> wall actor_type
 
 // Construction animation sprite mapping
 const BUILD_ANIM_SPRITES = {
@@ -113,6 +115,7 @@ const BUILDING_FOOTPRINTS = {
 const BUILDING_OVERLAYS = {
     'proc': ['proctop'],
     'sam': ['sam2'],
+    'afld': ['afldidle'],
 };
 
 // Building foundation bibs (rendered under building sprite)
@@ -142,6 +145,18 @@ const HUSK_SPRITES = {
 const SHIP_TURRETS = {
     'ca': 'turr', 'dd': 'ssam', 'pt': 'mgun',
 };
+
+// Wall types: use 16 connection-based frames instead of damage frames
+const WALL_TYPES = new Set(['brik', 'sbag', 'fenc', 'cycl', 'barb']);
+
+// Sight ranges (cells) for fog of war
+const SIGHT_RANGES = {
+    'Building': 6, 'Vehicle': 7, 'Infantry': 5,
+    'Aircraft': 9, 'Ship': 7, 'Mcv': 7,
+};
+
+// Crate actor types
+const CRATE_TYPES = new Set(['scrate', 'wcrate', 'xcratea', 'xcrateb', 'xcratec', 'xcrated']);
 
 // ── HSV color remapping ──
 function rgb2hsv(r, g, b) {
@@ -293,6 +308,7 @@ async function startGame() {
         session = new GameSession();
         mode = 'game'; humanPlayerId = session.human_player_id();
         selectedUnits = []; placementMode = null; playing = true;
+        exploredCells = new Set(); // Reset fog of war for new game
         PLAYER_COLORS[humanPlayerId] = '#4488dd';
         PLAYER_COLORS[humanPlayerId+1] = '#dd4444';
         PLAYER_COLORS_RGB[humanPlayerId] = [68,136,221];
@@ -711,6 +727,14 @@ function render(snapshot) {
     // Detect new/removed actors for animations
     updateAnimations(snapshot);
 
+    // Build wall adjacency map for connection-based frames
+    wallMap = {};
+    for (const a of snapshot.actors) {
+        if (WALL_TYPES.has(a.actor_type)) {
+            wallMap[`${a.x},${a.y}`] = a.actor_type;
+        }
+    }
+
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
 
@@ -741,6 +765,7 @@ function render(snapshot) {
     for (const a of sorted) {
         if (a.kind === 'Tree') drawTree(a);
         else if (a.kind === 'Mine') drawMine(a);
+        else if (CRATE_TYPES.has(a.actor_type)) drawCrate(a);
         else if (a.kind === 'Building') drawBuilding(a);
         else drawUnit(a);
     }
@@ -748,9 +773,18 @@ function render(snapshot) {
     // Draw active effects (explosions, death animations)
     drawEffects();
 
-    // Selection brackets + health bars on selected
+    // Fog of war (game mode only)
+    if (mode === 'game' && humanPlayerId != null) {
+        computeVisibility(snapshot);
+        drawShroud();
+    }
+
+    // Selection ground indicator + brackets + health bars on selected
     for (const a of sorted) {
-        if (selectedUnits.includes(a.id)) drawSelectionBrackets(a);
+        if (selectedUnits.includes(a.id)) {
+            drawSelectionIndicator(a);
+            drawSelectionBrackets(a);
+        }
     }
 
     // Placement ghost
@@ -939,7 +973,16 @@ function drawBuilding(a) {
     const info = spriteInfo[a.actor_type];
     if (info && spriteImages[a.actor_type]) {
         let frame = 0;
-        if (a.max_hp > 0 && a.hp < a.max_hp * 0.5 && info.frames > 1) frame = 1;
+        if (WALL_TYPES.has(a.actor_type)) {
+            // Wall connection frames: 4-bit adjacency mask (N=1, E=2, S=4, W=8)
+            const wt = a.actor_type;
+            const n = wallMap[`${a.x},${a.y-1}`] === wt ? 1 : 0;
+            const e = wallMap[`${a.x+1},${a.y}`] === wt ? 2 : 0;
+            const s = wallMap[`${a.x},${a.y+1}`] === wt ? 4 : 0;
+            const w = wallMap[`${a.x-1},${a.y}`] === wt ? 8 : 0;
+            frame = n | e | s | w;
+            if (frame >= info.frames) frame = 0; // Fallback
+        } else if (a.max_hp > 0 && a.hp < a.max_hp * 0.5 && info.frames > 1) frame = 1;
         const drawW = info.width * scale;
         const drawH = info.height * scale;
         const dx = centerX - drawW / 2;
@@ -959,6 +1002,8 @@ function drawBuilding(a) {
                         if (ovName === 'sam2' && ovInfo.frames >= 32 && a.facing !== undefined) {
                             const step = 1024 / 32;
                             ovFrame = Math.floor(((a.facing + step / 2) & 1023) / step) % 32;
+                        } else if (ovName === 'afldidle' && ovInfo.frames > 1) {
+                            ovFrame = (currentTick * 2) % ovInfo.frames;
                         }
                         drawSprite(ovName, ovFrame, ovDx, ovDy, ovW, ovH, a.owner);
                     }
@@ -990,6 +1035,21 @@ function drawBuilding(a) {
                         ctx.globalAlpha = 0.7;
                         ctx.drawImage(npFrames[0], centerX - npW/2, centerY - npH/2, npW, npH);
                         ctx.globalAlpha = 1;
+                    }
+                }
+            }
+            // Rally point flag (if building has rally point data)
+            if (a.rally_x != null && a.rally_y != null) {
+                const flagInfo = spriteInfo['flagfly'];
+                const flagFrames = spriteImages['flagfly'];
+                if (flagInfo && flagFrames) {
+                    const fFrame = (currentTick * 2) % flagInfo.frames;
+                    if (flagFrames[fFrame]) {
+                        const fW = flagInfo.width * scale;
+                        const fH = flagInfo.height * scale;
+                        const fx = a.rally_x * cellPx - camX + cellPx/2 - fW/2;
+                        const fy = a.rally_y * cellPx - camY + cellPx/2 - fH/2;
+                        ctx.drawImage(flagFrames[fFrame], fx, fy, fW, fH);
                     }
                 }
             }
@@ -1077,6 +1137,19 @@ function drawUnit(a) {
                     const rotorFrames = spriteImages[rotorName];
                     if (rotorFrames[rFrame]) {
                         ctx.drawImage(rotorFrames[rFrame], rCx, rCy, rW, rH);
+                    }
+                }
+            }
+            // Veterancy rank indicator (if rank data present in snapshot)
+            if (a.rank > 0 && !huskName) {
+                const rankInfo = spriteInfo['rank'];
+                const rankFrames = spriteImages['rank'];
+                if (rankInfo && rankFrames) {
+                    const rFrame = Math.min(a.rank - 1, rankInfo.frames - 1);
+                    if (rankFrames[rFrame]) {
+                        const rkW = rankInfo.width * scale;
+                        const rkH = rankInfo.height * scale;
+                        ctx.drawImage(rankFrames[rFrame], sx + cellPx - rkW, sy, rkW, rkH);
                     }
                 }
             }
@@ -1230,6 +1303,111 @@ function drawPlacementGhost() {
     ctx.setLineDash([3, 3]); ctx.strokeRect(gx, gy, fw * cellPx, fh * cellPx); ctx.setLineDash([]);
 }
 
+// ── Crate rendering ──
+function drawCrate(a) {
+    const sx = a.x * cellPx - camX, sy = a.y * cellPx - camY;
+    if (sx + cellPx < 0 || sx > canvas.width || sy + cellPx < 0 || sy > canvas.height) return;
+    const scale = cellPx / CELL_PX;
+    const info = spriteInfo[a.actor_type];
+    const frames = spriteImages[a.actor_type];
+    if (info && frames && frames[0]) {
+        const drawW = info.width * scale, drawH = info.height * scale;
+        ctx.drawImage(frames[0], sx + cellPx/2 - drawW/2, sy + cellPx/2 - drawH/2, drawW, drawH);
+    } else {
+        // Fallback: small gold/silver box
+        ctx.fillStyle = a.actor_type === 'wcrate' ? '#c0c0c0' : '#c8a830';
+        ctx.fillRect(sx + cellPx*0.2, sy + cellPx*0.2, cellPx*0.6, cellPx*0.6);
+        ctx.strokeStyle = '#000'; ctx.lineWidth = 1;
+        ctx.strokeRect(sx + cellPx*0.2, sy + cellPx*0.2, cellPx*0.6, cellPx*0.6);
+    }
+}
+
+// ── Selection ground indicator (select.shp) ──
+function drawSelectionIndicator(a) {
+    const selectInfo = spriteInfo['select'];
+    const selectFrames = spriteImages['select'];
+    if (!selectInfo || !selectFrames) return;
+    const scale = cellPx / CELL_PX;
+    let sx, sy, bw, bh;
+    if (a.kind === 'Building') {
+        const fp = BUILDING_FOOTPRINTS[a.actor_type] || [2,2];
+        sx = a.x * cellPx - camX; sy = a.y * cellPx - camY;
+        bw = fp[0] * cellPx; bh = fp[1] * cellPx;
+    } else {
+        sx = a.x * cellPx - camX; sy = a.y * cellPx - camY;
+        bw = cellPx; bh = cellPx;
+    }
+    // Animate selection circle
+    const sFrame = (currentTick * 3) % selectInfo.frames;
+    if (selectFrames[sFrame]) {
+        const sW = selectInfo.width * scale;
+        const sH = selectInfo.height * scale;
+        // Scale to fit footprint
+        const fitW = Math.max(sW, bw * 0.8);
+        const fitH = Math.max(sH, bh * 0.8);
+        ctx.globalAlpha = 0.5;
+        ctx.drawImage(selectFrames[sFrame], sx + bw/2 - fitW/2, sy + bh/2 - fitH/2, fitW, fitH);
+        ctx.globalAlpha = 1;
+    }
+}
+
+// ── Fog of War ──
+function computeVisibility(snapshot) {
+    if (!snapshot || humanPlayerId == null) return;
+    const visibleNow = new Set();
+    for (const a of snapshot.actors) {
+        if (a.owner !== humanPlayerId) continue;
+        const range = SIGHT_RANGES[a.kind] || 5;
+        const r2 = range * range;
+        // For buildings, use center of footprint
+        let cx = a.x, cy = a.y;
+        if (a.kind === 'Building') {
+            const fp = BUILDING_FOOTPRINTS[a.actor_type] || [2,2];
+            cx = a.x + fp[0] / 2;
+            cy = a.y + fp[1] / 2;
+        }
+        for (let dy = -range; dy <= range; dy++) {
+            for (let dx = -range; dx <= range; dx++) {
+                if (dx*dx + dy*dy <= r2) {
+                    const key = `${Math.floor(cx+dx)},${Math.floor(cy+dy)}`;
+                    visibleNow.add(key);
+                    exploredCells.add(key);
+                }
+            }
+        }
+    }
+    // Store for drawShroud
+    computeVisibility._visible = visibleNow;
+}
+
+function drawShroud() {
+    const visibleNow = computeVisibility._visible;
+    if (!visibleNow) return;
+    // Determine visible cell range on screen
+    const startCX = Math.floor(camX / cellPx);
+    const startCY = Math.floor(camY / cellPx);
+    const endCX = Math.ceil((camX + canvas.width) / cellPx);
+    const endCY = Math.ceil((camY + canvas.height) / cellPx);
+    for (let cy = startCY; cy <= endCY; cy++) {
+        for (let cx = startCX; cx <= endCX; cx++) {
+            if (cx < 0 || cy < 0 || cx >= mapW || cy >= mapH) continue;
+            const key = `${cx},${cy}`;
+            const px = cx * cellPx - camX;
+            const py = cy * cellPx - camY;
+            if (visibleNow.has(key)) continue; // Fully visible
+            if (exploredCells.has(key)) {
+                // Fog: explored but not currently visible
+                ctx.fillStyle = 'rgba(0,0,0,0.45)';
+                ctx.fillRect(px, py, cellPx, cellPx);
+            } else {
+                // Shroud: never explored
+                ctx.fillStyle = '#000';
+                ctx.fillRect(px, py, cellPx, cellPx);
+            }
+        }
+    }
+}
+
 // ── Minimap (drawn in sidebar canvas) ──
 function drawMinimap(snapshot) {
     const mmW = 222, mmH = 222;
@@ -1254,9 +1432,14 @@ function drawMinimap(snapshot) {
         }
     }
 
-    // Actors
+    // Actors (hide enemy actors in fog in game mode)
+    const visibleNow = computeVisibility._visible;
     for (const a of snapshot.actors) {
         if (a.kind === 'Tree' || a.kind === 'Mine') continue;
+        // In game mode, only show enemy actors in currently visible cells
+        if (mode === 'game' && humanPlayerId != null && a.owner !== humanPlayerId && visibleNow) {
+            if (!visibleNow.has(`${a.x},${a.y}`)) continue;
+        }
         mmCtx.fillStyle = PLAYER_COLORS[a.owner] || '#888';
         if (a.kind === 'Building') {
             const fp = BUILDING_FOOTPRINTS[a.actor_type] || [2,2];
@@ -1265,6 +1448,25 @@ function drawMinimap(snapshot) {
         } else {
             mmCtx.fillRect(offX + a.x * scale, offY + a.y * scale,
                 Math.max(1, scale*1.5), Math.max(1, scale*1.5));
+        }
+    }
+
+    // Minimap shroud overlay (game mode)
+    if (mode === 'game' && humanPlayerId != null && exploredCells.size > 0) {
+        for (let cy = 0; cy < mapH; cy++) {
+            for (let cx = 0; cx < mapW; cx++) {
+                const key = `${cx},${cy}`;
+                const px = offX + cx * scale;
+                const py = offY + cy * scale;
+                if (visibleNow && visibleNow.has(key)) continue;
+                if (exploredCells.has(key)) {
+                    mmCtx.fillStyle = 'rgba(0,0,0,0.35)';
+                    mmCtx.fillRect(px, py, Math.max(1, scale), Math.max(1, scale));
+                } else {
+                    mmCtx.fillStyle = '#000';
+                    mmCtx.fillRect(px, py, Math.max(1, scale), Math.max(1, scale));
+                }
+            }
         }
     }
 
