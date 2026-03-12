@@ -11,6 +11,7 @@ use serde::Serialize;
 pub use crate::actor::ActorKind;
 
 use crate::actor::{Activity, Actor, HarvestState};
+use crate::ai::Bot;
 use crate::gamerules::GameRules;
 use crate::math::{CPos, WPos};
 use crate::pathfinder;
@@ -31,6 +32,8 @@ pub struct LobbyInfo {
 pub struct SlotInfo {
     pub player_reference: String,
     pub faction: String,
+    /// Whether this slot is controlled by an AI bot.
+    pub is_bot: bool,
 }
 
 impl Default for LobbyInfo {
@@ -204,6 +207,8 @@ pub struct World {
     shroud: Vec<CellLayer<u8>>,
     /// Compiled game rules for lookups (costs, stats, weapons).
     pub rules: GameRules,
+    /// AI bots controlling their respective players.
+    bots: Vec<Bot>,
 }
 
 impl World {
@@ -400,9 +405,17 @@ impl World {
             self.update_debug_pause_state();
         }
 
-        // 1. Process orders
+        // 1. Process replay/external orders
         for order in orders {
             self.process_order(order);
+        }
+
+        // 1b. Generate and process bot AI orders
+        if !self.bots.is_empty() && !self.paused {
+            let bot_orders = self.tick_bots();
+            for order in &bot_orders {
+                self.process_order(order);
+            }
         }
 
         // 2. Compute SyncHash
@@ -1100,6 +1113,20 @@ impl World {
         }
     }
 
+    /// Run all bot AIs and collect their orders.
+    /// Temporarily takes bots out of self to satisfy the borrow checker
+    /// (Bot::tick needs &World while we need &mut self later to process orders).
+    fn tick_bots(&mut self) -> Vec<GameOrder> {
+        let mut bots = std::mem::take(&mut self.bots);
+        let mut all_orders = Vec::new();
+        for bot in &mut bots {
+            let orders = bot.tick(self);
+            all_orders.extend(orders);
+        }
+        self.bots = bots;
+        all_orders
+    }
+
     /// Tick all actors (activities and ITick traits).
     fn tick_actors(&mut self) {
         // On tick 1, ClassicProductionQueue.Tick() sets Enabled=false
@@ -1765,10 +1792,12 @@ fn build_mcv_traits(spawn_x: i32, spawn_y: i32, facing: i32) -> Vec<TraitState> 
 }
 
 /// Build a World from parsed map data, game seed, and lobby info.
+/// If `rules` is Some, uses the provided GameRules; otherwise uses hardcoded defaults.
 pub fn build_world(
     map: &openra_data::oramap::OraMap,
     random_seed: i32,
     lobby: &LobbyInfo,
+    rules: Option<GameRules>,
 ) -> World {
     let rng = MersenneTwister::new(random_seed);
     let mut actors: BTreeMap<u32, Actor> = BTreeMap::new();
@@ -1807,7 +1836,8 @@ pub fn build_world(
     }
 
     // Playable players
-    for _slot in &lobby.occupied_slots {
+    let mut bot_player_ids: Vec<u32> = Vec::new();
+    for slot in &lobby.occupied_slots {
         let id = next_id;
         actors.insert(id, Actor {
             id,
@@ -1819,6 +1849,9 @@ pub fn build_world(
             actor_type: None,
         });
         player_actor_ids.push(id);
+        if slot.is_bot {
+            bot_player_ids.push(id);
+        }
         next_id += 1;
     }
 
@@ -1956,6 +1989,14 @@ pub fn build_world(
         .map(|_| CellLayer::new(map.map_size.0, map.map_size.1))
         .collect();
 
+    // Create Bot instances for AI-controlled players
+    let bots: Vec<Bot> = bot_player_ids.iter()
+        .map(|&pid| Bot::new(pid))
+        .collect();
+    if !bots.is_empty() {
+        eprintln!("Created {} bot(s): {:?}", bots.len(), bot_player_ids);
+    }
+
     let mut world = World {
         actors,
         synced_effects: Vec::new(),
@@ -1975,7 +2016,8 @@ pub fn build_world(
         map_width: map.map_size.0,
         map_height: map.map_size.1,
         shroud,
-        rules: GameRules::defaults(),
+        rules: rules.unwrap_or_else(GameRules::defaults),
+        bots,
     };
 
     // Initial shroud reveal around starting units

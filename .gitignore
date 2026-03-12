@@ -23,3 +23,6 @@ golden/*.json
 
 # Docker
 .docker-cargo-cache/
+
+# Vendor (cloned dependencies)
+/vendor/

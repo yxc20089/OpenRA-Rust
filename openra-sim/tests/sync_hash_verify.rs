@@ -14,6 +14,7 @@ fn lobby_from_replay(replay: &orarep::Replay) -> LobbyInfo {
         SlotInfo {
             player_reference: player_ref.clone(),
             faction: faction.clone(),
+            is_bot: false,
         }
     }).collect();
 
@@ -56,7 +57,7 @@ fn sync_hash_tick0_matches_replay() {
     let lobby = lobby_from_replay(&replay);
 
     // Build world
-    let w = world::build_world(&map, settings.random_seed, &lobby);
+    let w = world::build_world(&map, settings.random_seed, &lobby, None);
 
     // Show first few sync hash entries with their frame numbers
     for (i, sh) in replay.sync_hashes.iter().take(5).enumerate() {
@@ -115,7 +116,7 @@ fn sync_hash_multi_frame() {
 
     let settings = replay.lobby_settings().expect("No lobby settings");
     let lobby = lobby_from_replay(&replay);
-    let mut w = world::build_world(&map, settings.random_seed, &lobby);
+    let mut w = world::build_world(&map, settings.random_seed, &lobby, None);
 
     let mut matched = 0;
     let mut total = replay.sync_hashes.len();

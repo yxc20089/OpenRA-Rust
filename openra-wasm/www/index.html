@@ -7,16 +7,17 @@
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { background: #1a1a2e; color: #e0e0e0; font-family: monospace; display: flex; flex-direction: column; align-items: center; padding: 20px; }
 h1 { margin-bottom: 16px; color: #e94560; }
-.controls { margin: 12px 0; display: flex; gap: 10px; align-items: center; }
-button { background: #e94560; color: white; border: none; padding: 6px 16px; cursor: pointer; font-family: monospace; font-size: 14px; }
+.controls { margin: 12px 0; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: center; }
+button { background: #e94560; color: white; border: none; padding: 6px 16px; cursor: pointer; font-family: monospace; font-size: 14px; border-radius: 3px; }
 button:hover { background: #c73650; }
 button:disabled { background: #555; cursor: not-allowed; }
-.file-inputs { margin-bottom: 16px; display: flex; gap: 20px; }
-.file-inputs label { display: flex; flex-direction: column; gap: 4px; }
-canvas { border: 1px solid #333; background: #0a3d0a; }
-#status { margin-top: 8px; font-size: 13px; color: #aaa; }
+.file-inputs { margin-bottom: 16px; display: flex; gap: 20px; flex-wrap: wrap; justify-content: center; }
+.file-inputs label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+canvas { border: 1px solid #333; background: #1a3a1a; }
+#status { margin-top: 8px; font-size: 13px; color: #aaa; max-width: 960px; text-align: center; }
 #speed-label { font-size: 13px; }
-input[type="range"] { width: 100px; }
+input[type="range"] { width: 100px; vertical-align: middle; }
+input[type="file"] { font-size: 12px; color: #ccc; }
 </style>
 </head>
 <body>
@@ -31,7 +32,7 @@ input[type="range"] { width: 100px; }
   <button id="btn-step" disabled>Step</button>
   <label id="speed-label">Speed: <input type="range" id="speed" min="1" max="60" value="10"> <span id="speed-val">10</span></label>
 </div>
-<canvas id="canvas" width="800" height="600"></canvas>
+<canvas id="canvas" width="960" height="720"></canvas>
 <div id="status">Load a replay and map to begin.</div>
 <script type="module" src="index.js"></script>
 </body>

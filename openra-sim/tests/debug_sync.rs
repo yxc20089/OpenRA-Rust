@@ -9,6 +9,7 @@ fn lobby_from_replay(replay: &orarep::Replay) -> LobbyInfo {
         SlotInfo {
             player_reference: player_ref.clone(),
             faction: faction.clone(),
+            is_bot: false,
         }
     }).collect();
     LobbyInfo {
@@ -36,7 +37,7 @@ fn debug_orders_and_hashes() {
     let map = oramap::parse(&map_data).unwrap();
     let settings = replay.lobby_settings().unwrap();
     let lobby = lobby_from_replay(&replay);
-    let mut w = world::build_world(&map, settings.random_seed, &lobby);
+    let mut w = world::build_world(&map, settings.random_seed, &lobby, None);
 
     // Dump ALL orders around the mismatch area
     eprintln!("=== ALL orders for frames 30-50 ===");

@@ -21,6 +21,7 @@ fn lobby_from_replay(replay: &orarep::Replay) -> LobbyInfo {
         .map(|(_, player_ref, faction)| SlotInfo {
             player_reference: player_ref.clone(),
             faction: faction.clone(),
+            is_bot: false,
         })
         .collect();
     LobbyInfo {
@@ -65,7 +66,7 @@ impl ReplayViewer {
             .lobby_settings()
             .ok_or_else(|| JsValue::from_str("No lobby settings in replay"))?;
         let lobby = lobby_from_replay(&replay);
-        let world = world::build_world(&map, settings.random_seed, &lobby);
+        let world = world::build_world(&map, settings.random_seed, &lobby, None);
 
         let max_frame = replay
             .sync_hashes

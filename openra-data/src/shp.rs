@@ -2,6 +2,7 @@
 //!
 //! Decodes SHP files from the Tiberian Dawn / Red Alert engine format.
 //! Each SHP file contains multiple frames of 8-bit indexed pixel data.
+//! Global width/height apply to all frames.
 //!
 //! Reference: OpenRA.Mods.Common/SpriteLoaders/ShpTDLoader.cs
 
@@ -17,65 +18,63 @@ pub struct SpriteFrame {
 /// A decoded SHP file containing multiple frames.
 #[derive(Debug, Clone)]
 pub struct ShpFile {
+    pub width: u16,
+    pub height: u16,
     pub frames: Vec<SpriteFrame>,
 }
 
-/// SHP format constants.
-const FORMAT_XOR_PREV: u8 = 0x20;
-const FORMAT_XOR_BASE: u8 = 0x40;
-const FORMAT_80: u8 = 0x80;
-
 /// Decode an SHP TD format file from raw bytes.
+///
+/// File layout:
+/// - Header: u16 num_images, u16 x, u16 y, u16 width, u16 height (10 bytes)
+/// - Offset table: (num_images + 2) entries, each 8 bytes
+///   - 3 bytes offset (LE) + 1 byte format + 3 bytes ref_offset + 1 byte ref_format
+/// - Frame data: Format80 (LCW) compressed pixel data at each offset
 pub fn decode(data: &[u8]) -> Result<ShpFile, String> {
     if data.len() < 14 {
         return Err("SHP file too small".into());
     }
 
-    // Header: u16 num_images, then x, y, width, height (all u16)
+    // Header: 5 x u16
     let num_images = read_u16(data, 0) as usize;
+    let _x = read_u16(data, 2);
+    let _y = read_u16(data, 4);
+    let width = read_u16(data, 6);
+    let height = read_u16(data, 8);
+
     if num_images == 0 {
         return Err("SHP file has zero frames".into());
     }
 
-    // Read frame offsets (num_images + 2 entries, each 8 bytes)
-    // Format: offset(3 bytes LE) + format(1 byte) + refoff(3 bytes) + refformat(1 byte)
-    let header_size = 2;
-    let offset_entry_size = 8;
+    // Offset table starts at byte 10
+    let table_start = 10;
+    let entry_size = 8;
+    let table_end = table_start + (num_images + 2) * entry_size;
 
-    if data.len() < header_size + (num_images + 2) * offset_entry_size {
+    if data.len() < table_end {
         return Err("SHP file truncated in offset table".into());
     }
 
     let mut offsets = Vec::with_capacity(num_images + 2);
     for i in 0..(num_images + 2) {
-        let base = header_size + i * offset_entry_size;
-        let offset = read_u24(data, base);
+        let base = table_start + i * entry_size;
+        let offset = read_u24(data, base) as usize;
         let format = data[base + 3];
-        let ref_offset = read_u24(data, base + 4);
+        let ref_offset = read_u24(data, base + 4) as usize;
         let ref_format = data[base + 7];
         offsets.push(FrameHeader {
-            offset: offset as usize,
+            offset,
             format,
-            ref_offset: ref_offset as usize,
+            ref_offset,
             ref_format,
         });
     }
 
-    // Read image dimensions from first frame header
-    // After offset table: each frame at its offset has a small header
+    let pixel_count = width as usize * height as usize;
     let mut frames = Vec::with_capacity(num_images);
 
     for i in 0..num_images {
         let hdr = &offsets[i];
-        let frame_start = hdr.offset;
-
-        if frame_start + 4 > data.len() {
-            return Err(format!("Frame {} offset out of bounds", i));
-        }
-
-        let width = read_u16(data, frame_start);
-        let height = read_u16(data, frame_start + 2);
-        let pixel_count = width as usize * height as usize;
 
         if pixel_count == 0 {
             frames.push(SpriteFrame {
@@ -86,33 +85,31 @@ pub fn decode(data: &[u8]) -> Result<ShpFile, String> {
             continue;
         }
 
-        // Compressed data starts after the 4-byte frame header (width, height)
-        let compressed_start = frame_start + 4;
-        let compressed_data = &data[compressed_start..];
+        if hdr.offset >= data.len() {
+            return Err(format!("Frame {} offset {} out of bounds (file size {})",
+                i, hdr.offset, data.len()));
+        }
 
-        let pixels = match hdr.format {
-            FORMAT_80 => decode_format80(compressed_data, pixel_count)?,
-            FORMAT_XOR_PREV if i > 0 => {
-                let prev = &frames[i - 1].pixels;
-                let base_decoded = decode_format80(compressed_data, pixel_count)?;
-                xor_buffers(prev, &base_decoded)
-            }
-            FORMAT_XOR_BASE => {
-                // XOR with the reference frame
-                let ref_hdr = &offsets[i];
-                let ref_start = ref_hdr.ref_offset;
-                if ref_start + 4 > data.len() {
-                    return Err(format!("Ref frame offset out of bounds for frame {}", i));
-                }
-                let ref_compressed = &data[ref_start + 4..];
-                let ref_decoded = decode_format80(ref_compressed, pixel_count)?;
-                let base_decoded = decode_format80(compressed_data, pixel_count)?;
-                xor_buffers(&ref_decoded, &base_decoded)
-            }
-            _ => {
-                // Treat as format 80
-                decode_format80(compressed_data, pixel_count)?
-            }
+        // Compressed data starts directly at the offset (no per-frame header)
+        let compressed_data = &data[hdr.offset..];
+
+        let pixels = if hdr.format & 0x80 != 0 {
+            // Format80 (LCW)
+            decode_format80(compressed_data, pixel_count)?
+        } else if hdr.format & 0x40 != 0 {
+            // XOR with base reference frame
+            let base_pixels = decode_format80(compressed_data, pixel_count)?;
+            let ref_data = &data[hdr.ref_offset..];
+            let ref_pixels = decode_format80(ref_data, pixel_count)?;
+            xor_buffers(&ref_pixels, &base_pixels)
+        } else if hdr.format & 0x20 != 0 && i > 0 {
+            // XOR with previous frame
+            let base_pixels = decode_format80(compressed_data, pixel_count)?;
+            let prev = &frames[i - 1].pixels;
+            xor_buffers(prev, &base_pixels)
+        } else {
+            // Default: Format80
+            decode_format80(compressed_data, pixel_count)?
         };
 
         frames.push(SpriteFrame {
@@ -122,7 +119,7 @@ pub fn decode(data: &[u8]) -> Result<ShpFile, String> {
         });
     }
 
-    Ok(ShpFile { frames })
+    Ok(ShpFile { width, height, frames })
 }
 
 #[derive(Debug)]
@@ -135,7 +132,17 @@ struct FrameHeader {
 }
 
 /// Decode Format80 (LCW) compressed data.
-/// This is the compression used by Westwood's SHP files.
+///
+/// Command byte encoding:
+/// - 0x80: end of data
+/// - 0xFF nn nn pp pp: copy nn bytes from absolute dest position pp
+/// - 0xFE nn nn vv: fill nn bytes with value vv
+/// - 11cccccc pp pp: copy (c+3) bytes from absolute dest position pp
+/// - 10cccccc dd: copy (c+3) bytes from relative position (current - dd)
+///   Note: the 10xxxxxx form is NOT present in standard Format80.
+///   Actually in Westwood's Format80, 10cccccc is just a shorter form:
+///   copy (c+3) from relative offset stored in next byte as: (dest_pos - byte)
+/// - 0ccccccc: copy c bytes directly from source stream
 fn decode_format80(src: &[u8], max_output: usize) -> Result<Vec<u8>, String> {
     let mut dest = Vec::with_capacity(max_output);
     let mut i = 0;
@@ -145,110 +152,71 @@ fn decode_format80(src: &[u8], max_output: usize) -> Result<Vec<u8>, String> {
         i += 1;
 
         if cmd == 0x80 {
-            // End of data
             break;
         } else if cmd == 0xFF {
-            // Long absolute move: 0xFF count_lo count_hi src_lo src_hi
-            if i + 4 > src.len() {
-                break;
-            }
+            // Long copy from absolute dest position: 0xFF count_lo count_hi pos_lo pos_hi
+            if i + 4 > src.len() { break; }
             let count = read_u16(src, i) as usize;
-            let src_pos = read_u16(src, i + 2) as usize;
+            let pos = read_u16(src, i + 2) as usize;
             i += 4;
-            for j in 0..count {
-                if dest.len() >= max_output {
-                    break;
-                }
-                if src_pos + j < dest.len() {
-                    dest.push(dest[src_pos + j]);
-                } else {
-                    dest.push(0);
-                }
-            }
+            copy_from_dest(&mut dest, pos, count, max_output);
         } else if cmd == 0xFE {
             // Long fill: 0xFE count_lo count_hi value
-            if i + 3 > src.len() {
-                break;
-            }
+            if i + 3 > src.len() { break; }
             let count = read_u16(src, i) as usize;
             let value = src[i + 2];
             i += 3;
-            for _ in 0..count.min(max_output - dest.len()) {
-                dest.push(value);
-            }
+            let actual = count.min(max_output - dest.len());
+            dest.extend(std::iter::repeat(value).take(actual));
         } else if cmd & 0x80 != 0 {
             if cmd & 0x40 != 0 {
-                // Short absolute move from dest: 11cccccc src_lo src_hi
+                // 11cccccc pos_lo pos_hi: copy (c+3) from absolute dest position
                 let count = ((cmd & 0x3F) as usize) + 3;
-                if i + 2 > src.len() {
-                    break;
-                }
-                let src_pos = read_u16(src, i) as usize;
+                if i + 2 > src.len() { break; }
+                let pos = read_u16(src, i) as usize;
                 i += 2;
-                for j in 0..count {
-                    if dest.len() >= max_output {
-                        break;
-                    }
-                    if src_pos + j < dest.len() {
-                        dest.push(dest[src_pos + j]);
-                    } else {
-                        dest.push(0);
-                    }
-                }
+                copy_from_dest(&mut dest, pos, count, max_output);
             } else {
-                // Short relative move from dest: 10cccccc offset
-                let count = ((cmd >> 0) & 0x3F) as usize;
-                if count == 0 {
-                    break; // Zero count = end
-                }
-                let count = count + 3; // minimum copy of 3
-                if i >= src.len() {
-                    break;
-                }
-                // Relative offset: negative from current dest position
-                // But in Format80, this is actually: 10cccccc d (copy count+3 bytes from dest[dest.len()-d..])
-                // Wait — Format80 doesn't use relative offsets this way.
-                // Actually: 10cccccc d -> copy (c+3) bytes starting at (dest.len() - d)
-                // But d is only 1 byte, so max 255 lookback... that's not right.
-                // Let me re-check: 10xxxxxx = (count-3) in bits 0-5, offset from current in next byte
-                // Actually the correct Form80 is more nuanced. Let me use a simpler approach.
+                // 10cccccc dd: copy (c+3) from relative dest position (current - dd)
+                // Note: count field is (cmd & 0x3F), actual count = field + 3
+                // But if field is 0 and next byte gives more info... no, just (c+3)
+                let count = ((cmd & 0x3F) as usize) + 3;
+                if i >= src.len() { break; }
                 let offset_byte = src[i] as usize;
                 i += 1;
-                let src_pos = if dest.len() >= offset_byte {
+                let pos = if dest.len() >= offset_byte {
                     dest.len() - offset_byte
                 } else {
                     0
                 };
-                for j in 0..count - 3 {
-                    if dest.len() >= max_output {
-                        break;
-                    }
-                    if src_pos + j < dest.len() {
-                        dest.push(dest[src_pos + j]);
-                    } else {
-                        dest.push(0);
-                    }
-                }
+                copy_from_dest(&mut dest, pos, count, max_output);
             }
         } else {
-            // Direct copy: 0ccccccc = copy (c) bytes from source
+            // 0ccccccc: copy c bytes from source
             let count = cmd as usize;
-            if count == 0 {
-                break;
-            }
-            for _ in 0..count {
-                if dest.len() >= max_output || i >= src.len() {
-                    break;
-                }
-                dest.push(src[i]);
-                i += 1;
-            }
+            if count == 0 { break; }
+            let actual = count.min(src.len() - i).min(max_output - dest.len());
+            dest.extend_from_slice(&src[i..i + actual]);
+            i += actual;
         }
     }
 
-    // Pad to expected size if needed
+    // Pad to expected size
     dest.resize(max_output, 0);
     Ok(dest)
+}
+
+/// Copy `count` bytes from dest[pos..] back into dest, byte-by-byte to handle overlapping.
+fn copy_from_dest(dest: &mut Vec<u8>, pos: usize, count: usize, max_output: usize) {
+    for j in 0..count {
+        if dest.len() >= max_output { break; }
+        let src_idx = pos + j;
+        if src_idx < dest.len() {
+            dest.push(dest[src_idx]);
+        } else {
+            dest.push(0);
+        }
+    }
 }
 
 /// XOR two buffers together.
@@ -282,9 +250,24 @@ mod tests {
 
     #[test]
     fn decode_empty_shp() {
-        // Minimal SHP with 0 frames
         let data = [0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let result = decode(&data);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn format80_direct_copy() {
+        // 0x03 = copy 3 bytes from source, then 0x80 = end
+        let src = [0x03, 0xAA, 0xBB, 0xCC, 0x80];
+        let result = decode_format80(&src, 3).unwrap();
+        assert_eq!(result, vec![0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn format80_fill() {
+        // 0xFE, count=4, value=0x42
+        let src = [0xFE, 0x04, 0x00, 0x42, 0x80];
+        let result = decode_format80(&src, 4).unwrap();
+        assert_eq!(result, vec![0x42, 0x42, 0x42, 0x42]);
     }
 }
