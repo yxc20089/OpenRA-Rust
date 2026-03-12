@@ -6,7 +6,9 @@
 
 pub mod actor;
 pub mod math;
+pub mod pathfinder;
 pub mod rng;
 pub mod sync;
+pub mod terrain;
 pub mod traits;
 pub mod world;

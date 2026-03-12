@@ -12,8 +12,10 @@ pub use crate::actor::ActorKind;
 
 use crate::actor::{Activity, Actor};
 use crate::math::{CPos, WPos};
+use crate::pathfinder;
 use crate::rng::MersenneTwister;
 use crate::sync;
+use crate::terrain::TerrainMap;
 use crate::traits::{PqType, TraitState};
 
 /// Lobby information extracted from the replay's SyncInfo orders.
@@ -173,6 +175,8 @@ pub struct World {
     seeds_resource_ticks: i32,
     /// Active production items per player actor ID.
     production: HashMap<u32, Vec<ProductionItem>>,
+    /// Terrain and occupancy map.
+    pub terrain: TerrainMap,
     /// Map dimensions (cells).
     map_width: i32,
     map_height: i32,
@@ -363,10 +367,128 @@ impl World {
                     }
                 }
             }
+            "Move" => {
+                if let Some(subject_id) = order.subject_id {
+                    if let Some(ref ts) = order.target_string {
+                        // Parse "X,Y" target cell
+                        if let Some(target) = parse_cell_target(ts) {
+                            self.order_move(subject_id, target);
+                        }
+                    }
+                }
+            }
+            "AttackMove" => {
+                if let Some(subject_id) = order.subject_id {
+                    if let Some(ref ts) = order.target_string {
+                        if let Some(target) = parse_cell_target(ts) {
+                            self.order_move(subject_id, target);
+                        }
+                    }
+                }
+            }
+            "Attack" => {
+                if let Some(subject_id) = order.subject_id {
+                    if let Some(target_actor_id) = order.extra_data {
+                        self.order_attack(subject_id, target_actor_id);
+                    }
+                }
+            }
+            "PlaceBuilding" => {
+                if let (Some(subject_id), Some(ts)) = (order.subject_id, &order.target_string) {
+                    // Format: "building_type,X,Y"
+                    let parts: Vec<&str> = ts.split(',').collect();
+                    if parts.len() >= 3 {
+                        let building_type = parts[0].trim();
+                        if let (Ok(x), Ok(y)) = (parts[1].trim().parse::<i32>(), parts[2].trim().parse::<i32>()) {
+                            self.order_place_building(subject_id, building_type, x, y);
+                        }
+                    }
+                }
+            }
+            "Stop" => {
+                if let Some(subject_id) = order.subject_id {
+                    if let Some(actor) = self.actors.get_mut(&subject_id) {
+                        actor.activity = None;
+                    }
+                }
+            }
             "StartGame" | "Command" => {}
             other => {
                 eprintln!("ORDER: unhandled '{}' subject={:?}", other, order.subject_id);
             }
+        }
+    }
+
+    /// Handle a Move order: pathfind and start moving.
+    fn order_move(&mut self, actor_id: u32, target: (i32, i32)) {
+        let from = match self.actors.get(&actor_id).and_then(|a| a.location) {
+            Some(loc) => loc,
+            None => return,
+        };
+        if let Some(path) = pathfinder::find_path(&self.terrain, from, target, Some(actor_id)) {
+            if path.len() > 1 {
+                // Get speed from rules or use default
+                let speed = self.actor_speed(actor_id);
+                if let Some(actor) = self.actors.get_mut(&actor_id) {
+                    actor.activity = Some(Activity::Move {
+                        path,
+                        path_index: 1, // Skip the start cell
+                        speed,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Handle an Attack order: set attack activity.
+    fn order_attack(&mut self, actor_id: u32, target_id: u32) {
+        // Default weapon range of 5 cells (will be from rules later)
+        if let Some(actor) = self.actors.get_mut(&actor_id) {
+            actor.activity = Some(Activity::Attack {
+                target_id,
+                weapon_range: 5,
+            });
+        }
+    }
+
+    /// Handle PlaceBuilding order: create building actor and occupy terrain.
+    fn order_place_building(&mut self, owner_player_id: u32, building_type: &str, x: i32, y: i32) {
+        let (footprint_w, footprint_h, hp) = building_footprint(building_type);
+        let building_id = self.next_actor_id;
+        self.next_actor_id += 1;
+
+        let top_left = CPos::new(x, y);
+        let building = Actor {
+            id: building_id,
+            kind: ActorKind::Building,
+            owner_id: Some(owner_player_id),
+            location: Some((x, y)),
+            traits: vec![
+                TraitState::BodyOrientation { quantized_facings: 1 },
+                TraitState::Building { top_left },
+                TraitState::Health { hp },
+                TraitState::RevealsShroud,
+            ],
+            activity: None,
+        };
+        self.actors.insert(building_id, building);
+        self.terrain.occupy_footprint(x, y, footprint_w, footprint_h, building_id);
+
+        eprintln!("PLACE: {} at ({},{}) id={} footprint={}x{}",
+            building_type, x, y, building_id, footprint_w, footprint_h);
+    }
+
+    /// Get movement speed for an actor (world units per tick).
+    fn actor_speed(&self, actor_id: u32) -> i32 {
+        if let Some(actor) = self.actors.get(&actor_id) {
+            match actor.kind {
+                ActorKind::Infantry => 43,   // ~24 ticks/cell
+                ActorKind::Vehicle => 85,    // ~12 ticks/cell
+                ActorKind::Mcv => 56,        // ~18 ticks/cell
+                _ => 56,
+            }
+        } else {
+            56
         }
     }
 
@@ -431,6 +553,118 @@ impl World {
                             deploy_ready.push((actor.id, loc, owner));
                         }
                     }
+                }
+            }
+        }
+
+        // Tick Move activities: advance position along path.
+        let mut move_completions: Vec<u32> = Vec::new();
+        for actor in self.actors.values_mut() {
+            if let Some(Activity::Move { ref path, ref mut path_index, speed }) = actor.activity {
+                if *path_index >= path.len() {
+                    move_completions.push(actor.id);
+                    continue;
+                }
+                let target_cell = path[*path_index];
+                let target_center = center_of_cell(target_cell.0, target_cell.1);
+
+                // Update facing toward target
+                if let Some(current_loc) = actor.location {
+                    let desired_facing = pathfinder::facing_between(current_loc, target_cell);
+                    for t in &mut actor.traits {
+                        if let TraitState::Mobile { facing, .. } = t {
+                            *facing = desired_facing;
+                            break;
+                        }
+                    }
+                }
+
+                // Interpolate CenterPosition toward target
+                let mut arrived = false;
+                for t in &mut actor.traits {
+                    if let TraitState::Mobile { center_position, from_cell, to_cell, .. } = t {
+                        // Set ToCell to target
+                        *to_cell = CPos::new(target_cell.0, target_cell.1);
+
+                        let dx = target_center.x - center_position.x;
+                        let dy = target_center.y - center_position.y;
+                        let dist_sq = (dx as i64) * (dx as i64) + (dy as i64) * (dy as i64);
+                        let speed_sq = (speed as i64) * (speed as i64);
+
+                        if dist_sq <= speed_sq {
+                            // Arrived at cell
+                            *center_position = target_center;
+                            *from_cell = CPos::new(target_cell.0, target_cell.1);
+                            *to_cell = CPos::new(target_cell.0, target_cell.1);
+                            arrived = true;
+                        } else {
+                            // Move toward target
+                            // Use integer approximation: normalize by largest component
+                            let abs_dx = dx.abs().max(1);
+                            let abs_dy = dy.abs().max(1);
+                            let max_comp = abs_dx.max(abs_dy);
+                            center_position.x += dx * speed / max_comp;
+                            center_position.y += dy * speed / max_comp;
+                        }
+                        break;
+                    }
+                }
+
+                if arrived {
+                    actor.location = Some(target_cell);
+                    *path_index += 1;
+                    if *path_index >= path.len() {
+                        move_completions.push(actor.id);
+                    }
+                }
+            }
+        }
+        // Clear completed Move activities
+        for id in move_completions {
+            if let Some(actor) = self.actors.get_mut(&id) {
+                actor.activity = None;
+            }
+        }
+
+        // Tick Attack activities: check range, deal damage.
+        let mut attacks: Vec<(u32, u32, i32)> = Vec::new(); // (attacker, target, damage)
+        for actor in self.actors.values() {
+            if let Some(Activity::Attack { target_id, weapon_range }) = &actor.activity {
+                if let (Some(attacker_loc), Some(target)) =
+                    (actor.location, self.actors.get(target_id))
+                {
+                    if let Some(target_loc) = target.location {
+                        let dx = (attacker_loc.0 - target_loc.0).abs();
+                        let dy = (attacker_loc.1 - target_loc.1).abs();
+                        let dist = dx.max(dy);
+                        if dist <= *weapon_range {
+                            // In range — deal damage (simplified: 100 HP per tick)
+                            attacks.push((actor.id, *target_id, 100));
+                        }
+                    }
+                }
+            }
+        }
+        // Apply damage
+        let mut dead_actors: Vec<u32> = Vec::new();
+        for (_attacker, target_id, damage) in &attacks {
+            if let Some(target) = self.actors.get_mut(target_id) {
+                for t in &mut target.traits {
+                    if let TraitState::Health { hp } = t {
+                        *hp -= damage;
+                        if *hp <= 0 {
+                            dead_actors.push(*target_id);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        // Remove dead actors
+        for id in dead_actors {
+            if let Some(dead) = self.actors.remove(&id) {
+                if let Some(loc) = dead.location {
+                    self.terrain.clear_occupant(loc.0, loc.1);
                 }
             }
         }
@@ -519,6 +753,9 @@ impl World {
         };
         self.actors.insert(fact_id, fact_actor);
 
+        // Occupy terrain (FACT is 3x2)
+        self.terrain.occupy_footprint(fact_location.0, fact_location.1, 3, 2, fact_id);
+
         eprintln!("DEPLOY: created FACT actor {} at {:?} TopLeft.bits={}",
             fact_id, fact_location, top_left.bits);
 
@@ -596,6 +833,34 @@ fn tick_facing(facing: i32, desired: i32, step: i32) -> i32 {
 /// Convert a cell position to world position (rectangular grid).
 pub fn center_of_cell(x: i32, y: i32) -> WPos {
     WPos::new(1024 * x + 512, 1024 * y + 512, 0)
+}
+
+/// Parse "X,Y" cell target from order target_string.
+fn parse_cell_target(s: &str) -> Option<(i32, i32)> {
+    let mut parts = s.split(',');
+    let x = parts.next()?.trim().parse::<i32>().ok()?;
+    let y = parts.next()?.trim().parse::<i32>().ok()?;
+    Some((x, y))
+}
+
+/// Get building footprint dimensions and HP for known building types.
+/// Returns (width, height, hp).
+fn building_footprint(building_type: &str) -> (i32, i32, i32) {
+    match building_type {
+        "powr" => (2, 2, 40000),
+        "apwr" => (2, 2, 70000),
+        "tent" | "barr" => (2, 2, 50000),
+        "weap" | "weap.ukraine" => (3, 2, 100000),
+        "proc" => (3, 2, 90000),
+        "fact" => (3, 2, 150000),
+        "fix" => (3, 2, 80000),
+        "dome" => (2, 2, 60000),
+        "hpad" | "afld" => (2, 2, 80000),
+        "spen" | "syrd" => (3, 3, 120000),
+        "atek" | "stek" => (2, 2, 60000),
+        "pbox" | "hbox" | "gun" | "ftur" | "tsla" | "agun" | "sam" | "gap" => (1, 1, 40000),
+        _ => (2, 2, 50000), // Default
+    }
 }
 
 /// Assign spawn points to playable players using the playerRandom sequence.
@@ -843,6 +1108,23 @@ pub fn build_world(
         next_id += 1;
     }
 
+    // Initialize terrain map and mark existing buildings/trees as occupied.
+    let mut terrain = TerrainMap::new(map.map_size.0, map.map_size.1);
+    for actor in actors.values() {
+        if let Some((x, y)) = actor.location {
+            match actor.kind {
+                ActorKind::Tree | ActorKind::Mine => {
+                    terrain.set_occupant(x, y, actor.id);
+                }
+                ActorKind::Building => {
+                    // Default 2x2 footprint for initial buildings
+                    terrain.occupy_footprint(x, y, 2, 2, actor.id);
+                }
+                _ => {}
+            }
+        }
+    }
+
     World {
         actors,
         synced_effects: Vec::new(),
@@ -858,6 +1140,7 @@ pub fn build_world(
         mine_count,
         seeds_resource_ticks: 0,
         production: HashMap::new(),
+        terrain,
         map_width: map.map_size.0,
         map_height: map.map_size.1,
     }

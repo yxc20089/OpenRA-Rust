@@ -16,6 +16,10 @@ pub enum ActorKind {
     Spawn,
     Mcv,
     Building,
+    Infantry,
+    Vehicle,
+    Aircraft,
+    Ship,
 }
 
 /// An activity queued on an actor (simplified C# Activity system).
@@ -23,6 +27,17 @@ pub enum ActorKind {
 pub enum Activity {
     /// Turn toward a target facing at the given speed (WAngle units/tick).
     Turn { target: i32, speed: i32 },
+    /// Move along a path of cells at a given speed (world units/tick).
+    Move {
+        path: Vec<(i32, i32)>,
+        path_index: usize,
+        speed: i32,
+    },
+    /// Attack a target actor. Move in range, then fire.
+    Attack {
+        target_id: u32,
+        weapon_range: i32, // cells
+    },
 }
 
 /// A game actor with its traits and current activity.
