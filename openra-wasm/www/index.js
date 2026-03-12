@@ -53,6 +53,13 @@ let buildAnims = {};                     // { actorId: { type, x, y, startTick, 
 let activeEffects = [];                  // { x, y, sprite, frame, maxFrames, startTick }
 let exploredCells = new Set();           // Persistent fog-of-war: cells ever seen
 let wallMap = {};                        // Rebuilt each frame: "x,y" -> wall actor_type
+let controlGroups = {};                  // 1-9 → [actorId, ...]
+let lastGroupKey = null;                 // For double-tap detection
+let lastGroupTime = 0;
+let commandMode = null;                  // null | 'attack-move' | 'move' | 'guard'
+let gamePaused = false;
+let sellAnims = {};                      // { actorId: { sprite, x, y, frame, totalFrames, startTick } }
+let prevActorHP = {};                    // Track HP for sell detection
 
 // Construction animation sprite mapping
 const BUILD_ANIM_SPRITES = {
@@ -157,6 +164,15 @@ const SIGHT_RANGES = {
 
 // Crate actor types
 const CRATE_TYPES = new Set(['scrate', 'wcrate', 'xcratea', 'xcrateb', 'xcratec', 'xcrated']);
+
+// Weapon projectile sprites per actor type
+const WEAPON_PROJECTILES = {
+    '1tnk': '120mm', '2tnk': '120mm', '3tnk': '120mm', '4tnk': '120mm',
+    'arty': '120mm', 'v2rl': 'v2', 'jeep': '50cal', 'apc': '50cal',
+    'gun': '120mm', 'agun': 'flak', 'sam': 'v2', 'tsla': 'litning',
+    'ca': '120mm', 'dd': '120mm', 'pt': '50cal', 'ss': 'v2',
+    'heli': '50cal', 'hind': '50cal', 'mig': 'bomblet', 'yak': '50cal',
+};
 
 // ── HSV color remapping ──
 function rgb2hsv(r, g, b) {
@@ -341,6 +357,7 @@ function centerCamera(snapshot) {
 
 function gameLoop() {
     if (!playing || mode !== 'game') return;
+    if (gamePaused) { setTimeout(gameLoop, 100); return; }
     session.tick();
     currentTick++;
     lastSnapshot = JSON.parse(session.snapshot_json());
@@ -500,6 +517,26 @@ window.addEventListener('resize', () => { resizeCanvas(); if (lastSnapshot) rend
 function screenToWorld(sx, sy) {
     return { x: Math.floor((sx + camX) / cellPx), y: Math.floor((sy + camY) / cellPx) };
 }
+function updateTooltip(mx, my) {
+    const tip = document.getElementById('tooltip');
+    if (!lastSnapshot || !gameUiEl.style.display || gameUiEl.style.display === 'none') {
+        tip.style.display = 'none'; return;
+    }
+    const actor = actorAtCell(mouseCell.x, mouseCell.y, lastSnapshot);
+    if (!actor || actor.kind === 'Tree' || actor.kind === 'Mine') {
+        tip.style.display = 'none'; return;
+    }
+    const hpPct = actor.max_hp > 0 ? Math.round(actor.hp / actor.max_hp * 100) : 100;
+    const hpClass = hpPct <= 25 ? 'tt-hp low' : 'tt-hp';
+    const ownerLabel = actor.owner === humanPlayerId ? 'You' : `Player ${actor.owner}`;
+    tip.innerHTML = `<span class="tt-name">${actor.actor_type}</span> (${actor.kind})<br>`
+        + `<span class="${hpClass}">HP: ${hpPct}%</span> | ${ownerLabel}<br>`
+        + `<span class="tt-activity">${actor.activity || 'idle'}</span>`;
+    tip.style.display = 'block';
+    tip.style.left = (mx + 14) + 'px';
+    tip.style.top = (my + 14) + 'px';
+}
+
 function actorAtCell(cx, cy, snapshot) {
     for (const a of snapshot.actors) {
         if (a.kind === 'Building') {
@@ -520,6 +557,11 @@ canvas.addEventListener('mousemove', e => {
     const rect = canvas.getBoundingClientRect();
     mouseCell = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
     if (placementMode && lastSnapshot) render(lastSnapshot);
+    // Tooltip
+    updateTooltip(e.clientX, e.clientY);
+});
+canvas.addEventListener('mouseleave', () => {
+    document.getElementById('tooltip').style.display = 'none';
 });
 
 canvas.addEventListener('click', e => {
@@ -540,13 +582,26 @@ canvas.addEventListener('contextmenu', e => {
     const rect = canvas.getBoundingClientRect();
     const cell = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
     if (placementMode) { placementMode = null; showMsg(''); return; }
-    if (selectedUnits.length === 0) return;
+    if (selectedUnits.length === 0) { commandMode = null; return; }
+
     const target = actorAtCell(cell.x, cell.y, lastSnapshot);
-    if (target && target.owner !== humanPlayerId && target.owner > 2) {
+
+    // Command mode dispatch
+    if (commandMode === 'attack-move') {
+        for (const uid of selectedUnits) session.order_attack_move(uid, cell.x, cell.y);
+        commandMode = null; showMsg('');
+    } else if (commandMode === 'move') {
+        for (const uid of selectedUnits) session.order_move(uid, cell.x, cell.y);
+        commandMode = null; showMsg('');
+    } else if (commandMode === 'guard' && target && target.owner === humanPlayerId) {
+        for (const uid of selectedUnits) session.order_move(uid, target.x, target.y);
+        commandMode = null; showMsg('');
+    } else if (target && target.owner !== humanPlayerId && target.owner > 2) {
         for (const uid of selectedUnits) session.order_attack(uid, target.id);
     } else {
         for (const uid of selectedUnits) session.order_move(uid, cell.x, cell.y);
     }
+    if (commandMode) { commandMode = null; showMsg(''); }
 });
 
 function handleGameClick(cell, shiftKey) {
@@ -595,11 +650,57 @@ canvas.addEventListener('mouseup', e => {
 // ── Keyboard ──
 document.addEventListener('keydown', e => {
     if (mode !== 'game') return;
+
+    // Escape: cancel placement/command mode, then deselect
     if (e.key === 'Escape') {
-        if (placementMode) { placementMode = null; showMsg(''); }
+        if (commandMode) { commandMode = null; showMsg(''); }
+        else if (placementMode) { placementMode = null; showMsg(''); }
         else { selectedUnits = []; refreshSelection(); }
+        return;
     }
-    if (e.key === 's' || e.key === 'S') for (const uid of selectedUnits) session.order_stop(uid);
+
+    // Pause
+    if (e.key === 'p' || e.key === 'P') {
+        gamePaused = !gamePaused;
+        if (gamePaused) showMsg('PAUSED');
+        else showMsg('');
+        return;
+    }
+
+    // Control groups: Ctrl+[1-9] to assign, [1-9] to recall, double-tap to center
+    const numKey = parseInt(e.key);
+    if (numKey >= 1 && numKey <= 9) {
+        if (e.ctrlKey || e.metaKey) {
+            controlGroups[numKey] = [...selectedUnits];
+            showMsg(`Group ${numKey}: ${selectedUnits.length} units`);
+            e.preventDefault();
+        } else {
+            const group = controlGroups[numKey];
+            if (group && group.length > 0) {
+                selectedUnits = [...group];
+                refreshSelection();
+                // Double-tap: center camera on group
+                const now = Date.now();
+                if (lastGroupKey === numKey && now - lastGroupTime < 400 && lastSnapshot) {
+                    const actors = lastSnapshot.actors.filter(a => group.includes(a.id));
+                    if (actors.length > 0) {
+                        const avgX = actors.reduce((s,a) => s + a.x, 0) / actors.length;
+                        const avgY = actors.reduce((s,a) => s + a.y, 0) / actors.length;
+                        camX = avgX * cellPx - canvas.width / 2;
+                        camY = avgY * cellPx - canvas.height / 2;
+                    }
+                }
+                lastGroupKey = numKey;
+                lastGroupTime = now;
+            }
+        }
+        return;
+    }
+
+    // Unit commands
+    if (e.key === 's' || e.key === 'S') {
+        for (const uid of selectedUnits) session.order_stop(uid);
+    }
     if (e.key === 'd' || e.key === 'D') {
         if (!lastSnapshot) return;
         for (const uid of selectedUnits) {
@@ -607,6 +708,59 @@ document.addEventListener('keydown', e => {
             if (a && a.kind === 'Mcv') session.order_deploy(uid);
         }
     }
+
+    // Command modes
+    if (e.key === 'a' || e.key === 'A') {
+        commandMode = 'attack-move';
+        showMsg('Attack Move — right-click target');
+    }
+    if (e.key === 'm' || e.key === 'M') {
+        commandMode = 'move';
+        showMsg('Move — right-click destination');
+    }
+    if (e.key === 'g' || e.key === 'G') {
+        commandMode = 'guard';
+        showMsg('Guard — right-click friendly unit');
+    }
+
+    // Scatter: move each selected unit to random adjacent cell
+    if (e.key === 'x' || e.key === 'X') {
+        for (const uid of selectedUnits) {
+            const dx = Math.floor(Math.random() * 3) - 1;
+            const dy = Math.floor(Math.random() * 3) - 1;
+            const a = lastSnapshot?.actors.find(a => a.id === uid);
+            if (a) session.order_move(uid, a.x + dx, a.y + dy);
+        }
+    }
+
+    // Tab: cycle to next owned unit not in viewport
+    if (e.key === 'Tab') {
+        e.preventDefault();
+        if (!lastSnapshot) return;
+        const myUnits = lastSnapshot.actors.filter(a =>
+            a.owner === humanPlayerId && a.kind !== 'Building' && a.kind !== 'Tree' && a.kind !== 'Mine'
+        );
+        if (myUnits.length === 0) return;
+        const curId = selectedUnits[0] || 0;
+        const curIdx = myUnits.findIndex(a => a.id === curId);
+        const next = myUnits[(curIdx + 1) % myUnits.length];
+        selectedUnits = [next.id];
+        camX = next.x * cellPx - canvas.width / 2;
+        camY = next.y * cellPx - canvas.height / 2;
+        refreshSelection();
+    }
+
+    // H: center on home base (Construction Yard)
+    if (e.key === 'h' || e.key === 'H') {
+        if (!lastSnapshot) return;
+        const cy = lastSnapshot.actors.find(a => a.owner === humanPlayerId && a.actor_type === 'fact');
+        if (cy) {
+            camX = cy.x * cellPx - canvas.width / 2;
+            camY = cy.y * cellPx - canvas.height / 2;
+        }
+    }
+
+    // Camera
     const sp = 20;
     if (e.key === 'ArrowLeft') camX -= sp;
     if (e.key === 'ArrowRight') camX += sp;
@@ -773,6 +927,9 @@ function render(snapshot) {
     // Draw active effects (explosions, death animations)
     drawEffects();
 
+    // Draw sell animations (reverse construction)
+    drawSellAnims();
+
     // Fog of war (game mode only)
     if (mode === 'game' && humanPlayerId != null) {
         computeVisibility(snapshot);
@@ -789,6 +946,27 @@ function render(snapshot) {
 
     // Placement ghost
     if (placementMode && mouseCell.x >= 0) drawPlacementGhost();
+
+    // Pause overlay
+    if (gamePaused) {
+        ctx.fillStyle = 'rgba(0,0,0,0.4)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = '#c8a830';
+        ctx.font = 'bold 36px monospace';
+        ctx.textAlign = 'center';
+        ctx.fillText('PAUSED', canvas.width / 2, canvas.height / 2);
+        ctx.font = '14px monospace';
+        ctx.fillStyle = '#888';
+        ctx.fillText('Press P to resume', canvas.width / 2, canvas.height / 2 + 30);
+    }
+
+    // Command mode indicator
+    if (commandMode) {
+        ctx.fillStyle = 'rgba(200,168,48,0.8)';
+        ctx.font = 'bold 12px monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText(`[${commandMode.toUpperCase()}] Right-click to execute`, 10, canvas.height - 12);
+    }
 
     // Minimap
     drawMinimap(snapshot);
@@ -814,17 +992,36 @@ function updateAnimations(snapshot) {
             }
         }
     }
-    // Actors that disappeared: spawn death effects
+    // Actors that disappeared: spawn death or sell effects
     if (prevActorIds.size > 0) {
         for (const oldId of prevActorIds) {
             if (!currentIds.has(oldId) && lastSnapshot) {
                 const oldActor = lastSnapshot.actors.find(a => a.id === oldId);
-                if (oldActor && oldActor.kind !== 'Tree' && oldActor.kind !== 'Mine') {
-                    spawnDeathEffect(oldActor);
+                if (!oldActor || oldActor.kind === 'Tree' || oldActor.kind === 'Mine') continue;
+                // Sell detection: owned building disappeared with HP > 0
+                const wasHP = prevActorHP[oldId] || 0;
+                if (oldActor.kind === 'Building' && wasHP > 0 && oldActor.owner === humanPlayerId) {
+                    const makeSprite = BUILD_ANIM_SPRITES[oldActor.actor_type];
+                    if (makeSprite && spriteInfo[makeSprite]) {
+                        const totalFrames = spriteInfo[makeSprite].frames;
+                        sellAnims[oldId] = {
+                            sprite: makeSprite,
+                            x: oldActor.x, y: oldActor.y,
+                            owner: oldActor.owner,
+                            startTick: currentTick,
+                            totalFrames,
+                            actor_type: oldActor.actor_type,
+                        };
+                        continue; // Don't spawn death effect for sold buildings
+                    }
                 }
+                spawnDeathEffect(oldActor);
             }
         }
     }
+    // Track HP for sell detection
+    prevActorHP = {};
+    for (const a of snapshot.actors) prevActorHP[a.id] = a.hp;
     prevActorIds = currentIds;
 
     // Clean up finished build anims
@@ -832,6 +1029,13 @@ function updateAnimations(snapshot) {
         const elapsed = currentTick - anim.startTick;
         if (elapsed >= anim.totalFrames) {
             delete buildAnims[id];
+        }
+    }
+    // Clean up finished sell anims
+    for (const [id, anim] of Object.entries(sellAnims)) {
+        const elapsed = currentTick - anim.startTick;
+        if (elapsed >= anim.totalFrames) {
+            delete sellAnims[id];
         }
     }
 }
@@ -870,6 +1074,26 @@ function drawEffects() {
         remaining.push(eff);
     }
     activeEffects = remaining;
+}
+
+function drawSellAnims() {
+    const scale = cellPx / CELL_PX;
+    for (const [id, anim] of Object.entries(sellAnims)) {
+        const elapsed = currentTick - anim.startTick;
+        if (elapsed >= anim.totalFrames) continue;
+        const makeInfo = spriteInfo[anim.sprite];
+        if (!makeInfo || !spriteImages[anim.sprite]) continue;
+        // Reverse playback: start from last frame, go to 0
+        const frame = Math.max(0, anim.totalFrames - 1 - elapsed);
+        const fp = BUILDING_FOOTPRINTS[anim.actor_type] || [2,2];
+        const sx = anim.x * cellPx - camX;
+        const sy = anim.y * cellPx - camY;
+        const bw = fp[0] * cellPx, bh = fp[1] * cellPx;
+        const centerX = sx + bw / 2, centerY = sy + bh / 2;
+        const drawW = makeInfo.width * scale;
+        const drawH = makeInfo.height * scale;
+        drawSprite(anim.sprite, frame, centerX - drawW/2, centerY - drawH/2, drawW, drawH, anim.owner);
+    }
 }
 
 function drawResources(snapshot) {
@@ -1075,6 +1299,16 @@ function drawUnit(a) {
 
     const scale = cellPx / CELL_PX;
 
+    // Unit shadow (ground ellipse)
+    const isAircraft = a.kind === 'Aircraft';
+    ctx.fillStyle = 'rgba(0,0,0,0.25)';
+    ctx.beginPath();
+    const shadowOffY = isAircraft ? cellPx * 0.9 : cellPx * 0.75;
+    const shadowRX = isAircraft ? cellPx * 0.35 : cellPx * 0.28;
+    const shadowRY = isAircraft ? cellPx * 0.14 : cellPx * 0.1;
+    ctx.ellipse(sx + cellPx/2, sy + shadowOffY, shadowRX, shadowRY, 0, 0, Math.PI*2);
+    ctx.fill();
+
     // Check for husk sprite (destroyed units)
     const huskName = (a.hp <= 0) ? HUSK_SPRITES[a.actor_type] : null;
     const spriteName = huskName || a.actor_type;
@@ -1084,7 +1318,7 @@ function drawUnit(a) {
         const drawW = info.width * scale, drawH = info.height * scale;
         const cx = sx + cellPx/2 - drawW/2, cy = sy + cellPx/2 - drawH/2;
 
-        // Facing: vehicles/ships/aircraft have 32 facings, infantry 8
+        // Facing: vehicles/ships/aircraft have 32 facings, infantry 8 with walk cycles
         let frame = 0;
         const isVehicle = a.kind === 'Vehicle' || a.kind === 'Mcv' || a.kind === 'Aircraft' || a.kind === 'Ship';
         if (!huskName) {
@@ -1093,7 +1327,18 @@ function drawUnit(a) {
                 frame = Math.floor(((a.facing + step/2) & 1023) / step) % 32;
             } else if (a.kind === 'Infantry' && info.frames >= 8) {
                 const step = 1024 / 8;
-                frame = Math.floor(((a.facing + step/2) & 1023) / step) % 8;
+                const facingIdx = Math.floor(((a.facing + step/2) & 1023) / step) % 8;
+                if (info.frames > 8) {
+                    // Walk cycle: frames_per_facing includes standing + walk frames
+                    const fpf = Math.floor(info.frames / 8);
+                    if (a.activity === 'moving' && fpf > 1) {
+                        frame = facingIdx * fpf + 1 + (currentTick % (fpf - 1));
+                    } else {
+                        frame = facingIdx * fpf; // Standing frame
+                    }
+                } else {
+                    frame = facingIdx;
+                }
             }
         }
 
@@ -1150,6 +1395,38 @@ function drawUnit(a) {
                         const rkW = rankInfo.width * scale;
                         const rkH = rankInfo.height * scale;
                         ctx.drawImage(rankFrames[rFrame], sx + cellPx - rkW, sy, rkW, rkH);
+                    }
+                }
+            }
+            // Projectile rendering (when attacking, draw projectile toward nearest enemy)
+            if (a.activity === 'attacking' && !huskName && lastSnapshot) {
+                const projName = WEAPON_PROJECTILES[a.actor_type];
+                if (projName && spriteInfo[projName] && spriteImages[projName]) {
+                    // Find nearest enemy in range as target
+                    let target = null;
+                    if (a.target_id) {
+                        target = lastSnapshot.actors.find(t => t.id === a.target_id);
+                    }
+                    if (!target) {
+                        let minDist = 999;
+                        for (const t of lastSnapshot.actors) {
+                            if (t.owner === a.owner || t.owner <= 2) continue;
+                            const d = Math.max(Math.abs(t.x - a.x), Math.abs(t.y - a.y));
+                            if (d < minDist && d <= 8) { minDist = d; target = t; }
+                        }
+                    }
+                    if (target) {
+                        const pInfo = spriteInfo[projName];
+                        const pFrames = spriteImages[projName];
+                        const pFrame = currentTick % pInfo.frames;
+                        if (pFrames[pFrame]) {
+                            const pW = pInfo.width * scale, pH = pInfo.height * scale;
+                            // Lerp position: cycle every 8 ticks
+                            const t = (currentTick % 8) / 8;
+                            const px = (sx + cellPx/2) + (target.x * cellPx - camX + cellPx/2 - sx - cellPx/2) * t - pW/2;
+                            const py = (sy + cellPx/2) + (target.y * cellPx - camY + cellPx/2 - sy - cellPx/2) * t - pH/2;
+                            ctx.drawImage(pFrames[pFrame], px, py, pW, pH);
+                        }
                     }
                 }
             }
