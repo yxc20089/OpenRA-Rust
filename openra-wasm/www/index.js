@@ -1,4 +1,4 @@
-import init, { ReplayViewer, GameSession, SpriteAtlas } from './pkg/openra_wasm.js';
+import init, { ReplayViewer, GameSession, SpriteAtlas, available_maps } from './pkg/openra_wasm.js';
 
 // ── DOM refs ──
 const homeEl = document.getElementById('home');
@@ -321,7 +321,9 @@ function replayLoop() {
 // ── Game start ──
 async function startGame() {
     try {
-        session = new GameSession();
+        const mapIdx = parseInt(document.getElementById('map-select').value) || 0;
+        const diff = parseInt(document.getElementById('difficulty-select').value) || 1;
+        session = new GameSession(mapIdx, diff);
         mode = 'game'; humanPlayerId = session.human_player_id();
         selectedUnits = []; placementMode = null; playing = true;
         exploredCells = new Set(); // Reset fog of war for new game
@@ -481,6 +483,24 @@ function refreshSelection() {
         selInfo.innerHTML = `<span class="name">${actors.length} units</span>`;
     }
     selActions.innerHTML = '';
+    // Add action buttons for owned buildings
+    if (actors.length === 1 && mode === 'game') {
+        const a = actors[0];
+        if (a.owner === humanPlayerId && (a.kind === 'Building' || a.kind === 'Mcv')) {
+            if (a.hp < a.max_hp) {
+                const repBtn = document.createElement('button');
+                repBtn.className = 'action-btn';
+                repBtn.textContent = 'Repair';
+                repBtn.onclick = () => session.order_repair(a.id);
+                selActions.appendChild(repBtn);
+            }
+            const sellBtn = document.createElement('button');
+            sellBtn.className = 'action-btn';
+            sellBtn.textContent = 'Sell';
+            sellBtn.onclick = () => session.order_sell(a.id);
+            selActions.appendChild(sellBtn);
+        }
+    }
 }
 
 function updateHUD(snapshot) {
@@ -599,7 +619,16 @@ canvas.addEventListener('contextmenu', e => {
     } else if (target && target.owner !== humanPlayerId && target.owner > 2) {
         for (const uid of selectedUnits) session.order_attack(uid, target.id);
     } else {
-        for (const uid of selectedUnits) session.order_move(uid, cell.x, cell.y);
+        // Check if selected unit is a production building → set rally point
+        const PROD_BUILDINGS = new Set(['weap', 'weap.ukraine', 'tent', 'barr', 'hpad', 'afld', 'spen', 'syrd']);
+        const selActors = lastSnapshot.actors.filter(a => selectedUnits.includes(a.id));
+        const prodBuilding = selActors.find(a => a.kind === 'Building' && a.owner === humanPlayerId && PROD_BUILDINGS.has(a.actor_type));
+        if (prodBuilding && selActors.length === 1) {
+            session.order_set_rally_point(prodBuilding.id, cell.x, cell.y);
+            showMsg(`Rally point set`);
+        } else {
+            for (const uid of selectedUnits) session.order_move(uid, cell.x, cell.y);
+        }
     }
     if (commandMode) { commandMode = null; showMsg(''); }
 });
@@ -1761,4 +1790,17 @@ function drawMinimap(snapshot) {
 // ── Init ──
 await init();
 await loadSprites();
+
+// Populate map selector
+try {
+    const maps = JSON.parse(available_maps());
+    const mapSelect = document.getElementById('map-select');
+    mapSelect.innerHTML = '';
+    maps.forEach((name, i) => {
+        const opt = document.createElement('option');
+        opt.value = i; opt.textContent = name;
+        mapSelect.appendChild(opt);
+    });
+} catch (e) { console.warn('Failed to load map list:', e); }
+
 showScreen('home');

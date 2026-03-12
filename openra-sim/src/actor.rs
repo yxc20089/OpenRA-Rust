@@ -96,6 +96,10 @@ pub struct Actor {
     /// Actor type name from rules (e.g., "fact", "2tnk", "e1").
     /// Not synced — used for game logic lookups.
     pub actor_type: Option<String>,
+    /// Kill count for veterancy (not synced).
+    pub kills: u16,
+    /// Veterancy rank: 0=none, 1=veteran, 2=elite, 3=heroic (not synced).
+    pub rank: u8,
 }
 
 impl Actor {

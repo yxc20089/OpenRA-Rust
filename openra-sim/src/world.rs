@@ -4,7 +4,7 @@
 //! then computes per-tick SyncHash to verify determinism against
 //! the hashes recorded in .orarep files.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::Serialize;
 
@@ -151,6 +151,11 @@ pub struct ActorSnapshot {
     pub max_hp: i32,
     pub activity: String,
     pub facing: i32,
+    /// Attack target actor ID (for projectile rendering).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_id: Option<u32>,
+    /// Veterancy rank (0=none, 1=veteran, 2=elite, 3=heroic).
+    pub rank: u8,
 }
 
 #[derive(Debug, Serialize)]
@@ -229,6 +234,10 @@ pub struct World {
     pub rules: GameRules,
     /// AI bots controlling their respective players.
     bots: Vec<Bot>,
+    /// Buildings currently being repaired (toggled by RepairBuilding order).
+    repairing: HashSet<u32>,
+    /// Rally points per building actor ID.
+    rally_points: HashMap<u32, (i32, i32)>,
 }
 
 impl World {
@@ -274,6 +283,26 @@ impl World {
         self.actors.values()
             .filter(|a| a.owner_id == Some(player_id) && a.kind == ActorKind::Building)
             .filter_map(|a| a.actor_type.clone())
+            .collect()
+    }
+
+    /// Get IDs of damaged buildings owned by a player (for AI repair).
+    pub fn player_damaged_buildings(&self, player_id: u32) -> Vec<u32> {
+        self.actors.values()
+            .filter(|a| {
+                a.owner_id == Some(player_id)
+                    && a.kind == ActorKind::Building
+                    && a.traits.iter().any(|t| {
+                        if let crate::traits::TraitState::Health { hp } = t {
+                            let atype = a.actor_type.as_deref().unwrap_or("");
+                            let max_hp = self.rules.actor(atype).map(|s| s.hp).unwrap_or(*hp);
+                            *hp < max_hp
+                        } else {
+                            false
+                        }
+                    })
+            })
+            .map(|a| a.id)
             .collect()
     }
 
@@ -334,9 +363,14 @@ impl World {
             let facing = actor.traits.iter().find_map(|t| {
                 if let TraitState::Mobile { facing, .. } = t { Some(*facing) } else { None }
             }).unwrap_or(0);
+            let target_id = match &actor.activity {
+                Some(Activity::Attack { target_id, .. }) => Some(*target_id),
+                _ => None,
+            };
             actors.push(ActorSnapshot {
                 id: actor.id, kind: actor.kind, owner, x, y,
                 actor_type: actor_type_str, hp, max_hp, activity, facing,
+                target_id, rank: actor.rank,
             });
         }
         let players = self.player_actor_ids.iter().map(|&pid| {
@@ -581,7 +615,27 @@ impl World {
                 // Toggle power on a building (not yet tracked per-building)
             }
             "RepairBuilding" => {
-                // Start repairing a building (simplified: instant repair not implemented yet)
+                if let Some(subject_id) = order.subject_id {
+                    // Toggle repair on/off for the building
+                    if self.repairing.contains(&subject_id) {
+                        self.repairing.remove(&subject_id);
+                    } else {
+                        self.repairing.insert(subject_id);
+                    }
+                }
+            }
+            "SetRallyPoint" => {
+                if let Some(subject_id) = order.subject_id {
+                    if let Some(target) = &order.target_string {
+                        // target_string format: "x,y"
+                        let parts: Vec<&str> = target.split(',').collect();
+                        if parts.len() == 2 {
+                            if let (Ok(x), Ok(y)) = (parts[0].parse::<i32>(), parts[1].parse::<i32>()) {
+                                self.rally_points.insert(subject_id, (x, y));
+                            }
+                        }
+                    }
+                }
             }
             "StartGame" | "Command" => {}
             other => {
@@ -722,6 +776,7 @@ impl World {
             ],
             activity: None,
             actor_type: Some(building_type.to_string()),
+            kills: 0, rank: 0,
         };
         self.actors.insert(building_id, building);
         self.terrain.occupy_footprint(x, y, footprint_w, footprint_h, building_id);
@@ -1374,6 +1429,56 @@ impl World {
             }
         }
 
+        // Tick building repairs: heal HP, deduct cash.
+        if !self.repairing.is_empty() {
+            let repair_ids: Vec<u32> = self.repairing.iter().copied().collect();
+            let mut finished: Vec<u32> = Vec::new();
+            for building_id in repair_ids {
+                let (owner_id, hp, max_hp, cost) = {
+                    let actor = match self.actors.get(&building_id) {
+                        Some(a) if a.kind == ActorKind::Building => a,
+                        _ => { finished.push(building_id); continue; }
+                    };
+                    let hp = actor.traits.iter().find_map(|t| {
+                        if let TraitState::Health { hp } = t { Some(*hp) } else { None }
+                    }).unwrap_or(0);
+                    let atype = actor.actor_type.as_deref().unwrap_or("");
+                    let max_hp = self.rules.actor(atype).map(|s| s.hp).unwrap_or(hp);
+                    let cost = self.rules.actor(atype).map(|s| s.cost).unwrap_or(0);
+                    let owner_id = actor.owner_id.unwrap_or(0);
+                    (owner_id, hp, max_hp, cost)
+                };
+                if hp >= max_hp {
+                    finished.push(building_id);
+                    continue;
+                }
+                // Repair rate: ~1% of max HP per tick, cost proportional
+                let repair_hp = std::cmp::max(1, max_hp / 100);
+                let repair_cost = if max_hp > 0 { (cost * repair_hp) / (max_hp * 2) } else { 0 };
+                let cash = self.actors.get(&owner_id).map(|a| a.cash()).unwrap_or(0);
+                if cash < repair_cost {
+                    finished.push(building_id);
+                    continue;
+                }
+                // Deduct cash
+                if let Some(player) = self.actors.get_mut(&owner_id) {
+                    player.set_cash(cash - repair_cost);
+                }
+                // Heal building
+                if let Some(actor) = self.actors.get_mut(&building_id) {
+                    for t in &mut actor.traits {
+                        if let TraitState::Health { hp } = t {
+                            *hp = std::cmp::min(*hp + repair_hp, max_hp);
+                            break;
+                        }
+                    }
+                }
+            }
+            for id in finished {
+                self.repairing.remove(&id);
+            }
+        }
+
         // Tick Harvest activities.
         self.tick_harvesters();
 
@@ -1500,11 +1605,43 @@ impl World {
             ],
             activity,
             actor_type: Some(unit_type.to_string()),
+            kills: 0, rank: 0,
         };
         self.actors.insert(unit_id, actor);
         self.terrain.set_occupant(x, y, unit_id);
         eprintln!("SPAWN: {} id={} at ({},{}) owner={} speed={} hp={}",
             unit_type, unit_id, x, y, owner_player_id, speed, hp);
+
+        // Auto-move to rally point if set on the production building
+        if unit_type != "harv" {
+            let rally = self.find_rally_point_for_unit(owner_player_id, unit_type);
+            if let Some(target) = rally {
+                self.order_move(unit_id, target);
+            }
+        }
+    }
+
+    /// Find the rally point for the production building that produces this unit type.
+    fn find_rally_point_for_unit(&self, owner_player_id: u32, unit_type: &str) -> Option<(i32, i32)> {
+        let is_infantry = self.rules.actor(unit_type)
+            .map(|s| s.kind == ActorKind::Infantry)
+            .unwrap_or(false);
+        for actor in self.actors.values() {
+            if actor.owner_id != Some(owner_player_id) { continue; }
+            if actor.kind != ActorKind::Building { continue; }
+            let btype = actor.actor_type.as_deref().unwrap_or("");
+            let is_right = if is_infantry {
+                matches!(btype, "tent" | "barr")
+            } else {
+                matches!(btype, "weap" | "weap.ukraine" | "hpad" | "afld" | "spen" | "syrd")
+            };
+            if is_right {
+                if let Some(&rally) = self.rally_points.get(&actor.id) {
+                    return Some(rally);
+                }
+            }
+        }
+        None
     }
 
     /// Find a refinery (PROC) owned by a player.
@@ -1621,6 +1758,7 @@ impl World {
             ],
             activity: None,
             actor_type: Some("fact".to_string()),
+            kills: 0, rank: 0,
         };
         self.actors.insert(fact_id, fact_actor);
 
@@ -1922,6 +2060,7 @@ pub fn build_world(
     random_seed: i32,
     lobby: &LobbyInfo,
     rules: Option<GameRules>,
+    difficulty: u8,
 ) -> World {
     let rng = MersenneTwister::new(random_seed);
     let mut actors: BTreeMap<u32, Actor> = BTreeMap::new();
@@ -1936,6 +2075,8 @@ pub fn build_world(
         traits: vec![TraitState::DebugPauseState { paused: true }],
         activity: None,
         actor_type: None,
+        kills: 0,
+        rank: 0,
     });
     next_id += 1;
 
@@ -1954,6 +2095,8 @@ pub fn build_world(
             traits: build_player_traits(lobby.starting_cash),
             activity: None,
             actor_type: None,
+            kills: 0,
+            rank: 0,
         });
         player_actor_ids.push(id);
         next_id += 1;
@@ -1971,6 +2114,8 @@ pub fn build_world(
             traits: build_player_traits(lobby.starting_cash),
             activity: None,
             actor_type: None,
+            kills: 0,
+            rank: 0,
         });
         player_actor_ids.push(id);
         if slot.is_bot {
@@ -1989,6 +2134,8 @@ pub fn build_world(
         traits: build_player_traits(lobby.starting_cash),
         activity: None,
         actor_type: None,
+        kills: 0,
+        rank: 0,
     });
     player_actor_ids.push(next_id);
     next_id += 1;
@@ -2038,6 +2185,8 @@ pub fn build_world(
             traits: trait_list,
             activity: None,
             actor_type: Some(map_actor.actor_type.clone()),
+            kills: 0,
+            rank: 0,
         });
     }
 
@@ -2063,6 +2212,8 @@ pub fn build_world(
             traits: build_mcv_traits(spawn_x, spawn_y, facing),
             activity: None,
             actor_type: Some("mcv".to_string()),
+            kills: 0,
+            rank: 0,
         });
         next_id += 1;
     }
@@ -2114,8 +2265,9 @@ pub fn build_world(
         .collect();
 
     // Create Bot instances for AI-controlled players
+    let diff = crate::ai::Difficulty::from_u8(difficulty);
     let bots: Vec<Bot> = bot_player_ids.iter()
-        .map(|&pid| Bot::new(pid))
+        .map(|&pid| Bot::new_with_difficulty(pid, diff))
         .collect();
     if !bots.is_empty() {
         eprintln!("Created {} bot(s): {:?}", bots.len(), bot_player_ids);
@@ -2142,6 +2294,8 @@ pub fn build_world(
         shroud,
         rules: rules.unwrap_or_else(GameRules::defaults),
         bots,
+        repairing: HashSet::new(),
+        rally_points: HashMap::new(),
     };
 
     // Initial shroud reveal around starting units

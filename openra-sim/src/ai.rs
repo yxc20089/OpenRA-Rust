@@ -7,6 +7,24 @@
 use crate::actor::ActorKind;
 use crate::world::{GameOrder, World};
 
+/// AI difficulty level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Difficulty {
+    Easy = 0,
+    Medium = 1,
+    Hard = 2,
+}
+
+impl Difficulty {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Difficulty::Easy,
+            1 => Difficulty::Medium,
+            _ => Difficulty::Hard,
+        }
+    }
+}
+
 /// AI state for one bot player.
 #[derive(Debug)]
 pub struct Bot {
@@ -24,10 +42,18 @@ pub struct Bot {
     has_war_factory: bool,
     /// Whether we've queued refinery.
     has_refinery: bool,
+    /// Whether we've queued radar dome.
+    has_radar: bool,
+    /// Whether we've queued defenses.
+    defenses_built: u32,
     /// Number of units produced.
     units_produced: u32,
     /// Attack wave threshold.
     attack_threshold: u32,
+    /// AI difficulty.
+    difficulty: Difficulty,
+    /// Tick interval between AI actions.
+    tick_interval: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +68,15 @@ enum BotState {
 
 impl Bot {
     pub fn new(player_id: u32) -> Self {
+        Self::new_with_difficulty(player_id, Difficulty::Easy)
+    }
+
+    pub fn new_with_difficulty(player_id: u32, difficulty: Difficulty) -> Self {
+        let (tick_interval, attack_threshold) = match difficulty {
+            Difficulty::Easy => (45, 5),
+            Difficulty::Medium => (30, 8),
+            Difficulty::Hard => (15, 6),
+        };
         Bot {
             player_id,
             ticks_idle: 0,
@@ -50,8 +85,12 @@ impl Bot {
             has_barracks: false,
             has_war_factory: false,
             has_refinery: false,
+            has_radar: false,
+            defenses_built: 0,
             units_produced: 0,
-            attack_threshold: 5,
+            attack_threshold,
+            difficulty,
+            tick_interval,
         }
     }
 
@@ -60,8 +99,7 @@ impl Bot {
         self.ticks_idle += 1;
         let mut orders = Vec::new();
 
-        // Only act every ~30 ticks to avoid spamming
-        if self.ticks_idle < 30 {
+        if self.ticks_idle < self.tick_interval {
             return orders;
         }
         self.ticks_idle = 0;
@@ -131,6 +169,31 @@ impl Bot {
             return;
         }
 
+        // Medium/Hard: build radar dome
+        if self.difficulty != Difficulty::Easy && self.has_war_factory && !self.has_radar && cash >= 1000 {
+            orders.push(GameOrder {
+                order_string: "StartProduction".to_string(),
+                subject_id: Some(self.player_id),
+                target_string: Some("dome".to_string()),
+                extra_data: None,
+            });
+            self.has_radar = true;
+            return;
+        }
+
+        // Medium/Hard: build defenses
+        if self.difficulty != Difficulty::Easy && self.has_barracks && self.defenses_built < 2 && cash >= 600 {
+            let defense = if self.defenses_built == 0 { "gun" } else { "sam" };
+            orders.push(GameOrder {
+                order_string: "StartProduction".to_string(),
+                subject_id: Some(self.player_id),
+                target_string: Some(defense.to_string()),
+                extra_data: None,
+            });
+            self.defenses_built += 1;
+            return;
+        }
+
         // Once we have basic infrastructure, switch to producing
         if self.has_power && self.has_barracks {
             self.state = BotState::Producing;
@@ -140,23 +203,55 @@ impl Bot {
     fn do_produce(&mut self, world: &World, orders: &mut Vec<GameOrder>) {
         let cash = self.player_cash(world);
 
-        // Produce a mix of infantry and vehicles
-        if self.has_war_factory && cash >= 800 {
-            orders.push(GameOrder {
-                order_string: "StartProduction".to_string(),
-                subject_id: Some(self.player_id),
-                target_string: Some("2tnk".to_string()),
-                extra_data: None,
-            });
-            self.units_produced += 1;
-        } else if cash >= 100 {
-            orders.push(GameOrder {
-                order_string: "StartProduction".to_string(),
-                subject_id: Some(self.player_id),
-                target_string: Some("e1".to_string()),
-                extra_data: None,
-            });
-            self.units_produced += 1;
+        // Diversify units based on difficulty
+        let unit = match self.difficulty {
+            Difficulty::Easy => {
+                if self.has_war_factory && cash >= 800 { "2tnk" }
+                else if cash >= 100 { "e1" }
+                else { return; }
+            }
+            Difficulty::Medium => {
+                // Cycle through unit types
+                match self.units_produced % 4 {
+                    0 if self.has_war_factory && cash >= 800 => "2tnk",
+                    1 if self.has_war_factory && cash >= 700 => "1tnk",
+                    2 if cash >= 300 => "e3",  // Rocket soldier
+                    _ if cash >= 100 => "e1",
+                    _ => return,
+                }
+            }
+            Difficulty::Hard => {
+                match self.units_produced % 6 {
+                    0 if self.has_war_factory && cash >= 800 => "2tnk",
+                    1 if self.has_war_factory && cash >= 950 => "3tnk",
+                    2 if self.has_war_factory && cash >= 600 => "v2rl",
+                    3 if cash >= 300 => "e3",
+                    4 if cash >= 500 => "e4",  // Flamethrower
+                    _ if cash >= 100 => "e1",
+                    _ => return,
+                }
+            }
+        };
+
+        orders.push(GameOrder {
+            order_string: "StartProduction".to_string(),
+            subject_id: Some(self.player_id),
+            target_string: Some(unit.to_string()),
+            extra_data: None,
+        });
+        self.units_produced += 1;
+
+        // Medium/Hard: repair damaged buildings
+        if self.difficulty != Difficulty::Easy {
+            let damaged = world.player_damaged_buildings(self.player_id);
+            for building_id in damaged {
+                orders.push(GameOrder {
+                    order_string: "RepairBuilding".to_string(),
+                    subject_id: Some(building_id),
+                    target_string: None,
+                    extra_data: None,
+                });
+            }
         }
 
         // Once we have enough units, switch to attacking
@@ -191,7 +286,12 @@ impl Bot {
 
         // Go back to producing after attack
         self.units_produced = 0;
-        self.attack_threshold += 2; // Increase threshold each wave
+        let wave_increase = match self.difficulty {
+            Difficulty::Easy => 2,
+            Difficulty::Medium => 3,
+            Difficulty::Hard => 2, // Hard attacks more often with more units
+        };
+        self.attack_threshold += wave_increase;
         self.state = BotState::Producing;
     }
 
@@ -205,6 +305,7 @@ impl Bot {
         self.has_barracks = building_types.iter().any(|t| t == "tent" || t == "barr");
         self.has_war_factory = building_types.iter().any(|t| t == "weap" || t == "weap.ukraine");
         self.has_refinery = building_types.iter().any(|t| t == "proc");
+        self.has_radar = building_types.iter().any(|t| t == "dome");
     }
 
     fn find_enemy_target(&self, world: &World) -> Option<(i32, i32)> {

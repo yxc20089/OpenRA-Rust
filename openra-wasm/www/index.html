@@ -189,6 +189,20 @@ input[type="range"] { width: 60px; vertical-align: middle; }
 <div id="home">
   <h1>OPENRA</h1>
   <p>Real-time strategy in the browser</p>
+  <div style="display: flex; gap: 12px; align-items: center; margin-top: 8px; flex-wrap: wrap; justify-content: center;">
+    <label style="font-size: 12px; color: #888;">Map:
+      <select id="map-select" style="background: #2a2a1e; color: #c8a830; border: 1px solid #3a3a28; padding: 4px 8px; font-family: inherit;">
+        <option value="0">Loading...</option>
+      </select>
+    </label>
+    <label style="font-size: 12px; color: #888;">Difficulty:
+      <select id="difficulty-select" style="background: #2a2a1e; color: #c8a830; border: 1px solid #3a3a28; padding: 4px 8px; font-family: inherit;">
+        <option value="0">Easy</option>
+        <option value="1" selected>Medium</option>
+        <option value="2">Hard</option>
+      </select>
+    </label>
+  </div>
   <div class="home-buttons">
     <button class="home-btn" id="btn-start-game">New Game</button>
     <button class="home-btn secondary" id="btn-watch-replay">Watch Replay</button>

@@ -10,8 +10,17 @@ use wasm_bindgen::prelude::*;
 use openra_data::{mix, oramap, orarep, palette, shp, tmp};
 use openra_sim::world::{self, GameOrder, LobbyInfo, SlotInfo};
 
-/// Bundled map for quick-start games.
-const BUNDLED_MAP: &[u8] = include_bytes!("../../tests/maps/singles.oramap");
+/// Bundled maps for quick-start games (all temperat tileset).
+const BUNDLED_MAPS: &[(&str, &[u8])] = &[
+    ("Singles", include_bytes!("../../tests/maps/singles.oramap")),
+    ("A Path Beyond", include_bytes!("../../vendor/OpenRA/mods/ra/maps/a-path-beyond.oramap")),
+    ("Ore Lord", include_bytes!("../../vendor/OpenRA/mods/ra/maps/ore-lord.oramap")),
+    ("Crossfire", include_bytes!("../../vendor/OpenRA/mods/ra/maps/crossfire.oramap")),
+    ("Shadowfiend II", include_bytes!("../../vendor/OpenRA/mods/ra/maps/shadowfiend-II.oramap")),
+    ("Keep Off The Grass", include_bytes!("../../vendor/OpenRA/mods/ra/maps/keep-off-the-grass-2.oramap")),
+    ("Discovery", include_bytes!("../../vendor/OpenRA/mods/ra/maps/discovery.oramap")),
+    ("Pressure", include_bytes!("../../vendor/OpenRA/mods/ra/maps/pressure.oramap")),
+];
 /// Bundled palette.
 const BUNDLED_PALETTE: &[u8] = include_bytes!("../../vendor/OpenRA/mods/ra/maps/chernobyl/temperat.pal");
 /// Bundled temperat.mix for terrain tiles.
@@ -125,7 +134,7 @@ impl ReplayViewer {
             .ok_or_else(|| JsValue::from_str("No lobby settings in replay"))?;
         let lobby = lobby_from_replay(&replay);
         let map_tiles_json = map_tiles_to_json(&map);
-        let world = world::build_world(&map, settings.random_seed, &lobby, None);
+        let world = world::build_world(&map, settings.random_seed, &lobby, None, 0);
         let max_frame = replay.sync_hashes.last().map(|sh| sh.frame).unwrap_or(0);
         Ok(ReplayViewer {
             world, orders: replay.orders, sync_hashes: replay.sync_hashes,
@@ -170,13 +179,23 @@ pub struct GameSession {
     map_tiles_json: String,
 }
 
+/// Return JSON array of available map names.
+#[wasm_bindgen]
+pub fn available_maps() -> String {
+    let names: Vec<&str> = BUNDLED_MAPS.iter().map(|(name, _)| *name).collect();
+    serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_string())
+}
+
 #[wasm_bindgen]
 impl GameSession {
-    /// Start a new game: human player vs 1 bot AI on the bundled map.
+    /// Start a new game: human player vs 1 bot AI.
+    /// map_index: index into BUNDLED_MAPS (0 = default)
+    /// difficulty: 0=Easy, 1=Medium, 2=Hard
     #[wasm_bindgen(constructor)]
-    pub fn new() -> Result<GameSession, JsValue> {
-        let map = oramap::parse(BUNDLED_MAP)
-            .map_err(|e| JsValue::from_str(&format!("Failed to parse bundled map: {}", e)))?;
+    pub fn new(map_index: u8, difficulty: u8) -> Result<GameSession, JsValue> {
+        let map_data = BUNDLED_MAPS.get(map_index as usize).unwrap_or(&BUNDLED_MAPS[0]).1;
+        let map = oramap::parse(map_data)
+            .map_err(|e| JsValue::from_str(&format!("Failed to parse map: {}", e)))?;
 
         let seed = (js_sys::Math::random() * 2_147_483_647.0) as i32;
 
@@ -198,7 +217,7 @@ impl GameSession {
         };
 
         let map_tiles_json = map_tiles_to_json(&map);
-        let world = world::build_world(&map, seed, &lobby, None);
+        let world = world::build_world(&map, seed, &lobby, None, difficulty);
         // Human is first playable player (after World=1, Neutral=2, Creeps=... )
         // Player IDs: the first two non-system player actors
         let player_ids = world.player_ids().to_vec();
@@ -319,6 +338,24 @@ impl GameSession {
             order_string: "Sell".into(),
             subject_id: Some(building_id),
             target_string: None,
+            extra_data: None,
+        });
+    }
+
+    pub fn order_repair(&mut self, building_id: u32) {
+        self.pending_orders.push(GameOrder {
+            order_string: "RepairBuilding".into(),
+            subject_id: Some(building_id),
+            target_string: None,
+            extra_data: None,
+        });
+    }
+
+    pub fn order_set_rally_point(&mut self, building_id: u32, x: i32, y: i32) {
+        self.pending_orders.push(GameOrder {
+            order_string: "SetRallyPoint".into(),
+            subject_id: Some(building_id),
+            target_string: Some(format!("{},{}", x, y)),
             extra_data: None,
         });
     }

@@ -37,7 +37,7 @@ fn debug_orders_and_hashes() {
     let map = oramap::parse(&map_data).unwrap();
     let settings = replay.lobby_settings().unwrap();
     let lobby = lobby_from_replay(&replay);
-    let mut w = world::build_world(&map, settings.random_seed, &lobby, None);
+    let mut w = world::build_world(&map, settings.random_seed, &lobby, None, 0);
 
     // Dump ALL orders around the mismatch area
     eprintln!("=== ALL orders for frames 30-50 ===");
