@@ -158,6 +158,25 @@ pub struct PlayerSnapshot {
     pub cash: i32,
     pub power_provided: i32,
     pub power_drained: i32,
+    pub production_queue: Vec<ProductionSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProductionSnapshot {
+    pub item_name: String,
+    pub progress: f32,
+    pub done: bool,
+}
+
+/// Info about an item the player can build.
+#[derive(Debug, Serialize)]
+pub struct BuildableInfo {
+    pub name: String,
+    pub cost: i32,
+    pub kind: ActorKind,
+    pub is_building: bool,
+    pub power: i32,
+    pub footprint: (i32, i32),
 }
 
 pub struct SyncHashDebug {
@@ -329,7 +348,21 @@ impl World {
                     (0, 0)
                 })
                 .unwrap_or((0, 0));
-            PlayerSnapshot { index: pid, cash, power_provided, power_drained }
+            let production_queue = self.production.get(&pid).map(|items| {
+                items.iter().map(|item| {
+                    let progress = if item.total_time > 0 {
+                        1.0 - (item.remaining_time as f32 / item.total_time as f32)
+                    } else {
+                        1.0
+                    };
+                    ProductionSnapshot {
+                        item_name: item.item_name.clone(),
+                        progress,
+                        done: item.remaining_time <= 0,
+                    }
+                }).collect()
+            }).unwrap_or_default();
+            PlayerSnapshot { index: pid, cash, power_provided, power_drained, production_queue }
         }).collect();
         // Collect resource cells for rendering
         let mut resources = Vec::new();
@@ -1644,6 +1677,93 @@ impl World {
             hash = hash * 2 + if visible { 1 } else { 0 };
         }
         hash
+    }
+
+    /// Return items the player can currently build (prerequisites met).
+    pub fn buildable_items(&self, player_id: u32) -> Vec<BuildableInfo> {
+        let mut items = Vec::new();
+        for (name, stats) in &self.rules.actors {
+            if stats.cost <= 0 { continue; }
+            if !self.has_prerequisites(player_id, name) { continue; }
+            items.push(BuildableInfo {
+                name: name.clone(),
+                cost: stats.cost,
+                kind: stats.kind,
+                is_building: stats.is_building,
+                power: stats.power,
+                footprint: stats.footprint,
+            });
+        }
+        items
+    }
+
+    /// Check if a building can be placed at (x, y) for the given player.
+    pub fn can_place_building(&self, player_id: u32, building_type: &str, x: i32, y: i32) -> bool {
+        let (fw, fh, _hp) = match self.rules.actor(building_type) {
+            Some(s) => (s.footprint.0, s.footprint.1, s.hp),
+            None => return false,
+        };
+        // Check bounds
+        if x < 0 || y < 0 || x + fw > self.map_width || y + fh > self.map_height {
+            return false;
+        }
+        // Check all cells are passable and unoccupied
+        for cy in y..y + fh {
+            for cx in x..x + fw {
+                if !self.terrain.is_passable(cx, cy) {
+                    return false;
+                }
+                if self.terrain.occupant(cx, cy) != 0 {
+                    return false;
+                }
+            }
+        }
+        // Must be adjacent to own building (simplified adjacency check)
+        let has_adjacent = self.actors.values().any(|a| {
+            if a.owner_id != Some(player_id) || a.kind != ActorKind::Building { return false; }
+            let (ax, ay) = a.location.unwrap_or((-100, -100));
+            let (aw, ah) = self.rules.actor(a.actor_type.as_deref().unwrap_or(""))
+                .map(|s| (s.footprint.0, s.footprint.1))
+                .unwrap_or((1, 1));
+            // Check if any cell of new building is within 2 cells of existing building
+            for ny in y..y + fh {
+                for nx in x..x + fw {
+                    if nx >= ax - 2 && nx < ax + aw + 2 && ny >= ay - 2 && ny < ay + ah + 2 {
+                        return true;
+                    }
+                }
+            }
+            false
+        });
+        has_adjacent
+    }
+
+    /// Check if the game is over. Returns Some(winning_player_id) or None.
+    pub fn game_over(&self) -> Option<u32> {
+        if self.world_tick < 30 { return None; } // too early
+        let mut alive_players: Vec<u32> = Vec::new();
+        // A player is alive if they have any buildings or units (excluding trees/mines/world/player actors)
+        for &pid in &self.player_actor_ids {
+            if pid == self.everyone_player_id { continue; }
+            let has_stuff = self.actors.values().any(|a| {
+                a.owner_id == Some(pid)
+                    && matches!(a.kind, ActorKind::Building | ActorKind::Infantry
+                        | ActorKind::Vehicle | ActorKind::Mcv | ActorKind::Aircraft | ActorKind::Ship)
+            });
+            if has_stuff {
+                alive_players.push(pid);
+            }
+        }
+        if alive_players.len() == 1 {
+            Some(alive_players[0])
+        } else {
+            None
+        }
+    }
+
+    /// Get the player actor IDs (for identifying human vs bot).
+    pub fn player_ids(&self) -> &[u32] {
+        &self.player_actor_ids
     }
 }
 

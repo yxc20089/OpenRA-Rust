@@ -2,38 +2,167 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>OpenRA Replay Viewer</title>
+<title>OpenRA Rust</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { background: #1a1a2e; color: #e0e0e0; font-family: monospace; display: flex; flex-direction: column; align-items: center; padding: 20px; }
-h1 { margin-bottom: 16px; color: #e94560; }
-.controls { margin: 12px 0; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; justify-content: center; }
-button { background: #e94560; color: white; border: none; padding: 6px 16px; cursor: pointer; font-family: monospace; font-size: 14px; border-radius: 3px; }
-button:hover { background: #c73650; }
-button:disabled { background: #555; cursor: not-allowed; }
-.file-inputs { margin-bottom: 16px; display: flex; gap: 20px; flex-wrap: wrap; justify-content: center; }
+body { background: #1a1a2e; color: #e0e0e0; font-family: monospace; }
+
+/* ── Home Screen ── */
+#home {
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; min-height: 100vh; gap: 24px;
+}
+#home h1 { color: #e94560; font-size: 32px; }
+#home p { color: #888; font-size: 14px; }
+.home-buttons { display: flex; gap: 20px; margin-top: 12px; }
+.home-btn {
+  background: #e94560; color: white; border: none; padding: 16px 32px;
+  cursor: pointer; font-family: monospace; font-size: 18px; border-radius: 6px;
+}
+.home-btn:hover { background: #c73650; }
+.home-btn.secondary { background: #2a4a6a; }
+.home-btn.secondary:hover { background: #3a5a7a; }
+
+/* ── Replay file inputs ── */
+#replay-setup {
+  display: none; flex-direction: column; align-items: center;
+  justify-content: center; min-height: 100vh; gap: 16px;
+}
+#replay-setup h2 { color: #e94560; }
+.file-inputs { display: flex; gap: 20px; flex-wrap: wrap; justify-content: center; }
 .file-inputs label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
-canvas { border: 1px solid #333; background: #1a3a1a; }
-#status { margin-top: 8px; font-size: 13px; color: #aaa; max-width: 960px; text-align: center; }
-#speed-label { font-size: 13px; }
-input[type="range"] { width: 100px; vertical-align: middle; }
 input[type="file"] { font-size: 12px; color: #ccc; }
+
+/* ── Game UI ── */
+#game-ui { display: none; height: 100vh; }
+.game-layout {
+  display: flex; height: calc(100vh - 36px);
+}
+#sidebar {
+  width: 200px; background: #16213e; border-right: 1px solid #333;
+  overflow-y: auto; flex-shrink: 0;
+}
+#canvas-wrap { flex: 1; position: relative; }
+canvas { display: block; width: 100%; height: 100%; }
+#status-bar {
+  height: 36px; background: #0f1629; border-top: 1px solid #333;
+  display: flex; align-items: center; padding: 0 12px; font-size: 13px;
+  gap: 20px;
+}
+
+/* Sidebar sections */
+.sidebar-section { border-bottom: 1px solid #333; padding: 8px; }
+.sidebar-section h3 { font-size: 11px; color: #888; margin-bottom: 6px; text-transform: uppercase; }
+.build-btn {
+  display: block; width: 100%; padding: 6px 8px; margin-bottom: 3px;
+  background: #1a2a4a; color: #ddd; border: 1px solid #333; cursor: pointer;
+  font-family: monospace; font-size: 12px; text-align: left; border-radius: 3px;
+}
+.build-btn:hover { background: #2a3a5a; border-color: #e94560; }
+.build-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.build-btn .cost { float: right; color: #ffcc00; }
+
+/* Production queue */
+.queue-item { padding: 4px 8px; font-size: 12px; }
+.queue-item .bar { height: 4px; background: #333; border-radius: 2px; margin-top: 2px; }
+.queue-item .bar-fill { height: 100%; background: #e94560; border-radius: 2px; transition: width 0.1s; }
+.queue-item.done .bar-fill { background: #44cc44; }
+
+/* Selection info */
+.sel-info { padding: 8px; font-size: 12px; }
+.sel-info .name { color: #e94560; font-weight: bold; }
+
+/* Action buttons */
+.action-btn {
+  background: #e94560; color: white; border: none; padding: 4px 12px;
+  cursor: pointer; font-family: monospace; font-size: 12px; border-radius: 3px;
+  margin: 2px;
+}
+.action-btn:hover { background: #c73650; }
+
+/* Replay controls */
+.replay-controls { padding: 8px; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.replay-controls button {
+  background: #e94560; color: white; border: none; padding: 4px 10px;
+  cursor: pointer; font-family: monospace; font-size: 12px; border-radius: 3px;
+}
+.replay-controls button:hover { background: #c73650; }
+.replay-controls button:disabled { background: #555; cursor: not-allowed; }
+.replay-controls label { font-size: 11px; }
+input[type="range"] { width: 80px; vertical-align: middle; }
 </style>
 </head>
 <body>
-<h1>OpenRA Replay Viewer</h1>
-<div class="file-inputs">
-  <label>Replay (.orarep)<input type="file" id="replay-file" accept=".orarep"></label>
-  <label>Map (.oramap)<input type="file" id="map-file" accept=".oramap"></label>
+
+<!-- ── Home Screen ── -->
+<div id="home">
+  <h1>OpenRA Rust</h1>
+  <p>Real-time strategy in the browser</p>
+  <div class="home-buttons">
+    <button class="home-btn" id="btn-start-game">Start Playing</button>
+    <button class="home-btn secondary" id="btn-watch-replay">Watch Replay</button>
+  </div>
+  <p style="margin-top: 8px; font-size: 12px; color: #555;">Play against a bot AI on a built-in map</p>
 </div>
-<div class="controls">
-  <button id="btn-load" disabled>Load</button>
-  <button id="btn-play" disabled>Play</button>
-  <button id="btn-step" disabled>Step</button>
-  <label id="speed-label">Speed: <input type="range" id="speed" min="1" max="60" value="10"> <span id="speed-val">10</span></label>
+
+<!-- ── Replay Setup ── -->
+<div id="replay-setup">
+  <h2>Watch Replay</h2>
+  <div class="file-inputs">
+    <label>Replay (.orarep)<input type="file" id="replay-file" accept=".orarep"></label>
+    <label>Map (.oramap)<input type="file" id="map-file" accept=".oramap"></label>
+  </div>
+  <div style="display: flex; gap: 10px; margin-top: 8px;">
+    <button class="home-btn" id="btn-load-replay" disabled>Load Replay</button>
+    <button class="home-btn secondary" id="btn-back-home">Back</button>
+  </div>
+  <div id="replay-status" style="margin-top: 8px; font-size: 12px; color: #888;"></div>
 </div>
-<canvas id="canvas" width="960" height="720"></canvas>
-<div id="status">Load a replay and map to begin.</div>
+
+<!-- ── Game UI ── -->
+<div id="game-ui">
+  <div class="game-layout">
+    <div id="sidebar">
+      <div class="sidebar-section" id="sel-section" style="display:none;">
+        <h3>Selected</h3>
+        <div class="sel-info" id="sel-info"></div>
+        <div id="sel-actions"></div>
+      </div>
+      <div class="sidebar-section" id="queue-section" style="display:none;">
+        <h3>Building</h3>
+        <div id="queue-list"></div>
+      </div>
+      <div class="sidebar-section" id="build-buildings">
+        <h3>Buildings</h3>
+        <div id="building-list"></div>
+      </div>
+      <div class="sidebar-section" id="build-units">
+        <h3>Units</h3>
+        <div id="unit-list"></div>
+      </div>
+      <!-- Replay-only controls -->
+      <div class="sidebar-section" id="replay-controls" style="display:none;">
+        <h3>Replay</h3>
+        <div class="replay-controls">
+          <button id="btn-play">Play</button>
+          <button id="btn-step">Step</button>
+          <label>Speed <input type="range" id="speed" min="1" max="60" value="10"> <span id="speed-val">10</span></label>
+        </div>
+      </div>
+    </div>
+    <div id="canvas-wrap">
+      <canvas id="canvas"></canvas>
+    </div>
+  </div>
+  <div id="status-bar">
+    <span id="hud-cash">$5000</span>
+    <span id="hud-power">Power: 0/0</span>
+    <span id="hud-tick">Tick 0</span>
+    <span id="hud-mode" style="color: #888;"></span>
+    <span id="hud-msg" style="flex:1; text-align:right; color:#888;"></span>
+  </div>
+</div>
+
 <script type="module" src="index.js"></script>
 </body>
 </html>
