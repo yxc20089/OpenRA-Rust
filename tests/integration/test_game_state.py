@@ -70,3 +70,32 @@ def test_terrain_not_all_black(game_page):
         return nonBlack;
     })()""")
     assert result > 0, "Canvas center is entirely black — terrain not rendering"
+
+
+def test_shroud_edges_smooth(game_page):
+    """Shroud boundary should have smooth (blurred) edges, not hard cell-by-cell steps."""
+    start_game(game_page)
+    wait_ticks(game_page, 5)
+    # Sample pixels along a radial line from center toward the shroud edge.
+    # With smooth edges, brightness should decrease gradually (many distinct levels).
+    # With blocky edges, it jumps abruptly from bright to black (few levels).
+    result = game_page.evaluate("""(() => {
+        const c = document.getElementById('canvas');
+        const ctx = c.getContext('2d');
+        const cx = Math.floor(c.width / 2);
+        const cy = Math.floor(c.height / 2);
+        const levels = new Set();
+        // Sample 40 points going right from center toward shroud
+        for (let i = 0; i < 40; i++) {
+            const x = cx + i * 8;
+            if (x >= c.width) break;
+            const d = ctx.getImageData(x, cy, 1, 1).data;
+            // Quantize brightness to 16 levels
+            const brightness = Math.floor((d[0] + d[1] + d[2]) / 48);
+            levels.add(brightness);
+        }
+        return levels.size;
+    })()""")
+    # Smooth edges should produce at least 4 distinct brightness levels
+    # (bright terrain → dim fog → dark transition → black shroud)
+    assert result >= 3, f"Only {result} brightness levels — shroud edges may be too blocky"

@@ -105,3 +105,34 @@ def test_escape_clears_selection(game_page):
     game_page.keyboard.press("Escape")
     sel = get_selected_units(game_page)
     assert len(sel) == 0, "Escape should clear selection"
+
+
+def test_no_spinning_sprite_on_selected_unit(game_page):
+    """Selecting a unit should not show a spinning/animated overlay (regression: wrench bug)."""
+    pid = start_game(game_page)
+    snap = get_snapshot(game_page)
+    mcv = find_actor(snap, kind="Mcv", owner=pid)
+    click_cell(game_page, mcv["x"], mcv["y"])
+    wait_ticks(game_page, 3)
+    # Sample pixels around the MCV across two ticks — they should be stable (not animating)
+    mcv_x, mcv_y = mcv["x"], mcv["y"]
+    pixel_sample_js = f"""(() => {{
+        const c = document.getElementById('canvas');
+        const ctx = c.getContext('2d');
+        const o = window._ora;
+        const mcvX = Math.floor({mcv_x} * o.cellPx - o.camX + o.cellPx/2);
+        const mcvY = Math.floor({mcv_y} * o.cellPx - o.camY + o.cellPx/2);
+        let sum = 0;
+        for (let dx = -10; dx <= 10; dx += 5) {{
+            const d = ctx.getImageData(mcvX + dx, mcvY - 15, 1, 1).data;
+            sum += d[0] + d[1] + d[2];
+        }}
+        return sum;
+    }})()"""
+    sample1 = game_page.evaluate(pixel_sample_js)
+    wait_ticks(game_page, 4)
+    sample2 = game_page.evaluate(pixel_sample_js)
+    # If something is spinning/animating, the pixel values would change between frames
+    # Allow small variance for normal rendering (fog, etc) but large changes indicate animation
+    diff = abs(sample1 - sample2)
+    assert diff < 200, f"Pixels near selected unit changed by {diff} — possible spinning overlay"

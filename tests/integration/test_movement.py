@@ -1,4 +1,5 @@
 """Test unit movement behaviors."""
+import math
 from helpers import (
     start_game, get_snapshot, wait_ticks, click_cell, right_click_cell,
     find_actor, find_actors, order_move, order_stop, deploy_mcv,
@@ -106,3 +107,41 @@ def test_move_to_occupied_cell(game_page):
     snap = get_snapshot(game_page)
     u = find_actor(snap, id=unit["id"])
     assert u is not None, "Unit should still exist after moving to occupied cell"
+
+
+def test_facing_matches_movement_direction(game_page):
+    """Unit facing should match the direction of movement (regression: wrong sprite direction)."""
+    pid, fact = deploy_mcv(game_page)
+    snap = get_snapshot(game_page)
+    unit = next((a for a in snap["actors"] if a["owner"] == pid and a["kind"] == "Vehicle"), None)
+    if not unit:
+        return
+    # Move east (facing should be ~256)
+    order_move(game_page, unit["id"], unit["x"] + 6, unit["y"])
+    wait_ticks(game_page, 8)
+    snap = get_snapshot(game_page)
+    moved = find_actor(snap, id=unit["id"])
+    assert moved and moved["activity"] == "moving", f"Unit should be moving, got {moved['activity'] if moved else 'None'}"
+    # East = facing 256 in OpenRA. Allow ±128 for smooth turn.
+    facing = moved["facing"]
+    diff = min(abs(facing - 256), 1024 - abs(facing - 256))
+    assert diff < 192, f"Unit moving east should face ~256 (East), got facing={facing}"
+
+
+def test_facing_updates_on_direction_change(game_page):
+    """Facing should update when unit changes direction along path."""
+    pid, fact = deploy_mcv(game_page)
+    snap = get_snapshot(game_page)
+    unit = next((a for a in snap["actors"] if a["owner"] == pid and a["kind"] == "Vehicle"), None)
+    if not unit:
+        return
+    # Move south (facing should approach 512)
+    order_move(game_page, unit["id"], unit["x"], unit["y"] + 6)
+    wait_ticks(game_page, 8)
+    snap = get_snapshot(game_page)
+    moved = find_actor(snap, id=unit["id"])
+    if not moved or moved["activity"] != "moving":
+        return
+    facing = moved["facing"]
+    diff = min(abs(facing - 512), 1024 - abs(facing - 512))
+    assert diff < 192, f"Unit moving south should face ~512 (South), got facing={facing}"

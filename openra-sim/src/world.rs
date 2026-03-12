@@ -1276,37 +1276,51 @@ impl World {
             let target_center = center_of_cell(target_cell.0, target_cell.1);
             let speed_val = *speed;
 
-            // Update facing
+            // Update facing with smooth interpolation (same as Move activity)
             if let Some(current_loc) = actor.location {
                 let desired_facing = pathfinder::facing_between(current_loc, target_cell);
                 for t in &mut actor.traits {
                     if let TraitState::Mobile { facing, .. } = t {
-                        *facing = desired_facing;
+                        let turn_speed = 128;
+                        let diff = ((desired_facing - *facing) + 1024) % 1024;
+                        if diff != 0 {
+                            if diff <= 512 {
+                                *facing = (*facing + diff.min(turn_speed)) % 1024;
+                            } else {
+                                *facing = (*facing + 1024 - (1024 - diff).min(turn_speed)) % 1024;
+                            }
+                        }
                         break;
                     }
                 }
             }
 
-            // Interpolate position
+            // Linear interpolation toward target (same as Move activity)
             let mut arrived = false;
             for t in &mut actor.traits {
                 if let TraitState::Mobile { center_position, from_cell, to_cell, .. } = t {
                     *to_cell = CPos::new(target_cell.0, target_cell.1);
-                    let dx = target_center.x - center_position.x;
-                    let dy = target_center.y - center_position.y;
-                    let dist_sq = (dx as i64) * (dx as i64) + (dy as i64) * (dy as i64);
-                    let speed_sq = (speed_val as i64) * (speed_val as i64);
-                    if dist_sq <= speed_sq {
+                    let from_center = center_of_cell(from_cell.x(), from_cell.y());
+                    let total_dx = (target_center.x - from_center.x) as i64;
+                    let total_dy = (target_center.y - from_center.y) as i64;
+                    let total_dist = ((total_dx * total_dx + total_dy * total_dy) as f64).sqrt() as i32;
+                    if total_dist == 0 {
                         *center_position = target_center;
-                        *from_cell = CPos::new(target_cell.0, target_cell.1);
-                        *to_cell = CPos::new(target_cell.0, target_cell.1);
                         arrived = true;
                     } else {
-                        let abs_dx = dx.abs().max(1);
-                        let abs_dy = dy.abs().max(1);
-                        let max_comp = abs_dx.max(abs_dy);
-                        center_position.x += dx * speed_val / max_comp;
-                        center_position.y += dy * speed_val / max_comp;
+                        let prog_dx = (center_position.x - from_center.x) as i64;
+                        let prog_dy = (center_position.y - from_center.y) as i64;
+                        let progress = ((prog_dx * prog_dx + prog_dy * prog_dy) as f64).sqrt() as i32;
+                        let new_progress = progress + speed_val;
+                        if new_progress >= total_dist {
+                            *center_position = target_center;
+                            *from_cell = CPos::new(target_cell.0, target_cell.1);
+                            *to_cell = CPos::new(target_cell.0, target_cell.1);
+                            arrived = true;
+                        } else {
+                            center_position.x = from_center.x + (total_dx * new_progress as i64 / total_dist as i64) as i32;
+                            center_position.y = from_center.y + (total_dy * new_progress as i64 / total_dist as i64) as i32;
+                        }
                     }
                     break;
                 }
@@ -1494,43 +1508,60 @@ impl World {
                 let target_cell = path[*path_index];
                 let target_center = center_of_cell(target_cell.0, target_cell.1);
 
-                // Update facing toward target
+                // Update facing with smooth interpolation (like C# TurnsWhileMoving)
                 if let Some(current_loc) = actor.location {
                     let desired_facing = pathfinder::facing_between(current_loc, target_cell);
                     for t in &mut actor.traits {
                         if let TraitState::Mobile { facing, .. } = t {
-                            *facing = desired_facing;
+                            // Smooth turn: move facing toward desired by turn_speed per tick
+                            let turn_speed = 128; // ~45 degrees per tick
+                            let diff = ((desired_facing - *facing) + 1024) % 1024;
+                            if diff != 0 {
+                                if diff <= 512 {
+                                    *facing = (*facing + diff.min(turn_speed)) % 1024;
+                                } else {
+                                    *facing = (*facing + 1024 - (1024 - diff).min(turn_speed)) % 1024;
+                                }
+                            }
                             break;
                         }
                     }
                 }
 
-                // Interpolate CenterPosition toward target
+                // Linear interpolation toward target (C#-style Lerp)
+                // Progress advances by `speed` world units per tick along the
+                // straight line from from_cell center to to_cell center.
                 let mut arrived = false;
                 for t in &mut actor.traits {
                     if let TraitState::Mobile { center_position, from_cell, to_cell, .. } = t {
-                        // Set ToCell to target
                         *to_cell = CPos::new(target_cell.0, target_cell.1);
+                        let from_center = center_of_cell(from_cell.x(), from_cell.y());
 
-                        let dx = target_center.x - center_position.x;
-                        let dy = target_center.y - center_position.y;
-                        let dist_sq = (dx as i64) * (dx as i64) + (dy as i64) * (dy as i64);
-                        let speed_sq = (speed as i64) * (speed as i64);
+                        // Total distance between cell centers (1024 for ortho, ~1448 for diag)
+                        let total_dx = (target_center.x - from_center.x) as i64;
+                        let total_dy = (target_center.y - from_center.y) as i64;
+                        let total_dist = ((total_dx * total_dx + total_dy * total_dy) as f64).sqrt() as i32;
 
-                        if dist_sq <= speed_sq {
-                            // Arrived at cell
+                        if total_dist == 0 {
                             *center_position = target_center;
-                            *from_cell = CPos::new(target_cell.0, target_cell.1);
-                            *to_cell = CPos::new(target_cell.0, target_cell.1);
                             arrived = true;
                         } else {
-                            // Move toward target
-                            // Use integer approximation: normalize by largest component
-                            let abs_dx = dx.abs().max(1);
-                            let abs_dy = dy.abs().max(1);
-                            let max_comp = abs_dx.max(abs_dy);
-                            center_position.x += dx * speed / max_comp;
-                            center_position.y += dy * speed / max_comp;
+                            // Current progress = distance traveled from from_center
+                            let prog_dx = (center_position.x - from_center.x) as i64;
+                            let prog_dy = (center_position.y - from_center.y) as i64;
+                            let progress = ((prog_dx * prog_dx + prog_dy * prog_dy) as f64).sqrt() as i32;
+                            let new_progress = progress + speed;
+
+                            if new_progress >= total_dist {
+                                *center_position = target_center;
+                                *from_cell = CPos::new(target_cell.0, target_cell.1);
+                                *to_cell = CPos::new(target_cell.0, target_cell.1);
+                                arrived = true;
+                            } else {
+                                // Lerp: position = from + (to - from) * progress / distance
+                                center_position.x = from_center.x + (total_dx * new_progress as i64 / total_dist as i64) as i32;
+                                center_position.y = from_center.y + (total_dy * new_progress as i64 / total_dist as i64) as i32;
+                            }
                         }
                         break;
                     }

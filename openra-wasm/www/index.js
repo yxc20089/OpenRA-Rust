@@ -998,6 +998,25 @@ function buildTerrainCanvas(snapshot) {
     }
 }
 
+// ── Classic facing-to-frame lookup (C# OpenRA RA/TD non-linear mapping for 32-facing sprites) ──
+const CLASSIC_SPRITE_RANGES = [
+    20, 56, 88, 132, 156, 184, 212, 240,
+    268, 296, 324, 352, 384, 416, 452, 488,
+    532, 568, 604, 644, 668, 696, 724, 752,
+    780, 808, 836, 864, 896, 928, 964, 1000
+];
+function classicIndexFacing(facing, numFrames) {
+    if (numFrames === 32) {
+        const angle = facing & 1023;
+        for (let i = 0; i < 32; i++)
+            if (angle < CLASSIC_SPRITE_RANGES[i]) return i;
+        return 0; // wraps: 1000-1023 → frame 0 (North)
+    }
+    // Fallback to linear for non-32 facings
+    const step = 1024 / numFrames;
+    return Math.floor(((facing + step / 2) & 1023) / step) % numFrames;
+}
+
 // ── RENDER ──
 function render(snapshot) {
     if (!snapshot) return;
@@ -1062,10 +1081,9 @@ function render(snapshot) {
         drawShroud();
     }
 
-    // Selection ground indicator + brackets + health bars on selected
+    // Selection brackets + health bars on selected units
     for (const a of sorted) {
         if (selectedUnits.includes(a.id)) {
-            drawSelectionIndicator(a);
             drawSelectionBrackets(a);
         }
     }
@@ -1257,45 +1275,32 @@ function drawSellAnims() {
 
 function drawResources(snapshot) {
     if (!snapshot.resources) return;
-    const scale = cellPx / CELL_PX;
     for (const res of snapshot.resources) {
         const sx = res.x * cellPx - camX, sy = res.y * cellPx - camY;
         if (sx + cellPx < 0 || sx > canvas.width || sy + cellPx < 0 || sy > canvas.height) continue;
         const d = res.density || 1;
-        // Try sprite: ore = mine.tem, gems = gmine.tem
-        const temName = res.kind === 1 ? 'ter:mine.tem' : 'ter:gmine.tem';
-        const frames = spriteImages[temName];
-        const info = spriteInfo[temName];
-        if (frames && info && frames.length > 0) {
-            // Pick frame based on density (more ore = later frame)
-            const frame = Math.min(d - 1, frames.length - 1);
-            if (frames[frame]) {
-                const drawW = info.width * scale;
-                const drawH = info.height * scale;
-                ctx.drawImage(frames[frame], sx + cellPx/2 - drawW/2, sy + cellPx/2 - drawH/2, drawW, drawH);
-                continue;
-            }
-        }
-        // Geometric fallback
         if (res.kind === 1) {
-            ctx.fillStyle = `rgba(140,110,30,${0.2 + d * 0.08})`;
-            ctx.fillRect(sx + 2, sy + 2, cellPx - 4, cellPx - 4);
-            ctx.fillStyle = '#a08020';
+            // Ore: golden-brown specks, density affects count and opacity
+            ctx.fillStyle = `rgba(160,128,32,${0.15 + d * 0.05})`;
+            ctx.fillRect(sx + 1, sy + 1, cellPx - 2, cellPx - 2);
+            ctx.fillStyle = '#c8a020';
             const seed = res.x * 31 + res.y * 17;
-            for (let i = 0; i < Math.min(d, 5); i++) {
-                const ox = ((seed + i * 7) % (cellPx - 6)) + 3;
-                const oy = ((seed + i * 13) % (cellPx - 6)) + 3;
-                ctx.fillRect(sx + ox, sy + oy, 2, 2);
+            for (let i = 0; i < Math.min(d, 6); i++) {
+                const ox = ((seed + i * 7) % (cellPx - 4)) + 2;
+                const oy = ((seed + i * 13) % (cellPx - 4)) + 2;
+                const sz = d > 6 ? 3 : 2;
+                ctx.fillRect(sx + ox, sy + oy, sz, sz);
             }
         } else {
-            ctx.fillStyle = `rgba(100,40,140,${0.3 + d * 0.08})`;
-            ctx.fillRect(sx + 2, sy + 2, cellPx - 4, cellPx - 4);
+            // Gems: purple/blue specks
+            ctx.fillStyle = `rgba(100,40,180,${0.15 + d * 0.06})`;
+            ctx.fillRect(sx + 1, sy + 1, cellPx - 2, cellPx - 2);
             ctx.fillStyle = '#c060e0';
             const seed = res.x * 23 + res.y * 11;
             for (let i = 0; i < Math.min(d, 4); i++) {
-                const ox = ((seed + i * 9) % (cellPx - 6)) + 3;
-                const oy = ((seed + i * 11) % (cellPx - 6)) + 3;
-                ctx.fillRect(sx + ox, sy + oy, 2, 2);
+                const ox = ((seed + i * 9) % (cellPx - 4)) + 2;
+                const oy = ((seed + i * 11) % (cellPx - 4)) + 2;
+                ctx.fillRect(sx + ox, sy + oy, 3, 3);
             }
         }
     }
@@ -1383,8 +1388,7 @@ function drawBuilding(a) {
                         const ovDy = centerY - ovH / 2;
                         let ovFrame = 0;
                         if (ovName === 'sam2' && ovInfo.frames >= 32 && a.facing !== undefined) {
-                            const step = 1024 / 32;
-                            ovFrame = Math.floor(((a.facing + step / 2) & 1023) / step) % 32;
+                            ovFrame = classicIndexFacing(a.facing, 32);
                         } else if (ovName === 'afldidle' && ovInfo.frames > 1) {
                             ovFrame = (currentTick * 2) % ovInfo.frames;
                         }
@@ -1484,8 +1488,7 @@ function drawUnit(a) {
         const isVehicle = a.kind === 'Vehicle' || a.kind === 'Mcv' || a.kind === 'Aircraft' || a.kind === 'Ship';
         if (!huskName) {
             if (isVehicle && info.frames >= 32) {
-                const step = 1024 / 32;
-                frame = Math.floor(((a.facing + step/2) & 1023) / step) % 32;
+                frame = classicIndexFacing(a.facing, 32);
             } else if (a.kind === 'Infantry' && info.frames >= 8) {
                 const step = 1024 / 8;
                 const facingIdx = Math.floor(((a.facing + step/2) & 1023) / step) % 8;
@@ -1510,8 +1513,7 @@ function drawUnit(a) {
                 const tInfo = spriteInfo[turretName];
                 if (tInfo && spriteImages[turretName] && tInfo.frames >= 32) {
                     const tW = tInfo.width * scale, tH = tInfo.height * scale;
-                    const step = 1024 / 32;
-                    const tFrame = Math.floor(((a.facing + step/2) & 1023) / step) % 32;
+                    const tFrame = classicIndexFacing(a.facing, 32);
                     const tCx = sx + cellPx/2 - tW/2, tCy = sy + cellPx/2 - tH/2;
                     drawSprite(turretName, tFrame, tCx, tCy, tW, tH, a.owner);
                 }
@@ -1760,35 +1762,6 @@ function drawCrate(a) {
     }
 }
 
-// ── Selection ground indicator (select.shp) ──
-function drawSelectionIndicator(a) {
-    const selectInfo = spriteInfo['select'];
-    const selectFrames = spriteImages['select'];
-    if (!selectInfo || !selectFrames) return;
-    const scale = cellPx / CELL_PX;
-    let sx, sy, bw, bh;
-    if (a.kind === 'Building') {
-        const fp = BUILDING_FOOTPRINTS[a.actor_type] || [2,2];
-        sx = a.x * cellPx - camX; sy = a.y * cellPx - camY;
-        bw = fp[0] * cellPx; bh = fp[1] * cellPx;
-    } else {
-        sx = a.x * cellPx - camX; sy = a.y * cellPx - camY;
-        bw = cellPx; bh = cellPx;
-    }
-    // Animate selection circle
-    const sFrame = (currentTick * 3) % selectInfo.frames;
-    if (selectFrames[sFrame]) {
-        const sW = selectInfo.width * scale;
-        const sH = selectInfo.height * scale;
-        // Scale to fit footprint
-        const fitW = Math.max(sW, bw * 0.8);
-        const fitH = Math.max(sH, bh * 0.8);
-        ctx.globalAlpha = 0.5;
-        ctx.drawImage(selectFrames[sFrame], sx + bw/2 - fitW/2, sy + bh/2 - fitH/2, fitW, fitH);
-        ctx.globalAlpha = 1;
-    }
-}
-
 // ── Fog of War ──
 function computeVisibility(snapshot) {
     if (!snapshot || humanPlayerId == null) return;
@@ -1827,8 +1800,7 @@ function drawShroud() {
 
     const w = canvas.width, h = canvas.height;
 
-    // Use an offscreen canvas for the shroud mask so we don't destroy
-    // already-drawn terrain/units on the main canvas.
+    // Offscreen canvas for shroud mask (black = unexplored, transparent = explored)
     if (!_shroudCanvas || _shroudCanvas.width !== w || _shroudCanvas.height !== h) {
         _shroudCanvas = document.createElement('canvas');
         _shroudCanvas.width = w;
@@ -1837,41 +1809,41 @@ function drawShroud() {
     }
     const sctx = _shroudCtx;
 
-    // Fill offscreen shroud canvas with black (unexplored = black)
+    // Fill with black (full shroud)
+    sctx.globalCompositeOperation = 'source-over';
     sctx.clearRect(0, 0, w, h);
     sctx.fillStyle = '#000';
     sctx.fillRect(0, 0, w, h);
 
-    // Cut out explored/visible areas with soft radial gradients
+    // Cut out all explored cells (destination-out removes black where explored)
     sctx.globalCompositeOperation = 'destination-out';
-
-    if (lastSnapshot) {
-        for (const a of lastSnapshot.actors) {
-            if (a.owner !== humanPlayerId) continue;
-            const range = SIGHT_RANGES[a.kind] || 5;
-            let ax = a.x, ay = a.y;
-            if (a.kind === 'Building') {
-                const fp = BUILDING_FOOTPRINTS[a.actor_type] || [2,2];
-                ax = a.x + fp[0] / 2;
-                ay = a.y + fp[1] / 2;
+    sctx.fillStyle = 'rgba(0,0,0,1)';
+    const startCX = Math.floor(camX / cellPx) - 1;
+    const startCY = Math.floor(camY / cellPx) - 1;
+    const endCX = Math.ceil((camX + w) / cellPx) + 1;
+    const endCY = Math.ceil((camY + h) / cellPx) + 1;
+    for (let cy = startCY; cy <= endCY; cy++) {
+        for (let cx = startCX; cx <= endCX; cx++) {
+            if (cx < 0 || cy < 0 || cx >= mapW || cy >= mapH) continue;
+            const key = `${cx},${cy}`;
+            if (exploredCells.has(key)) {
+                const px = cx * cellPx - camX;
+                const py = cy * cellPx - camY;
+                sctx.fillRect(px, py, cellPx, cellPx);
             }
-            const sx = ax * cellPx - camX + cellPx/2;
-            const sy = ay * cellPx - camY + cellPx/2;
-            const radius = range * cellPx;
-
-            const grad = sctx.createRadialGradient(sx, sy, radius * 0.7, sx, sy, radius);
-            grad.addColorStop(0, 'rgba(0,0,0,1)');
-            grad.addColorStop(1, 'rgba(0,0,0,0)');
-            sctx.fillStyle = grad;
-            sctx.fillRect(sx - radius, sy - radius, radius * 2, radius * 2);
         }
     }
+    sctx.globalCompositeOperation = 'source-over';
 
-    // Also cut out explored cells (previously seen areas get partial transparency)
-    const startCX = Math.floor(camX / cellPx);
-    const startCY = Math.floor(camY / cellPx);
-    const endCX = Math.ceil((camX + w) / cellPx);
-    const endCY = Math.ceil((camY + h) / cellPx);
+    // Composite shroud with blur to smooth the cell-boundary edges
+    ctx.save();
+    ctx.filter = `blur(${Math.max(4, Math.round(cellPx / 3))}px)`;
+    ctx.drawImage(_shroudCanvas, 0, 0);
+    ctx.filter = 'none';
+    ctx.restore();
+
+    // Fog of war: dim explored-but-not-visible cells
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
     for (let cy = startCY; cy <= endCY; cy++) {
         for (let cx = startCX; cx <= endCX; cx++) {
             if (cx < 0 || cy < 0 || cx >= mapW || cy >= mapH) continue;
@@ -1880,17 +1852,10 @@ function drawShroud() {
             if (exploredCells.has(key)) {
                 const px = cx * cellPx - camX;
                 const py = cy * cellPx - camY;
-                // Partially cut out explored-but-not-visible cells (60% visible)
-                sctx.fillStyle = 'rgba(0,0,0,0.6)';
-                sctx.fillRect(px, py, cellPx, cellPx);
+                ctx.fillRect(px, py, cellPx, cellPx);
             }
         }
     }
-
-    sctx.globalCompositeOperation = 'source-over';
-
-    // Composite the shroud mask onto the main canvas
-    ctx.drawImage(_shroudCanvas, 0, 0);
 }
 
 // ── Minimap (drawn in sidebar canvas) ──
