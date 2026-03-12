@@ -26,7 +26,8 @@ pub enum ActorKind {
 #[derive(Debug, Clone)]
 pub enum Activity {
     /// Turn toward a target facing at the given speed (WAngle units/tick).
-    Turn { target: i32, speed: i32 },
+    /// Optional `then` activity to execute after turn completes.
+    Turn { target: i32, speed: i32, then: Option<Box<Activity>> },
     /// Move along a path of cells at a given speed (world units/tick).
     Move {
         path: Vec<(i32, i32)>,
@@ -100,6 +101,17 @@ pub struct Actor {
     pub kills: u16,
     /// Veterancy rank: 0=none, 1=veteran, 2=elite, 3=heroic (not synced).
     pub rank: u8,
+}
+
+impl Activity {
+    /// Get a cell from a Move path at the given index. Returns None for non-Move activities.
+    pub fn path_cell(&self, index: usize) -> Option<(i32, i32)> {
+        if let Activity::Move { path, .. } = self {
+            path.get(index).copied()
+        } else {
+            None
+        }
+    }
 }
 
 impl Actor {
