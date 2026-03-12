@@ -2,9 +2,8 @@
 //!
 //! Decodes SHP files from the Tiberian Dawn / Red Alert engine format.
 //! Each SHP file contains multiple frames of 8-bit indexed pixel data.
-//! Global width/height apply to all frames.
 //!
-//! Reference: OpenRA.Mods.Common/SpriteLoaders/ShpTDLoader.cs
+//! Reference: OpenRA.Mods.Cnc/SpriteLoaders/ShpTDLoader.cs
 
 /// A single sprite frame.
 #[derive(Debug, Clone)]
@@ -23,218 +22,380 @@ pub struct ShpFile {
     pub frames: Vec<SpriteFrame>,
 }
 
+/// Format flag for each frame in the offset table.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Format {
+    XorPrev = 0x20,
+    XorLcw = 0x40,
+    Lcw = 0x80,
+}
+
+impl Format {
+    fn from_byte(b: u8) -> Option<Self> {
+        match b {
+            0x20 => Some(Format::XorPrev),
+            0x40 => Some(Format::XorLcw),
+            0x80 => Some(Format::Lcw),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FrameHeader {
+    file_offset: u32,
+    format: u8,
+    ref_offset: u16,
+    ref_format: u16,
+}
+
 /// Decode an SHP TD format file from raw bytes.
 ///
-/// File layout:
-/// - Header: u16 num_images, u16 x, u16 y, u16 width, u16 height (10 bytes)
-/// - Offset table: (num_images + 2) entries, each 8 bytes
-///   - 3 bytes offset (LE) + 1 byte format + 3 bytes ref_offset + 1 byte ref_format
-/// - Frame data: Format80 (LCW) compressed pixel data at each offset
+/// File layout (from OpenRA ShpTDLoader.cs):
+/// - Header: u16 imageCount, u16 x, u16 y, u16 width, u16 height, u32 unknown (14 bytes)
+/// - imageCount frame entries, each 8 bytes:
+///   u32 (low 24 bits = offset, high 8 bits = format), u16 ref_offset, u16 ref_format
+/// - 2 extra entries (eof marker + zeros) = 16 bytes
+/// - Compressed frame data
 pub fn decode(data: &[u8]) -> Result<ShpFile, String> {
     if data.len() < 14 {
         return Err("SHP file too small".into());
     }
 
-    // Header: 5 x u16
     let num_images = read_u16(data, 0) as usize;
     let _x = read_u16(data, 2);
     let _y = read_u16(data, 4);
     let width = read_u16(data, 6);
     let height = read_u16(data, 8);
+    // 4 unknown bytes at offset 10 (skip)
 
     if num_images == 0 {
         return Err("SHP file has zero frames".into());
     }
 
-    // Offset table starts at byte 10
-    let table_start = 10;
-    let entry_size = 8;
-    let table_end = table_start + (num_images + 2) * entry_size;
+    let pixel_count = width as usize * height as usize;
 
-    if data.len() < table_end {
+    // Entries start at byte 14
+    let entries_start = 14;
+    let entry_size = 8;
+    let entries_end = entries_start + num_images * entry_size;
+    // After entries: 2 extra entries (eof + zeros) = 16 bytes
+    let data_start = entries_end + 16;
+
+    if entries_end > data.len() {
         return Err("SHP file truncated in offset table".into());
     }
 
-    let mut offsets = Vec::with_capacity(num_images + 2);
-    for i in 0..(num_images + 2) {
-        let base = table_start + i * entry_size;
-        let offset = read_u24(data, base) as usize;
-        let format = data[base + 3];
-        let ref_offset = read_u24(data, base + 4) as usize;
-        let ref_format = data[base + 7];
-        offsets.push(FrameHeader {
-            offset,
+    // Parse frame headers
+    let mut headers: Vec<FrameHeader> = Vec::with_capacity(num_images);
+    for i in 0..num_images {
+        let base = entries_start + i * entry_size;
+        let dword = read_u32(data, base);
+        let file_offset = dword & 0xFFFFFF;
+        let format = (dword >> 24) as u8;
+        let ref_offset = read_u16(data, base + 4);
+        let ref_format = read_u16(data, base + 6);
+        headers.push(FrameHeader {
+            file_offset,
             format,
             ref_offset,
             ref_format,
         });
     }
 
-    let pixel_count = width as usize * height as usize;
-    let mut frames = Vec::with_capacity(num_images);
+    // The compressed data is everything from data_start onwards.
+    // FileOffset values are absolute from stream start.
+    // shpBytesFileOffset = data_start
+    let shp_bytes_offset = data_start;
 
+    // Build a map from file_offset to header index for XORLCW resolution
+    let mut offset_to_idx: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for (i, h) in headers.iter().enumerate() {
+        offset_to_idx.entry(h.file_offset).or_insert(i);
+    }
+
+    // Resolve reference images for XOR formats
+    let mut ref_images: Vec<Option<usize>> = vec![None; num_images];
     for i in 0..num_images {
-        let hdr = &offsets[i];
+        let fmt = headers[i].format;
+        if fmt == Format::XorPrev as u8 {
+            if i > 0 {
+                ref_images[i] = Some(i - 1);
+            }
+        } else if fmt == Format::XorLcw as u8 {
+            if let Some(&idx) = offset_to_idx.get(&(headers[i].ref_offset as u32)) {
+                ref_images[i] = Some(idx);
+            }
+        }
+    }
 
-        if pixel_count == 0 {
-            frames.push(SpriteFrame {
-                width,
-                height,
-                pixels: Vec::new(),
-            });
-            continue;
+    // Decompress all frames
+    let mut frame_data: Vec<Option<Vec<u8>>> = vec![None; num_images];
+
+    fn decompress_frame(
+        idx: usize,
+        headers: &[FrameHeader],
+        ref_images: &[Option<usize>],
+        frame_data: &mut Vec<Option<Vec<u8>>>,
+        data: &[u8],
+        shp_bytes_offset: usize,
+        pixel_count: usize,
+        depth: usize,
+    ) {
+        if depth > headers.len() || frame_data[idx].is_some() || pixel_count == 0 {
+            return;
         }
 
-        if hdr.offset >= data.len() {
-            return Err(format!("Frame {} offset {} out of bounds (file size {})",
-                i, hdr.offset, data.len()));
-        }
-
-        // Compressed data starts directly at the offset (no per-frame header)
-        let compressed_data = &data[hdr.offset..];
-
-        let pixels = if hdr.format & 0x80 != 0 {
-            // Format80 (LCW)
-            decode_format80(compressed_data, pixel_count)?
-        } else if hdr.format & 0x40 != 0 {
-            // XOR with base reference frame
-            let base_pixels = decode_format80(compressed_data, pixel_count)?;
-            let ref_data = &data[hdr.ref_offset..];
-            let ref_pixels = decode_format80(ref_data, pixel_count)?;
-            xor_buffers(&ref_pixels, &base_pixels)
-        } else if hdr.format & 0x20 != 0 && i > 0 {
-            // XOR with previous frame
-            let base_pixels = decode_format80(compressed_data, pixel_count)?;
-            let prev = &frames[i - 1].pixels;
-            xor_buffers(prev, &base_pixels)
+        let h = &headers[idx];
+        let src_offset = if h.file_offset as usize >= shp_bytes_offset {
+            h.file_offset as usize - shp_bytes_offset
         } else {
-            // Default: Format80
-            decode_format80(compressed_data, pixel_count)?
+            // FileOffset is absolute from file start, but data array starts at shp_bytes_offset
+            // If offset < shp_bytes_offset, the data is in the header area
+            h.file_offset as usize
         };
 
-        frames.push(SpriteFrame {
+        let fmt = h.format;
+
+        if fmt == Format::Lcw as u8 {
+            // Direct LCW decompression
+            let mut dest = vec![0u8; pixel_count];
+            if shp_bytes_offset + src_offset <= data.len() {
+                lcw_decode_into(&data[shp_bytes_offset..], &mut dest, src_offset);
+            }
+            frame_data[idx] = Some(dest);
+        } else if fmt == Format::XorPrev as u8 || fmt == Format::XorLcw as u8 {
+            // XOR delta - need reference frame first
+            if let Some(ref_idx) = ref_images[idx] {
+                if frame_data[ref_idx].is_none() {
+                    decompress_frame(
+                        ref_idx, headers, ref_images, frame_data, data,
+                        shp_bytes_offset, pixel_count, depth + 1,
+                    );
+                }
+                // Copy reference data and XOR delta into it
+                let mut dest = frame_data[ref_idx]
+                    .as_ref()
+                    .map(|d| d.clone())
+                    .unwrap_or_else(|| vec![0u8; pixel_count]);
+                if shp_bytes_offset + src_offset <= data.len() {
+                    xor_delta_decode_into(&data[shp_bytes_offset..], &mut dest, src_offset);
+                }
+                frame_data[idx] = Some(dest);
+            } else {
+                // No reference found, produce empty frame
+                frame_data[idx] = Some(vec![0u8; pixel_count]);
+            }
+        } else {
+            // Unknown format, try LCW as fallback
+            let mut dest = vec![0u8; pixel_count];
+            if shp_bytes_offset + src_offset <= data.len() {
+                lcw_decode_into(&data[shp_bytes_offset..], &mut dest, src_offset);
+            }
+            frame_data[idx] = Some(dest);
+        }
+    }
+
+    for i in 0..num_images {
+        decompress_frame(
+            i, &headers, &ref_images, &mut frame_data, data,
+            shp_bytes_offset, pixel_count, 0,
+        );
+    }
+
+    let frames: Vec<SpriteFrame> = frame_data
+        .into_iter()
+        .map(|d| SpriteFrame {
             width,
             height,
-            pixels,
-        });
-    }
+            pixels: d.unwrap_or_else(|| vec![0u8; pixel_count]),
+        })
+        .collect();
 
     Ok(ShpFile { width, height, frames })
 }
 
-#[derive(Debug)]
-struct FrameHeader {
-    offset: usize,
-    format: u8,
-    ref_offset: usize,
-    #[allow(dead_code)]
-    ref_format: u8,
+/// LCW (Format80) decompression — exact port of OpenRA's LCWCompression.DecodeInto.
+///
+/// Reference: OpenRA.Mods.Cnc/FileFormats/LCWCompression.cs
+fn lcw_decode_into(src: &[u8], dest: &mut [u8], src_offset: usize) {
+    let mut si = src_offset;
+    let mut di = 0;
+    let src_len = src.len();
+    let dest_len = dest.len();
+
+    while si < src_len && di < dest_len {
+        let i = src[si];
+        si += 1;
+
+        if (i & 0x80) == 0 {
+            // Case 2: Relative back-reference copy
+            if si >= src_len { break; }
+            let second_byte = src[si];
+            si += 1;
+            let count = (((i & 0x70) >> 4) + 3) as usize;
+            let rpos = (((i & 0x0F) as usize) << 8) + second_byte as usize;
+
+            if di + count > dest_len { break; }
+
+            let src_start = if di >= rpos { di - rpos } else { break };
+            replicate_previous(dest, di, src_start, count);
+            di += count;
+        } else if (i & 0x40) == 0 {
+            // Case 1: Literal copy from source stream
+            let count = (i & 0x3F) as usize;
+            if count == 0 {
+                // End marker
+                return;
+            }
+            if si + count > src_len || di + count > dest_len { break; }
+            dest[di..di + count].copy_from_slice(&src[si..si + count]);
+            si += count;
+            di += count;
+        } else {
+            // High two bits set (11xxxxxx)
+            let count3 = (i & 0x3F) as usize;
+            if count3 == 0x3E {
+                // Case 4: Fill with repeated byte
+                if si + 3 > src_len { break; }
+                let count = read_u16(src, si) as usize;
+                si += 2;
+                let color = src[si];
+                si += 1;
+                let end = (di + count).min(dest_len);
+                while di < end {
+                    dest[di] = color;
+                    di += 1;
+                }
+            } else {
+                // Case 3 or Case 5: Absolute back-reference copy
+                let count = if count3 == 0x3F {
+                    // Case 5: Large count
+                    if si + 2 > src_len { break; }
+                    let c = read_u16(src, si) as usize;
+                    si += 2;
+                    c
+                } else {
+                    // Case 3: Small count
+                    count3 + 3
+                };
+
+                if si + 2 > src_len { break; }
+                let src_index = read_u16(src, si) as usize;
+                si += 2;
+
+                if src_index >= di || di + count > dest_len { break; }
+                for j in 0..count {
+                    dest[di + j] = dest[src_index + j];
+                }
+                di += count;
+            }
+        }
+    }
 }
 
-/// Decode Format80 (LCW) compressed data.
+/// Copy bytes from earlier in dest buffer (handles overlapping).
+fn replicate_previous(dest: &mut [u8], dest_index: usize, src_index: usize, count: usize) {
+    for i in 0..count {
+        if dest_index - src_index == 1 {
+            dest[dest_index + i] = dest[dest_index - 1];
+        } else {
+            dest[dest_index + i] = dest[src_index + i];
+        }
+    }
+}
+
+/// XOR Delta (Format40) decompression — exact port of OpenRA's XORDeltaCompression.DecodeInto.
 ///
-/// Command byte encoding:
-/// - 0x80: end of data
-/// - 0xFF nn nn pp pp: copy nn bytes from absolute dest position pp
-/// - 0xFE nn nn vv: fill nn bytes with value vv
-/// - 11cccccc pp pp: copy (c+3) bytes from absolute dest position pp
-/// - 10cccccc dd: copy (c+3) bytes from relative position (current - dd)
-///   Note: the 10xxxxxx form is NOT present in standard Format80.
-///   Actually in Westwood's Format80, 10cccccc is just a shorter form:
-///   copy (c+3) from relative offset stored in next byte as: (dest_pos - byte)
-/// - 0ccccccc: copy c bytes directly from source stream
-fn decode_format80(src: &[u8], max_output: usize) -> Result<Vec<u8>, String> {
-    let mut dest = Vec::with_capacity(max_output);
-    let mut i = 0;
+/// Reference: OpenRA.Mods.Cnc/FileFormats/XORDeltaCompression.cs
+fn xor_delta_decode_into(src: &[u8], dest: &mut [u8], src_offset: usize) {
+    let mut si = src_offset;
+    let mut di = 0;
+    let src_len = src.len();
+    let dest_len = dest.len();
 
-    while i < src.len() && dest.len() < max_output {
-        let cmd = src[i];
-        i += 1;
+    while si < src_len && di < dest_len {
+        let i = src[si];
+        si += 1;
 
-        if cmd == 0x80 {
-            break;
-        } else if cmd == 0xFF {
-            // Long copy from absolute dest position: 0xFF count_lo count_hi pos_lo pos_hi
-            if i + 4 > src.len() { break; }
-            let count = read_u16(src, i) as usize;
-            let pos = read_u16(src, i + 2) as usize;
-            i += 4;
-            copy_from_dest(&mut dest, pos, count, max_output);
-        } else if cmd == 0xFE {
-            // Long fill: 0xFE count_lo count_hi value
-            if i + 3 > src.len() { break; }
-            let count = read_u16(src, i) as usize;
-            let value = src[i + 2];
-            i += 3;
-            let actual = count.min(max_output - dest.len());
-            dest.extend(std::iter::repeat(value).take(actual));
-        } else if cmd & 0x80 != 0 {
-            if cmd & 0x40 != 0 {
-                // 11cccccc pos_lo pos_hi: copy (c+3) from absolute dest position
-                let count = ((cmd & 0x3F) as usize) + 3;
-                if i + 2 > src.len() { break; }
-                let pos = read_u16(src, i) as usize;
-                i += 2;
-                copy_from_dest(&mut dest, pos, count, max_output);
+        if (i & 0x80) == 0 {
+            let count = (i & 0x7F) as usize;
+            if count == 0 {
+                // Case 6: XOR repeated value
+                if si + 2 > src_len { break; }
+                let count = src[si] as usize;
+                si += 1;
+                let value = src[si];
+                si += 1;
+                let end = (di + count).min(dest_len);
+                while di < end {
+                    dest[di] ^= value;
+                    di += 1;
+                }
             } else {
-                // 10cccccc dd: copy (c+3) from relative dest position (current - dd)
-                // Note: count field is (cmd & 0x3F), actual count = field + 3
-                // But if field is 0 and next byte gives more info... no, just (c+3)
-                let count = ((cmd & 0x3F) as usize) + 3;
-                if i >= src.len() { break; }
-                let offset_byte = src[i] as usize;
-                i += 1;
-                let pos = if dest.len() >= offset_byte {
-                    dest.len() - offset_byte
-                } else {
-                    0
-                };
-                copy_from_dest(&mut dest, pos, count, max_output);
+                // Case 5: XOR variable bytes
+                let end = (di + count).min(dest_len);
+                while di < end {
+                    if si >= src_len { break; }
+                    dest[di] ^= src[si];
+                    si += 1;
+                    di += 1;
+                }
             }
         } else {
-            // 0ccccccc: copy c bytes from source
-            let count = cmd as usize;
-            if count == 0 { break; }
-            let actual = count.min(src.len() - i).min(max_output - dest.len());
-            dest.extend_from_slice(&src[i..i + actual]);
-            i += actual;
+            let count = (i & 0x7F) as usize;
+            if count == 0 {
+                if si + 2 > src_len { break; }
+                let word = read_u16(src, si) as usize;
+                si += 2;
+                if word == 0 {
+                    // End marker
+                    return;
+                }
+                if (word & 0x8000) == 0 {
+                    // Case 2: Skip pixels
+                    di += word & 0x7FFF;
+                } else if (word & 0x4000) == 0 {
+                    // Case 3: XOR variable bytes (large)
+                    let n = word & 0x3FFF;
+                    let end = (di + n).min(dest_len);
+                    while di < end {
+                        if si >= src_len { break; }
+                        dest[di] ^= src[si];
+                        si += 1;
+                        di += 1;
+                    }
+                } else {
+                    // Case 4: XOR repeated value (large)
+                    let n = word & 0x3FFF;
+                    if si >= src_len { break; }
+                    let value = src[si];
+                    si += 1;
+                    let end = (di + n).min(dest_len);
+                    while di < end {
+                        dest[di] ^= value;
+                        di += 1;
+                    }
+                }
+            } else {
+                // Case 1: Skip pixels
+                di += count;
+            }
         }
     }
-
-    // Pad to expected size
-    dest.resize(max_output, 0);
-    Ok(dest)
-}
-
-/// Copy `count` bytes from dest[pos..] back into dest, byte-by-byte to handle overlapping.
-fn copy_from_dest(dest: &mut Vec<u8>, pos: usize, count: usize, max_output: usize) {
-    for j in 0..count {
-        if dest.len() >= max_output { break; }
-        let src_idx = pos + j;
-        if src_idx < dest.len() {
-            dest.push(dest[src_idx]);
-        } else {
-            dest.push(0);
-        }
-    }
-}
-
-/// XOR two buffers together.
-fn xor_buffers(base: &[u8], overlay: &[u8]) -> Vec<u8> {
-    base.iter()
-        .zip(overlay.iter())
-        .map(|(a, b)| a ^ b)
-        .collect()
 }
 
 fn read_u16(data: &[u8], offset: usize) -> u16 {
     u16::from_le_bytes([data[offset], data[offset + 1]])
 }
 
-fn read_u24(data: &[u8], offset: usize) -> u32 {
-    data[offset] as u32
-        | ((data[offset + 1] as u32) << 8)
-        | ((data[offset + 2] as u32) << 16)
+fn read_u32(data: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ])
 }
 
 #[cfg(test)]
@@ -242,32 +403,84 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_helpers() {
-        let data = [0x34, 0x12, 0xAB];
-        assert_eq!(read_u16(&data, 0), 0x1234);
-        assert_eq!(read_u24(&data, 0), 0xAB1234);
+    fn lcw_literal_copy() {
+        // Case 1: 0x83 = 10_000011 = copy 3 bytes from source
+        // Then 0x80 = 10_000000 = count 0 = end
+        let src = [0x83, 0xAA, 0xBB, 0xCC, 0x80];
+        let mut dest = vec![0u8; 3];
+        lcw_decode_into(&src, &mut dest, 0);
+        assert_eq!(dest, vec![0xAA, 0xBB, 0xCC]);
     }
 
     #[test]
-    fn decode_empty_shp() {
-        let data = [0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        let result = decode(&data);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn format80_direct_copy() {
-        // 0x03 = copy 3 bytes from source, then 0x80 = end
-        let src = [0x03, 0xAA, 0xBB, 0xCC, 0x80];
-        let result = decode_format80(&src, 3).unwrap();
-        assert_eq!(result, vec![0xAA, 0xBB, 0xCC]);
-    }
-
-    #[test]
-    fn format80_fill() {
-        // 0xFE, count=4, value=0x42
+    fn lcw_fill() {
+        // Case 4: 0xFE = 11_111110, count=4, value=0x42
         let src = [0xFE, 0x04, 0x00, 0x42, 0x80];
-        let result = decode_format80(&src, 4).unwrap();
-        assert_eq!(result, vec![0x42, 0x42, 0x42, 0x42]);
+        let mut dest = vec![0u8; 4];
+        lcw_decode_into(&src, &mut dest, 0);
+        assert_eq!(dest, vec![0x42, 0x42, 0x42, 0x42]);
+    }
+
+    #[test]
+    fn decode_real_shp_from_mix() {
+        let conquer_path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../vendor/ra-content/conquer.mix"
+        );
+        if let Ok(mix_data) = std::fs::read(conquer_path) {
+            let conquer = crate::mix::MixArchive::parse(mix_data).unwrap();
+
+            // Test 1tnk.shp
+            if let Some(shp_data) = conquer.get("1tnk.shp") {
+                let shp = decode(shp_data).unwrap();
+                assert_eq!(shp.width, 24);
+                assert_eq!(shp.height, 24);
+                assert_eq!(shp.frames.len(), 64);
+
+                // Check that frames have actual pixel data
+                let f0_nonzero: usize = shp.frames[0].pixels.iter()
+                    .filter(|&&p| p != 0).count();
+                println!("1tnk frame 0: {}/{} non-transparent", f0_nonzero, shp.frames[0].pixels.len());
+                assert!(f0_nonzero > 50, "1tnk frame 0 should have significant pixel data, got {}", f0_nonzero);
+            }
+
+            // Test fact.shp
+            if let Some(shp_data) = conquer.get("fact.shp") {
+                let shp = decode(shp_data).unwrap();
+                assert_eq!(shp.width, 72);
+                assert_eq!(shp.height, 72);
+                let f0_nonzero: usize = shp.frames[0].pixels.iter()
+                    .filter(|&&p| p != 0).count();
+                println!("fact frame 0: {}/{} non-transparent", f0_nonzero, shp.frames[0].pixels.len());
+                assert!(f0_nonzero > 500, "fact frame 0 should have lots of pixel data, got {}", f0_nonzero);
+            }
+
+            // Test mcv.shp
+            if let Some(shp_data) = conquer.get("mcv.shp") {
+                let shp = decode(shp_data).unwrap();
+                let f0_nonzero: usize = shp.frames[0].pixels.iter()
+                    .filter(|&&p| p != 0).count();
+                println!("mcv frame 0: {}/{} non-transparent", f0_nonzero, shp.frames[0].pixels.len());
+                assert!(f0_nonzero > 200, "mcv frame 0 should have significant pixel data, got {}", f0_nonzero);
+            }
+        }
+    }
+
+    #[test]
+    fn decode_bits_shp() {
+        // Test with known-working SHP from bits/
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../vendor/OpenRA/mods/ra/bits/fact.shp"
+        );
+        if let Ok(data) = std::fs::read(path) {
+            let shp = decode(&data).unwrap();
+            assert_eq!(shp.width, 72);
+            assert_eq!(shp.height, 72);
+            let f0_nonzero: usize = shp.frames[0].pixels.iter()
+                .filter(|&&p| p != 0).count();
+            println!("bits/fact.shp frame 0: {}/{} non-transparent", f0_nonzero, shp.frames[0].pixels.len());
+            assert!(f0_nonzero > 500, "bits/fact.shp should decode properly");
+        }
     }
 }

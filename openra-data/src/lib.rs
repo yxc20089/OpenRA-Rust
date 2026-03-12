@@ -6,8 +6,10 @@
 //! - Palette files (color lookup tables)
 
 pub mod miniyaml;
+pub mod mix;
 pub mod oramap;
 pub mod orarep;
 pub mod palette;
 pub mod rules;
 pub mod shp;
+pub mod tmp;

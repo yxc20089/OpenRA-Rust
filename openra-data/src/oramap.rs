@@ -251,29 +251,43 @@ pub fn parse_map_yaml(yaml: &str) -> io::Result<OraMap> {
 
 /// Parse terrain tiles from map.bin binary data.
 ///
-/// Format: sequence of (u16 type_id, u8 index) packed per cell,
-/// row-major order, dimensions from map_size.
+/// Format v1: tiles start at offset 5, 3 bytes per cell (u16 type + u8 index), column-major
+/// Format v2: header with offsets, tiles at TilesOffset, 3 bytes per cell, column-major
 ///
-/// Reference: OpenRA.Game/Map/Map.cs PostInit(), CellLayer<TerrainTile>
+/// Reference: OpenRA.Game/Map/Map.cs BinaryDataHeader + PostInit()
 fn parse_map_bin(data: &[u8], width: i32, height: i32) -> Vec<Vec<TileReference>> {
     let w = width as usize;
     let h = height as usize;
     let mut tiles = vec![vec![TileReference::default(); w]; h];
 
-    // Each tile is 3 bytes: u16 LE type_id + u8 index
-    let bytes_per_tile = 3;
-    let expected_size = w * h * bytes_per_tile;
-
-    if data.len() < expected_size {
+    if data.len() < 5 {
         return tiles;
     }
 
-    for row in 0..h {
-        for col in 0..w {
-            let offset = (row * w + col) * bytes_per_tile;
+    let format = data[0];
+    let tiles_offset = if format == 1 {
+        5usize
+    } else if format == 2 && data.len() >= 17 {
+        u32::from_le_bytes([data[5], data[6], data[7], data[8]]) as usize
+    } else {
+        return tiles;
+    };
+
+    // Each tile is 3 bytes: u16 LE type_id + u8 index
+    // Stored column-major: for x in 0..w { for y in 0..h { ... } }
+    let bytes_per_tile = 3;
+    let needed = tiles_offset + w * h * bytes_per_tile;
+    if data.len() < needed {
+        return tiles;
+    }
+
+    let mut offset = tiles_offset;
+    for col in 0..w {
+        for row in 0..h {
             let type_id = u16::from_le_bytes([data[offset], data[offset + 1]]);
             let index = data[offset + 2];
             tiles[row][col] = TileReference { type_id, index };
+            offset += bytes_per_tile;
         }
     }
 

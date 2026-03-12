@@ -150,6 +150,7 @@ pub struct ActorSnapshot {
     pub hp: i32,
     pub max_hp: i32,
     pub activity: String,
+    pub facing: i32,
 }
 
 #[derive(Debug, Serialize)]
@@ -330,9 +331,12 @@ impl World {
                 Some(Activity::Attack { .. }) => "attacking",
                 Some(Activity::Harvest { .. }) => "harvesting",
             }.to_string();
+            let facing = actor.traits.iter().find_map(|t| {
+                if let TraitState::Mobile { facing, .. } = t { Some(*facing) } else { None }
+            }).unwrap_or(0);
             actors.push(ActorSnapshot {
                 id: actor.id, kind: actor.kind, owner, x, y,
-                actor_type: actor_type_str, hp, max_hp, activity,
+                actor_type: actor_type_str, hp, max_hp, activity, facing,
             });
         }
         let players = self.player_actor_ids.iter().map(|&pid| {
