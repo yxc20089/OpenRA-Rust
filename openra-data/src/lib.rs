@@ -5,6 +5,7 @@
 //! - SHP/TMP sprite files (unit/building graphics)
 //! - Palette files (color lookup tables)
 
+pub mod aud;
 pub mod miniyaml;
 pub mod mix;
 pub mod oramap;

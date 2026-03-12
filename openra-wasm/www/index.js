@@ -1,4 +1,4 @@
-import init, { ReplayViewer, GameSession, SpriteAtlas, available_maps } from './pkg/openra_wasm.js';
+import init, { ReplayViewer, GameSession, SpriteAtlas, SoundAtlas, available_maps } from './pkg/openra_wasm.js';
 
 // ── DOM refs ──
 const homeEl = document.getElementById('home');
@@ -60,6 +60,81 @@ let commandMode = null;                  // null | 'attack-move' | 'move' | 'gua
 let gamePaused = false;
 let sellAnims = {};                      // { actorId: { sprite, x, y, frame, totalFrames, startTick } }
 let prevActorHP = {};                    // Track HP for sell detection
+let soundAtlas = null;                   // SoundAtlas WASM instance
+
+// ── Audio Manager ──
+class AudioManager {
+    constructor() {
+        this.ctx = null;      // AudioContext (lazy init on user click)
+        this.cache = {};      // name → AudioBuffer
+        this.enabled = true;
+        this.sfxVolume = 0.5;
+        this.voiceVolume = 0.7;
+    }
+    init() {
+        if (this.ctx) return;
+        try {
+            this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+        } catch (e) { console.warn('Web Audio not available:', e); }
+    }
+    async decodeSound(name) {
+        if (this.cache[name]) return this.cache[name];
+        if (!soundAtlas) return null;
+        const json = soundAtlas.get_sound(name);
+        if (!json) return null;
+        try {
+            const info = JSON.parse(json);
+            if (!info.pcm_base64) return null;
+            const raw = atob(info.pcm_base64);
+            const pcm16 = new Int16Array(raw.length / 2);
+            for (let i = 0; i < pcm16.length; i++) {
+                pcm16[i] = raw.charCodeAt(i * 2) | (raw.charCodeAt(i * 2 + 1) << 8);
+            }
+            // Convert i16 PCM to float32 for Web Audio
+            const float32 = new Float32Array(pcm16.length);
+            for (let i = 0; i < pcm16.length; i++) {
+                float32[i] = pcm16[i] / 32768;
+            }
+            const buf = this.ctx.createBuffer(info.channels, float32.length / info.channels, info.sample_rate);
+            buf.getChannelData(0).set(float32.subarray(0, float32.length / info.channels));
+            if (info.channels > 1) {
+                buf.getChannelData(1).set(float32.subarray(float32.length / info.channels));
+            }
+            this.cache[name] = buf;
+            return buf;
+        } catch (e) { return null; }
+    }
+    async play(name, volume) {
+        if (!this.ctx || !this.enabled) return;
+        const buf = await this.decodeSound(name);
+        if (!buf) return;
+        const source = this.ctx.createBufferSource();
+        source.buffer = buf;
+        const gain = this.ctx.createGain();
+        gain.gain.value = volume || this.sfxVolume;
+        source.connect(gain);
+        gain.connect(this.ctx.destination);
+        source.start();
+    }
+    playSfx(name) { this.play(name, this.sfxVolume); }
+    playVoice(name) { this.play(name, this.voiceVolume); }
+}
+const audioManager = new AudioManager();
+
+// Sound mappings
+const WEAPON_SOUNDS = {
+    '1tnk': 'tnkfire3', '2tnk': 'tnkfire3', '3tnk': 'tnkfire3', '4tnk': 'tnkfire3',
+    'arty': 'cannon1', 'v2rl': 'rocket1', 'jeep': 'gun11', 'apc': 'gun11',
+    'gun': 'cannon2', 'agun': 'gun13', 'sam': 'rocket2', 'tsla': 'tesla1',
+    'e1': 'gun5', 'e3': 'rocket1', 'e4': 'flamer2',
+    'heli': 'gun11', 'hind': 'gun11', 'mig': 'bomb1', 'yak': 'gun11',
+};
+const DEATH_SOUNDS = {
+    'Building': 'crumble', 'Vehicle': 'xplos', 'Infantry': 'nuyell1',
+    'Aircraft': 'xplos', 'Ship': 'xplos',
+};
+const ACKNOWLEDGE_VOICES = ['roger', 'affirm1', 'yeah1', 'yessir1'];
+const MOVE_VOICES = ['movout1', 'ritaway', 'ugotit'];
 
 // Construction animation sprite mapping
 const BUILD_ANIM_SPRITES = {
@@ -607,17 +682,22 @@ canvas.addEventListener('contextmenu', e => {
     const target = actorAtCell(cell.x, cell.y, lastSnapshot);
 
     // Command mode dispatch
+    const playMoveVoice = () => {
+        const v = MOVE_VOICES[Math.floor(Math.random() * MOVE_VOICES.length)];
+        audioManager.playVoice(v);
+    };
     if (commandMode === 'attack-move') {
         for (const uid of selectedUnits) session.order_attack_move(uid, cell.x, cell.y);
-        commandMode = null; showMsg('');
+        commandMode = null; showMsg(''); playMoveVoice();
     } else if (commandMode === 'move') {
         for (const uid of selectedUnits) session.order_move(uid, cell.x, cell.y);
-        commandMode = null; showMsg('');
+        commandMode = null; showMsg(''); playMoveVoice();
     } else if (commandMode === 'guard' && target && target.owner === humanPlayerId) {
         for (const uid of selectedUnits) session.order_move(uid, target.x, target.y);
-        commandMode = null; showMsg('');
+        commandMode = null; showMsg(''); playMoveVoice();
     } else if (target && target.owner !== humanPlayerId && target.owner > 2) {
         for (const uid of selectedUnits) session.order_attack(uid, target.id);
+        audioManager.playVoice('affirm1');
     } else {
         // Check if selected unit is a production building → set rally point
         const PROD_BUILDINGS = new Set(['weap', 'weap.ukraine', 'tent', 'barr', 'hpad', 'afld', 'spen', 'syrd']);
@@ -645,6 +725,11 @@ function handleGameClick(cell, shiftKey) {
     if (actor && actor.owner === humanPlayerId) {
         if (shiftKey) { if (!selectedUnits.includes(actor.id)) selectedUnits.push(actor.id); }
         else selectedUnits = [actor.id];
+        // Acknowledge voice on selection
+        if (actor.kind === 'Infantry' || actor.kind === 'Vehicle') {
+            const v = ACKNOWLEDGE_VOICES[Math.floor(Math.random() * ACKNOWLEDGE_VOICES.length)];
+            audioManager.playVoice(v);
+        }
     } else if (actor && actor.owner !== humanPlayerId && actor.owner > 2 && selectedUnits.length > 0) {
         for (const uid of selectedUnits) session.order_attack(uid, actor.id);
     } else { if (!shiftKey) selectedUnits = []; }
@@ -1057,6 +1142,10 @@ function updateAnimations(snapshot) {
     for (const [id, anim] of Object.entries(buildAnims)) {
         const elapsed = currentTick - anim.startTick;
         if (elapsed >= anim.totalFrames) {
+            // "Construction complete" voice when own building finishes
+            if (anim.owner === humanPlayerId) {
+                audioManager.playVoice('conscmp1');
+            }
             delete buildAnims[id];
         }
     }
@@ -1082,6 +1171,9 @@ function spawnDeathEffect(actor) {
         maxFrames: info.frames,
         startTick: currentTick,
     });
+    // Play death sound
+    const snd = DEATH_SOUNDS[actor.kind];
+    if (snd) audioManager.playSfx(snd);
 }
 
 function drawEffects() {
@@ -1802,5 +1894,12 @@ try {
         mapSelect.appendChild(opt);
     });
 } catch (e) { console.warn('Failed to load map list:', e); }
+
+// Load sound atlas (non-blocking)
+try { soundAtlas = new SoundAtlas(); console.log('Sound atlas loaded'); }
+catch (e) { console.warn('Failed to load sound atlas:', e); }
+
+// Init audio on first user interaction
+document.addEventListener('click', () => { audioManager.init(); }, { once: true });
 
 showScreen('home');

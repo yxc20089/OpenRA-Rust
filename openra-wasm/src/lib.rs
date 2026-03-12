@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 
-use openra_data::{mix, oramap, orarep, palette, shp, tmp};
+use openra_data::{aud, mix, oramap, orarep, palette, shp, tmp};
 use openra_sim::world::{self, GameOrder, LobbyInfo, SlotInfo};
 
 /// Bundled maps for quick-start games (all temperat tileset).
@@ -25,6 +25,10 @@ const BUNDLED_MAPS: &[(&str, &[u8])] = &[
 const BUNDLED_PALETTE: &[u8] = include_bytes!("../../vendor/OpenRA/mods/ra/maps/chernobyl/temperat.pal");
 /// Bundled temperat.mix for terrain tiles.
 const TEMPERAT_MIX: &[u8] = include_bytes!("../../vendor/ra-content/temperat.mix");
+/// Bundled sounds.mix for sound effects.
+const SOUNDS_MIX: &[u8] = include_bytes!("../../vendor/ra-content/sounds.mix");
+/// Bundled speech.mix for voice announcements.
+const SPEECH_MIX: &[u8] = include_bytes!("../../vendor/ra-content/speech.mix");
 /// Bundled tileset YAML for template→image mapping.
 const TEMPERAT_TILESET: &str = include_str!("../../vendor/OpenRA/mods/ra/tilesets/temperat.yaml");
 
@@ -873,4 +877,91 @@ impl SpriteAtlas {
         }
         serde_json::Value::Object(map).to_string()
     }
+}
+
+// ── Sound Atlas ─────────────────────────────────────────────────────────────
+
+#[wasm_bindgen]
+pub struct SoundAtlas {
+    sounds_mix: mix::MixArchive,
+    speech_mix: mix::MixArchive,
+}
+
+#[wasm_bindgen]
+impl SoundAtlas {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Result<SoundAtlas, JsValue> {
+        let sounds_mix = mix::MixArchive::parse(SOUNDS_MIX.to_vec())
+            .map_err(|e| JsValue::from_str(&format!("sounds.mix error: {}", e)))?;
+        let speech_mix = mix::MixArchive::parse(SPEECH_MIX.to_vec())
+            .map_err(|e| JsValue::from_str(&format!("speech.mix error: {}", e)))?;
+        Ok(SoundAtlas { sounds_mix, speech_mix })
+    }
+
+    /// Get a decoded sound as PCM 16-bit data.
+    /// Returns a JSON object: { "sample_rate": 22050, "channels": 1, "pcm_base64": "..." }
+    /// or empty string if not found.
+    pub fn get_sound(&self, name: &str) -> String {
+        let aud_name = if name.ends_with(".aud") {
+            name.to_string()
+        } else {
+            format!("{}.aud", name)
+        };
+
+        let aud_data = self.sounds_mix.get(&aud_name)
+            .or_else(|| self.speech_mix.get(&aud_name));
+
+        match aud_data {
+            Some(data) => {
+                match aud::decode(data) {
+                    Ok(sound) => {
+                        // Encode PCM data as base64 for transfer to JS
+                        let b64 = base64_encode(&sound.pcm_data);
+                        serde_json::json!({
+                            "sample_rate": sound.sample_rate,
+                            "channels": sound.channels,
+                            "pcm_base64": b64,
+                        }).to_string()
+                    }
+                    Err(_) => String::new(),
+                }
+            }
+            None => String::new(),
+        }
+    }
+
+    /// Check if a sound exists in either MIX archive.
+    pub fn has_sound(&self, name: &str) -> bool {
+        let aud_name = if name.ends_with(".aud") {
+            name.to_string()
+        } else {
+            format!("{}.aud", name)
+        };
+        self.sounds_mix.contains(&aud_name) || self.speech_mix.contains(&aud_name)
+    }
+}
+
+/// Simple base64 encoder (no dependency needed).
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        result.push(CHARS[(n >> 18) as usize & 0x3F] as char);
+        result.push(CHARS[(n >> 12) as usize & 0x3F] as char);
+        if chunk.len() > 1 {
+            result.push(CHARS[(n >> 6) as usize & 0x3F] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(CHARS[n as usize & 0x3F] as char);
+        } else {
+            result.push('=');
+        }
+    }
+    result
 }
