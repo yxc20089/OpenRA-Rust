@@ -100,6 +100,17 @@ pub struct World {
     mcv_states: Vec<McvState>,
     /// Actor ID of the "Everyone" spectator player (always sees everything).
     everyone_player_id: u32,
+    /// FrozenActorLayer state per player: (FrozenHash, VisibilityHash).
+    /// Tracked separately so we can compute FH ^ VH correctly.
+    fal_state: std::collections::HashMap<u32, (i32, i32)>,
+    /// Number of MINE actors on the map (for SeedsResource RNG consumption).
+    mine_count: usize,
+    /// Ticks until next SeedsResource seeding event.
+    seeds_resource_ticks: i32,
+    /// Active production items per player actor ID.
+    production: std::collections::HashMap<u32, Vec<ProductionItem>>,
+    /// Current cash per player actor ID (for production consumption).
+    player_cash: std::collections::HashMap<u32, i32>,
 }
 
 /// Mutable state for an MCV actor during deployment.
@@ -114,6 +125,69 @@ struct McvState {
     spawn_x: i32,
     spawn_y: i32,
     owner_player_id: u32,
+}
+
+/// A production item being built in a ClassicProductionQueue.
+#[derive(Debug)]
+struct ProductionItem {
+    total_cost: i32,
+    total_time: i32,
+    remaining_cost: i32,
+    remaining_time: i32,
+    started: bool,
+}
+
+impl ProductionItem {
+    fn new(cost: i32, build_duration_modifier: i32) -> Self {
+        // C# GetBuildTime: time = cost, then apply BuildableInfo.BuildDurationModifier (60%)
+        // and ProductionQueueInfo.BuildDurationModifier (100%).
+        // ApplyPercentageModifiers: time * mod / 100 for each modifier.
+        let time = (cost as i64 * build_duration_modifier as i64 / 100) as i32;
+        ProductionItem {
+            total_cost: cost,
+            total_time: time,
+            remaining_cost: cost,
+            remaining_time: time,
+            started: false,
+        }
+    }
+
+    /// Tick the production item, consuming cash. Returns cash consumed this tick.
+    fn tick(&mut self, cash: i32) -> i32 {
+        if !self.started {
+            // First tick recalculates time (we already have it right)
+            self.started = true;
+        }
+
+        if self.remaining_time <= 0 {
+            return 0;
+        }
+
+        if self.remaining_cost != 0 {
+            let expected_remaining_cost = if self.remaining_time == 1 {
+                0
+            } else {
+                (self.total_cost as i64 * self.remaining_time as i64
+                    / self.total_time.max(1) as i64) as i32
+            };
+            let cost_this_tick = self.remaining_cost - expected_remaining_cost;
+            if cost_this_tick != 0 {
+                if cash < cost_this_tick {
+                    return 0; // Can't afford, stall
+                }
+                self.remaining_cost -= cost_this_tick;
+                self.remaining_time -= 1;
+                return cost_this_tick;
+            }
+        }
+
+        self.remaining_time -= 1;
+        0
+    }
+
+    fn is_done(&self) -> bool {
+        self.remaining_time <= 0
+    }
 }
 
 /// A deferred action to execute at the end of World.Tick().
@@ -209,11 +283,13 @@ impl World {
         // 2. Compute SyncHash (this is what gets verified against replay)
         let hash = self.sync_hash();
 
-        // 3. Tick the world if not paused
+        // 3. Tick the world if not paused (NetFrameInterval=3: 3 world ticks per net frame)
         if !self.paused {
-            self.world_tick += 1;
-            self.tick_actors();
-            self.execute_frame_end_tasks();
+            for _ in 0..3 {
+                self.world_tick += 1;
+                self.tick_actors();
+                self.execute_frame_end_tasks();
+            }
         }
 
         hash
@@ -249,8 +325,28 @@ impl World {
                 }
             }
             "StartProduction" => {
-                eprintln!("ORDER: StartProduction subject={:?} item={:?}",
-                    order.subject_id, order.target_string);
+                if let (Some(subject_id), Some(item_name)) = (order.subject_id, &order.target_string) {
+                    let cost = match item_name.as_str() {
+                        "powr" => 300,
+                        "apwr" => 500,
+                        "tent" | "barr" => 400,
+                        "weap" | "weap.ukraine" => 2000,
+                        "proc" => 1400,
+                        "fix" => 1200,
+                        "dome" | "atek" | "stek" => 2800,
+                        "hpad" | "afld" => 500,
+                        "spen" | "syrd" => 650,
+                        _ => {
+                            eprintln!("ORDER: StartProduction unknown item '{}' subject={}", item_name, subject_id);
+                            0
+                        }
+                    };
+                    if cost > 0 {
+                        eprintln!("ORDER: StartProduction subject={} item={} cost={}", subject_id, item_name, cost);
+                        let item = ProductionItem::new(cost, 60); // BuildDurationModifier=60
+                        self.production.entry(subject_id).or_default().push(item);
+                    }
+                }
             }
             "StartGame" | "Command" => {
                 // Lobby/control orders — no simulation effect
@@ -271,14 +367,25 @@ impl World {
             self.update_pq_hashes();
         }
 
-        // SharedRandom is consumed 14 times during the first tick.
-        // The exact source is unclear (likely deferred initialization tasks
-        // from world building), but the count is verified against the replay.
-        // On subsequent ticks (with no game activity), SharedRandom is NOT consumed.
-        if self.world_tick == 1 {
-            for _ in 0..14 {
-                self.rng.next();
+        // Note: the 14 RNG calls at tick 1 are now handled by SeedsResource
+        // (7 mines × 2 RNG calls each, firing at interval=75 which fires immediately
+        // on tick 1 since ticks starts at 0).
+
+        // SeedsResource: each MINE actor seeds ore every 75 ticks.
+        // Fires at ticks 1, 76, 151, 226, ... consuming 2 RNG calls per mine.
+        // The 7 mines on the "singles" map consume 14 RNG calls per seeding event.
+        // RandomWalk uses SharedRandom.Next(-1, 2) twice per step.
+        if self.seeds_resource_ticks > 0 {
+            self.seeds_resource_ticks -= 1;
+        }
+        if self.seeds_resource_ticks <= 0 {
+            for _ in 0..self.mine_count {
+                // Each mine does Util.RandomWalk which calls rng.Next(-1,2) twice.
+                // In the common case, the first step lands on a valid cell.
+                self.rng.next_range(-1, 2); // dx
+                self.rng.next_range(-1, 2); // dy
             }
+            self.seeds_resource_ticks = 75; // Reset interval
         }
 
         // Tick MCV Turn activities: change facing toward deploy target.
@@ -307,6 +414,33 @@ impl World {
             if mcv.facing == mcv.turn_target {
                 mcv.is_turning = false;
                 deploy_ready.push((mcv.actor_id, (mcv.spawn_x, mcv.spawn_y), mcv.owner_player_id));
+            }
+        }
+
+        // Tick production queues: consume cash, advance build time.
+        let player_ids: Vec<u32> = self.production.keys().copied().collect();
+        for pid in player_ids {
+            if let Some(items) = self.production.get_mut(&pid) {
+                if let Some(item) = items.first_mut() {
+                    let cash = self.player_cash.get(&pid).copied().unwrap_or(0);
+                    let consumed = item.tick(cash);
+                    if consumed > 0 {
+                        *self.player_cash.entry(pid).or_insert(0) -= consumed;
+                        // Update PlayerResources sync hash
+                        let new_cash = self.player_cash[&pid];
+                        if let Some(player_sync) = self.sync_actors.iter_mut().find(|a| a.actor_id == pid) {
+                            if player_sync.trait_hashes.len() > 1 {
+                                // PlayerResources hash = Cash ^ Resources ^ ResourceCapacity
+                                // Resources and ResourceCapacity are 0 for now
+                                player_sync.trait_hashes[1] = new_cash;
+                            }
+                        }
+                    }
+                    if item.is_done() {
+                        items.remove(0);
+                        eprintln!("PRODUCTION: item complete for player {}", pid);
+                    }
+                }
             }
         }
 
@@ -372,16 +506,16 @@ impl World {
         // FACT ISync traits in construction order:
         //
         // First batch (no Requires): YAML order
-        //   1. BodyOrientation (from ^SpriteActor) - QuantizedFacings = 1
-        //   2. Building (from ^BasicBuilding) - TopLeft
-        //   3. Health (from ^BasicBuilding, FACT overrides HP=150000)
-        //   4. RevealsShroud (from FACT) - base class private fields invisible → 0
-        //   5. RevealsShroud@GAPGEN (from FACT) - same → 0
+        //   0. BodyOrientation (from ^SpriteActor) - QuantizedFacings = 1
+        //   1. Building (from ^BasicBuilding) - TopLeft
+        //   2. Health (from ^BasicBuilding, FACT overrides HP=150000)
+        //   3. RevealsShroud (from FACT) - base class private fields invisible → 0
+        //   4. RevealsShroud@GAPGEN (from FACT) - same → 0
         //
         // Second batch (Requires satisfied):
-        //   6. FrozenUnderFog (Requires<BuildingInfo>) - VisibilityHash = 0
-        //   7. RepairableBuilding (Requires<IHealthInfo>) - RepairersHash = 0
-        //   8. ConyardChronoReturn (Requires<HealthInfo,WithSpriteBodyInfo>) - all zero
+        //   5. FrozenUnderFog (Requires<BuildingInfo>) - VisibilityHash = 0
+        //   6. RepairableBuilding (Requires<IHealthInfo>) - RepairersHash = 0
+        //   7. ConyardChronoReturn (Requires<HealthInfo,WithSpriteBodyInfo>) - all zero
         let top_left = CPos::new(fact_location.0, fact_location.1);
         let fact_sync = sync::ActorSync {
             actor_id: fact_id,
@@ -423,16 +557,16 @@ impl World {
             }
         }
 
-        // 2. Update FrozenActorLayer (index 13) for owner and Everyone.
-        //    FrozenHash ^= fact_id when the FACT becomes a frozen actor for that player.
-        let everyone_id = self.everyone_player_id;
-        for &pid in &[owner_player_id, everyone_id] {
-            if let Some(player_sync) = self.sync_actors.iter_mut().find(|a| a.actor_id == pid) {
-                if player_sync.trait_hashes.len() > 13 {
-                    player_sync.trait_hashes[13] ^= fact_id as i32;
-                }
-            }
-        }
+        // 2. Update FrozenActorLayer (index 13) for ALL players.
+        //    C# FrozenActorLayer.Tick() recalculates every tick:
+        //      FrozenHash = Σ id (all frozen actors)
+        //      VisibilityHash = Σ id (frozen actors where Visible=true, i.e. under fog)
+        //      trait_hash = FrozenHash ^ VisibilityHash
+        //    A new FACT is added as frozen actor for ALL players. For the owner and
+        //    Everyone, Visible=false (can see it), so only FrozenHash increases.
+        //    For other players, Visible=true (under fog), so both FH and VH increase,
+        //    and the XOR contribution is: (FH+id) ^ (VH+id) vs FH ^ VH.
+        self.update_fal_for_new_building(fact_id, owner_player_id);
 
         // 3. Update FrozenUnderFog VisibilityHash on FACT (trait index 5).
         //    Encodes which players can see the FACT, computed in reverse player order:
@@ -461,6 +595,32 @@ impl World {
             hash = hash * 2 + if visible { 1 } else { 0 };
         }
         hash
+    }
+
+    /// Update FrozenActorLayer (trait index 13) for all players when a new building
+    /// is created. The building is visible to owner and Everyone; under fog for others.
+    ///
+    /// C# FrozenActorLayer stores per-player:
+    ///   FrozenHash = Σ frozen_actor_id
+    ///   VisibilityHash = Σ frozen_actor_id where Visible=true (under fog)
+    ///   sync_hash = FrozenHash ^ VisibilityHash
+    fn update_fal_for_new_building(&mut self, building_id: u32, owner_player_id: u32) {
+        let everyone_id = self.everyone_player_id;
+        let player_ids: Vec<u32> = self.player_actor_ids.clone();
+        for &pid in &player_ids {
+            let state = self.fal_state.entry(pid).or_insert((0i32, 0i32));
+            state.0 = state.0.wrapping_add(building_id as i32); // FrozenHash
+            let can_see = pid == owner_player_id || pid == everyone_id;
+            if !can_see {
+                state.1 = state.1.wrapping_add(building_id as i32); // VisibilityHash
+            }
+            let new_hash = state.0 ^ state.1;
+            if let Some(player_sync) = self.sync_actors.iter_mut().find(|a| a.actor_id == pid) {
+                if player_sync.trait_hashes.len() > 13 {
+                    player_sync.trait_hashes[13] = new_hash;
+                }
+            }
+        }
     }
 }
 
@@ -870,6 +1030,7 @@ pub fn build_world(
     // === Map actors ===
     // Collect spawn point locations for MCV placement.
     let mut spawn_locations: Vec<(i32, i32)> = Vec::new();
+    let mut mine_count: usize = 0;
 
     for actor in &map.actors {
         let id = next_id;
@@ -891,6 +1052,7 @@ pub fn build_world(
             trait_hashes.push(building_sync_hash(top_left));
             trait_hashes.push(health_sync_hash(50000));
         } else if is_mine {
+            mine_count += 1;
             trait_hashes.push(1); // BodyOrientation: QuantizedFacings
             trait_hashes.push(building_sync_hash(top_left));
         } else if is_spawn {
@@ -954,12 +1116,17 @@ pub fn build_world(
             turn_target: 384,
             is_turning: false,
             turn_done: false,
-            turn_speed: 60, // Empirically determined from replay (YAML TurnSpeed: 20, effective: 60)
+            turn_speed: 20, // YAML TurnSpeed: 20, with NetFrameInterval=3 (3 ticks/frame)
             spawn_x,
             spawn_y,
             owner_player_id: owner_pid,
         });
         next_id += 1;
+    }
+
+    let mut player_cash = std::collections::HashMap::new();
+    for &pid in &player_actor_ids {
+        player_cash.insert(pid, lobby.starting_cash);
     }
 
     World {
@@ -979,6 +1146,11 @@ pub fn build_world(
         pq_enabled: true,
         mcv_states,
         everyone_player_id,
+        fal_state: std::collections::HashMap::new(),
+        mine_count,
+        seeds_resource_ticks: 0, // Fires on tick 1 (--ticks gives -1 ≤ 0)
+        production: std::collections::HashMap::new(),
+        player_cash: player_cash,
     }
 }
 

@@ -29,22 +29,7 @@ fn debug_orders_and_hashes() {
                 "HandshakeResponse", "HandshakeRequest", "SyncConnectionQuality",
                 "FluentMessage", "StartGame"];
 
-    eprintln!("=== All non-setup orders for frames 1-25 ===");
-    for (frame, order) in &replay.orders {
-        if *frame >= 1 && *frame <= 25 && !skip.contains(&order.order_string.as_str()) {
-            eprintln!("  frame={} order='{}' subject={:?} target={:?} extra={:?}",
-                frame, order.order_string, order.subject_id, order.target_string, order.extra_data);
-        }
-    }
-
-    eprintln!("\n=== Expected sync hashes for frames 1-25 ===");
-    for sh in &replay.sync_hashes {
-        if sh.frame >= 1 && sh.frame <= 25 {
-            eprintln!("  frame={} hash={}", sh.frame, sh.sync_hash);
-        }
-    }
-
-    // Run simulation and show per-frame computed vs expected
+    // Run simulation and compare all frames
     let map_data = std::fs::read(
         concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/maps/singles.oramap")
     ).unwrap();
@@ -53,9 +38,21 @@ fn debug_orders_and_hashes() {
     let lobby = lobby_from_replay(&replay);
     let mut w = world::build_world(&map, settings.random_seed, &lobby);
 
-    eprintln!("\n=== Per-frame simulation (frames 16-25) ===");
+    // Dump ALL orders around the mismatch area
+    eprintln!("=== ALL orders for frames 30-50 ===");
+    for (frame, order) in &replay.orders {
+        if *frame >= 30 && *frame <= 50 {
+            eprintln!("  frame={} order='{}' subject={:?} target={:?} extra={:?}",
+                frame, order.order_string, order.subject_id, order.target_string, order.extra_data);
+        }
+    }
+
+    let max_frame = 75;
+    let mut mismatches = 0;
+    let mut first_mismatch = None;
+
     for sh in &replay.sync_hashes {
-        if sh.frame > 25 { break; }
+        if sh.frame > max_frame { break; }
 
         let orders: Vec<GameOrder> = replay.orders.iter()
             .filter(|(f, o)| *f == sh.frame && !skip.contains(&o.order_string.as_str()))
@@ -67,59 +64,43 @@ fn debug_orders_and_hashes() {
             })
             .collect();
 
-        if sh.frame == 1 {
-            eprintln!("\n=== DETAILED DUMP BEFORE frame 1 (tick 0) ===");
-            w.dump_sync_details();
-        }
-        if sh.frame == 20 {
-            eprintln!("\n=== DETAILED DUMP BEFORE frame 20 (last matching frame) ===");
-            w.dump_sync_details();
-        }
-        if sh.frame == 21 {
-            eprintln!("\n=== DETAILED DUMP BEFORE frame 21 (first mismatching frame) ===");
-            w.dump_sync_details();
-        }
         let computed = w.process_frame(&orders);
         if sh.frame >= 16 {
-            let delta = computed.wrapping_sub(sh.sync_hash);
-            eprintln!("  frame={} computed={} expected={} delta={} match={}",
-                sh.frame, computed, sh.sync_hash, delta as i32, computed == sh.sync_hash);
-        }
-
-        // At frame 21, brute-force find how many extra RNG calls are needed
-        if sh.frame == 21 && computed != sh.sync_hash {
-            eprintln!("\n=== BRUTE FORCE: finding extra RNG calls needed ===");
-            eprintln!("  Current rng.last={} rng.total_count={}", w.rng.last, w.rng.total_count);
-            // We need rng.last such that AFTER_TRAITS + rng.last = expected
-            let after_traits = computed.wrapping_sub(w.rng.last);
-            let needed_rng: i32 = sh.sync_hash.wrapping_sub(after_traits);
-            eprintln!("  AFTER_TRAITS={} needed_rng_last={}", after_traits, needed_rng);
-
-            // Clone the RNG state from BEFORE the deploy tick (frame 20's tick)
-            // We need to go back... actually the RNG was already advanced.
-            // Let's just try advancing from current state
-            let mut test_rng = w.rng.clone();
-            // Rewind: we can't rewind MT, but we can try from current state
-            // Actually, let's recompute: the RNG state at frame 20's SyncHash is what we need
-            // But we've already advanced past it. Let me just check forward calls.
-            // Try different numbers of extra RNG calls and check what trait delta they imply
-            eprintln!("  Trying extra RNG calls (0-30):");
-            let mut test_rng = w.rng.clone();
-            let our_rng = w.rng.last;
-            for n in 0..=30 {
-                let rng_last = test_rng.last;
-                let rng_delta = rng_last.wrapping_sub(our_rng);
-                let trait_delta = (-1514386i32).wrapping_sub(rng_delta);
-                // Check if trait_delta factors by 122 (1+FACT_id=121)
-                let div122 = if trait_delta != 0 && trait_delta % 122 == 0 {
-                    format!("= 122 * {}", trait_delta / 122)
-                } else {
-                    String::new()
-                };
-                eprintln!("    N={}: rng_last={} rng_delta={} trait_delta={} {}",
-                    n, rng_last, rng_delta, trait_delta, div122);
-                test_rng.next();
+            let ok = computed == sh.sync_hash;
+            if !ok {
+                let delta = computed.wrapping_sub(sh.sync_hash);
+                eprintln!("  frame={} computed={} expected={} delta={} MISMATCH",
+                    sh.frame, computed, sh.sync_hash, delta as i32);
+                mismatches += 1;
+                if first_mismatch.is_none() {
+                    first_mismatch = Some(sh.frame);
+                    eprintln!("\n=== ANALYSIS frame {} ===", sh.frame);
+                    eprintln!("  delta={} (0x{:08x})", delta as i32, delta as u32);
+                    eprintln!("  our rng.last={} count={}", w.rng.last, w.rng.total_count);
+                    let needed = w.rng.last.wrapping_sub(delta as i32);
+                    eprintln!("  needed rng.last={}", needed);
+                    let mut test_rng = w.rng.clone();
+                    for n in 1..=10000 {
+                        test_rng.next();
+                        if test_rng.last == needed {
+                            eprintln!("  FOUND: {} extra RNG calls would produce needed rng.last!", n);
+                            break;
+                        }
+                    }
+                    // Check hash_player sums
+                    let hp = |id: u32| openra_sim::sync::hash_player(id);
+                    eprintln!("  hash_player sums: p3+p4={} p3+p4+p5={} all5={}",
+                        hp(3).wrapping_add(hp(4)),
+                        hp(3).wrapping_add(hp(4)).wrapping_add(hp(5)),
+                        hp(1).wrapping_add(hp(2)).wrapping_add(hp(3)).wrapping_add(hp(4)).wrapping_add(hp(5)));
+                }
             }
         }
+    }
+
+    if mismatches > 0 {
+        panic!("{} frame mismatches (first at frame {})", mismatches, first_mismatch.unwrap());
+    } else {
+        eprintln!("All frames 16-{} match!", max_frame);
     }
 }
