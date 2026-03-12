@@ -1,4 +1,6 @@
-import init, { ReplayViewer, GameSession, SpriteAtlas, SoundAtlas, available_maps } from './pkg/openra_wasm.js';
+import initWasm, * as wasm from './pkg/openra_wasm.js';
+const { ReplayViewer, GameSession, SpriteAtlas, SoundAtlas } = wasm;
+const init = initWasm;
 
 // ── DOM refs ──
 const homeEl = document.getElementById('home');
@@ -1911,15 +1913,27 @@ await loadSprites();
 
 // Populate map selector
 try {
-    const maps = JSON.parse(available_maps());
     const mapSelect = document.getElementById('map-select');
-    mapSelect.innerHTML = '';
-    maps.forEach((name, i) => {
-        const opt = document.createElement('option');
-        opt.value = i; opt.textContent = name;
-        mapSelect.appendChild(opt);
-    });
-} catch (e) { console.warn('Failed to load map list:', e); }
+    if (typeof wasm.available_maps === 'function') {
+        const maps = JSON.parse(wasm.available_maps());
+        mapSelect.innerHTML = '';
+        if (maps.length === 0) throw new Error('No maps available');
+        maps.forEach((name, i) => {
+            const opt = document.createElement('option');
+            opt.value = i; opt.textContent = name;
+            mapSelect.appendChild(opt);
+        });
+    } else {
+        // Older WASM build without available_maps — use default
+        mapSelect.innerHTML = '<option value="0">Default Map</option>';
+    }
+} catch (e) {
+    console.warn('Failed to load map list:', e);
+    const mapSelect = document.getElementById('map-select');
+    mapSelect.innerHTML = '<option value="0">Default Map</option>';
+    const errEl = document.getElementById('map-error');
+    if (errEl) { errEl.style.display = 'block'; errEl.textContent = 'Map loading failed: ' + e.message; }
+}
 
 // Load sound atlas (non-blocking)
 try { soundAtlas = new SoundAtlas(); console.log('Sound atlas loaded'); }

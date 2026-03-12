@@ -3,37 +3,75 @@
 <head>
 <meta charset="utf-8">
 <title>OpenRA</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Teko:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { background: #000; color: #ccc; font-family: 'Lucida Console', 'Courier New', monospace; overflow: hidden; }
+body { background: #000; color: #ccc; font-family: 'Share Tech Mono', 'Lucida Console', monospace; overflow: hidden; }
 
 /* ── Home Screen ── */
 #home {
   display: flex; flex-direction: column; align-items: center;
-  justify-content: center; min-height: 100vh; gap: 20px;
-  background: #0a0a0a url('uibits/loadscreen.png') center center no-repeat;
-  background-size: contain;
+  justify-content: center; min-height: 100vh; gap: 24px;
+  background: radial-gradient(circle at center, #1a0505 0%, #050505 100%);
+  position: relative;
 }
-#home h1 { color: #c8a830; font-size: 28px; letter-spacing: 2px; }
-#home p { color: #666; font-size: 13px; }
-.home-buttons { display: flex; gap: 16px; margin-top: 8px; }
+#home::before {
+  content: ''; position: absolute; inset: 0;
+  background: linear-gradient(to bottom, rgba(255,255,255,0), rgba(255,255,255,0) 50%, rgba(0,0,0,0.15) 50%, rgba(0,0,0,0.15));
+  background-size: 100% 4px; pointer-events: none; z-index: 2;
+}
+#home .home-content { position: relative; z-index: 1; display: flex; flex-direction: column; align-items: center; gap: 20px; }
+#home h1 {
+  font-family: 'Teko', sans-serif; color: #ef4444; font-size: 72px;
+  letter-spacing: 6px; text-transform: uppercase; line-height: 1;
+  text-shadow: 0 0 20px rgba(239, 68, 68, 0.6), 0 0 40px rgba(239, 68, 68, 0.3);
+}
+#home .subtitle {
+  color: #84cc16; font-size: 13px; letter-spacing: 2px; text-transform: uppercase;
+  text-shadow: 0 0 5px rgba(132, 204, 22, 0.5);
+}
+#home .star-icon {
+  width: 120px; height: 120px; margin-bottom: -8px;
+  filter: drop-shadow(0 0 12px rgba(239, 68, 68, 0.4));
+}
+.home-controls {
+  display: flex; gap: 16px; align-items: center; flex-wrap: wrap; justify-content: center;
+  background: rgba(0,0,0,0.5); border: 1px solid #262626; border-left: 3px solid #dc2626;
+  padding: 12px 20px; border-radius: 2px;
+}
+.home-controls label { font-size: 12px; color: #888; display: flex; align-items: center; gap: 6px; }
+.home-controls select {
+  background: #171717; color: #d1d5db; border: 1px solid #525252;
+  padding: 6px 10px; font-family: 'Share Tech Mono', monospace; font-size: 12px;
+}
+.home-controls select:focus { border-color: #dc2626; outline: none; }
+.home-buttons { display: flex; gap: 16px; margin-top: 4px; }
 .home-btn {
-  background: #3a3a28; color: #c8a830; border: 1px solid #5a5a3a; padding: 12px 28px;
-  cursor: pointer; font-family: inherit; font-size: 15px;
+  background: #dc2626; color: #fff; border: 2px solid #f87171;
+  padding: 12px 32px; cursor: pointer; font-family: 'Teko', sans-serif;
+  font-size: 22px; letter-spacing: 2px; text-transform: uppercase;
+  box-shadow: 4px 4px 0 #000; transition: all 0.1s;
 }
-.home-btn:hover { background: #4a4a38; border-color: #c8a830; }
-.home-btn.secondary { color: #999; border-color: #444; }
+.home-btn:hover { transform: translate(2px, 2px); box-shadow: 2px 2px 0 #000; background: #ef4444; }
+.home-btn:active { transform: translate(4px, 4px); box-shadow: 0 0 0 #000; }
+.home-btn.secondary {
+  background: #171717; color: #a3a3a3; border: 2px solid #525252;
+}
+.home-btn.secondary:hover { border-color: #737373; color: #fff; }
+#map-error { color: #ef4444; font-size: 11px; display: none; }
 
 /* ── Replay Setup ── */
 #replay-setup {
   display: none; flex-direction: column; align-items: center;
   justify-content: center; min-height: 100vh; gap: 14px;
-  background: #0a0a0a;
+  background: radial-gradient(circle at center, #1a0505 0%, #050505 100%);
 }
-#replay-setup h2 { color: #c8a830; font-size: 20px; }
+#replay-setup h2 { font-family: 'Teko', sans-serif; color: #ef4444; font-size: 32px; letter-spacing: 2px; text-transform: uppercase; }
 .file-inputs { display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; }
 .file-inputs label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #888; }
 input[type="file"] { font-size: 11px; color: #aaa; }
+#replay-setup .home-btn { font-size: 18px; padding: 10px 24px; }
 
 /* ── Game UI ── */
 #game-ui { display: none; height: 100vh; width: 100vw; }
@@ -187,25 +225,32 @@ input[type="range"] { width: 60px; vertical-align: middle; }
 
 <!-- Home Screen -->
 <div id="home">
-  <h1>OPENRA</h1>
-  <p>Real-time strategy in the browser</p>
-  <div style="display: flex; gap: 12px; align-items: center; margin-top: 8px; flex-wrap: wrap; justify-content: center;">
-    <label style="font-size: 12px; color: #888;">Map:
-      <select id="map-select" style="background: #2a2a1e; color: #c8a830; border: 1px solid #3a3a28; padding: 4px 8px; font-family: inherit;">
-        <option value="0">Loading...</option>
-      </select>
-    </label>
-    <label style="font-size: 12px; color: #888;">Difficulty:
-      <select id="difficulty-select" style="background: #2a2a1e; color: #c8a830; border: 1px solid #3a3a28; padding: 4px 8px; font-family: inherit;">
-        <option value="0">Easy</option>
-        <option value="1" selected>Medium</option>
-        <option value="2">Hard</option>
-      </select>
-    </label>
-  </div>
-  <div class="home-buttons">
-    <button class="home-btn" id="btn-start-game">New Game</button>
-    <button class="home-btn secondary" id="btn-watch-replay">Watch Replay</button>
+  <div class="home-content">
+    <svg class="star-icon" viewBox="0 0 100 100" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <polygon points="50,5 61,35 95,35 68,55 79,90 50,70 21,90 32,55 5,35 39,35" fill="#dc2626" stroke="#f87171" stroke-width="2"/>
+      <polygon points="50,18 57,38 80,38 62,52 69,75 50,62 31,75 38,52 20,38 43,38" fill="#ef4444" opacity="0.6"/>
+    </svg>
+    <h1>OPENRA</h1>
+    <p class="subtitle">// Real-time strategy in the browser</p>
+    <div class="home-controls">
+      <label>Map:
+        <select id="map-select">
+          <option value="0">Initializing WASM...</option>
+        </select>
+      </label>
+      <label>Difficulty:
+        <select id="difficulty-select">
+          <option value="0">Easy</option>
+          <option value="1" selected>Medium</option>
+          <option value="2">Hard</option>
+        </select>
+      </label>
+    </div>
+    <div id="map-error"></div>
+    <div class="home-buttons">
+      <button class="home-btn" id="btn-start-game">New Game</button>
+      <button class="home-btn secondary" id="btn-watch-replay">Watch Replay</button>
+    </div>
   </div>
 </div>
 
