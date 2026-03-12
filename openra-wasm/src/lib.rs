@@ -4,13 +4,16 @@
 //! - ReplayViewer: load .orarep + .oramap, play back recorded game
 //! - GameSession: start a new game vs bot AI on a bundled map
 
+use std::collections::HashMap;
 use wasm_bindgen::prelude::*;
 
-use openra_data::{oramap, orarep};
+use openra_data::{oramap, orarep, palette, shp};
 use openra_sim::world::{self, GameOrder, LobbyInfo, SlotInfo};
 
 /// Bundled map for quick-start games.
 const BUNDLED_MAP: &[u8] = include_bytes!("../../tests/maps/singles.oramap");
+/// Bundled palette.
+const BUNDLED_PALETTE: &[u8] = include_bytes!("../../vendor/OpenRA/mods/ra/maps/chernobyl/temperat.pal");
 
 #[wasm_bindgen(start)]
 pub fn init() {
@@ -254,5 +257,109 @@ impl GameSession {
             target_string: None,
             extra_data: None,
         });
+    }
+}
+
+// ── Sprite Atlas ───────────────────────────────────────────────────────────
+
+/// Bundled SHP sprite files.
+const SPRITE_DATA: &[(&str, &[u8])] = &[
+    ("fact", include_bytes!("../../vendor/OpenRA/mods/ra/bits/fact.shp")),
+    ("harv", include_bytes!("../../vendor/OpenRA/mods/ra/bits/harv.shp")),
+    ("heli", include_bytes!("../../vendor/OpenRA/mods/ra/bits/heli.shp")),
+    ("hind", include_bytes!("../../vendor/OpenRA/mods/ra/bits/hind.shp")),
+    ("yak", include_bytes!("../../vendor/OpenRA/mods/ra/bits/yak.shp")),
+    ("e6", include_bytes!("../../vendor/OpenRA/mods/ra/bits/e6.shp")),
+    ("gap", include_bytes!("../../vendor/OpenRA/mods/ra/bits/gap.shp")),
+    ("truk", include_bytes!("../../vendor/OpenRA/mods/ra/bits/truk.shp")),
+    ("ftrk", include_bytes!("../../vendor/OpenRA/mods/ra/bits/ftrk.shp")),
+    ("sam2", include_bytes!("../../vendor/OpenRA/mods/ra/bits/sam2.shp")),
+    ("proctop", include_bytes!("../../vendor/OpenRA/mods/ra/bits/proctop.shp")),
+    ("nopower", include_bytes!("../../vendor/OpenRA/mods/ra/bits/nopower.shp")),
+];
+
+/// A decoded sprite: name → list of frames, each with (width, height, rgba_data).
+#[wasm_bindgen]
+pub struct SpriteAtlas {
+    sprites: HashMap<String, Vec<SpriteFrame>>,
+}
+
+struct SpriteFrame {
+    width: u16,
+    height: u16,
+    rgba: Vec<u8>,
+}
+
+#[wasm_bindgen]
+impl SpriteAtlas {
+    /// Decode all bundled sprites using the bundled palette.
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> Result<SpriteAtlas, JsValue> {
+        let pal = palette::Palette::from_bytes(BUNDLED_PALETTE)
+            .map_err(|e| JsValue::from_str(&format!("Palette error: {}", e)))?;
+
+        let mut sprites = HashMap::new();
+        for &(name, data) in SPRITE_DATA {
+            match shp::decode(data) {
+                Ok(shp_file) => {
+                    let frames: Vec<SpriteFrame> = shp_file.frames.iter().map(|f| {
+                        let mut rgba = Vec::with_capacity(f.pixels.len() * 4);
+                        for &px in &f.pixels {
+                            let c = pal.rgba(px);
+                            rgba.extend_from_slice(&c);
+                        }
+                        SpriteFrame { width: f.width, height: f.height, rgba }
+                    }).collect();
+                    sprites.insert(name.to_string(), frames);
+                }
+                Err(_) => {} // Skip failed decodes
+            }
+        }
+        Ok(SpriteAtlas { sprites })
+    }
+
+    /// Get sprite info as JSON: { name: { width, height, frames } }
+    pub fn info_json(&self) -> String {
+        let mut info = HashMap::new();
+        for (name, frames) in &self.sprites {
+            if let Some(f) = frames.first() {
+                info.insert(name.clone(), serde_json::json!({
+                    "width": f.width,
+                    "height": f.height,
+                    "frames": frames.len(),
+                }));
+            }
+        }
+        serde_json::to_string(&info).unwrap_or_default()
+    }
+
+    /// Get RGBA pixel data for a specific sprite frame.
+    /// Returns empty vec if not found.
+    pub fn frame_rgba(&self, name: &str, frame_index: usize) -> Vec<u8> {
+        self.sprites.get(name)
+            .and_then(|frames| frames.get(frame_index))
+            .map(|f| f.rgba.clone())
+            .unwrap_or_default()
+    }
+
+    /// Get sprite width.
+    pub fn width(&self, name: &str) -> u16 {
+        self.sprites.get(name)
+            .and_then(|f| f.first())
+            .map(|f| f.width)
+            .unwrap_or(0)
+    }
+
+    /// Get sprite height.
+    pub fn height(&self, name: &str) -> u16 {
+        self.sprites.get(name)
+            .and_then(|f| f.first())
+            .map(|f| f.height)
+            .unwrap_or(0)
+    }
+
+    /// Get frame count for a sprite.
+    pub fn frame_count(&self, name: &str) -> usize {
+        self.sprites.get(name).map(|f| f.len()).unwrap_or(0)
     }
 }
