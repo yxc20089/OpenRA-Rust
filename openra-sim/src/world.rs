@@ -10,12 +10,12 @@ use serde::Serialize;
 
 pub use crate::actor::ActorKind;
 
-use crate::actor::{Activity, Actor};
+use crate::actor::{Activity, Actor, HarvestState};
 use crate::math::{CPos, WPos};
 use crate::pathfinder;
 use crate::rng::MersenneTwister;
 use crate::sync;
-use crate::terrain::TerrainMap;
+use crate::terrain::{ResourceType, TerrainMap};
 use crate::traits::{PqType, TraitState};
 
 /// Lobby information extracted from the replay's SyncInfo orders.
@@ -124,6 +124,15 @@ pub struct WorldSnapshot {
     pub players: Vec<PlayerSnapshot>,
     pub map_width: i32,
     pub map_height: i32,
+    pub resources: Vec<ResourceSnapshot>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ResourceSnapshot {
+    pub x: i32,
+    pub y: i32,
+    pub kind: u8, // 1=ore, 2=gems
+    pub density: u8,
 }
 
 #[derive(Debug, Serialize)]
@@ -238,12 +247,28 @@ impl World {
             let cash = self.actors.get(&pid).map(|a| a.cash()).unwrap_or(0);
             PlayerSnapshot { index: pid, cash }
         }).collect();
+        // Collect resource cells for rendering
+        let mut resources = Vec::new();
+        for y in 0..self.map_height {
+            for x in 0..self.map_width {
+                let cell = self.terrain.resource(x, y);
+                if cell.resource_type != ResourceType::None && cell.density > 0 {
+                    resources.push(ResourceSnapshot {
+                        x, y,
+                        kind: match cell.resource_type { ResourceType::Ore => 1, ResourceType::Gems => 2, ResourceType::None => 0 },
+                        density: cell.density,
+                    });
+                }
+            }
+        }
+
         WorldSnapshot {
             tick: self.world_tick,
             actors,
             players,
             map_width: self.map_width,
             map_height: self.map_height,
+            resources,
         }
     }
 
@@ -394,6 +419,16 @@ impl World {
                     }
                 }
             }
+            "Harvest" => {
+                // Send harvester to a specific resource cell
+                if let Some(subject_id) = order.subject_id {
+                    if let Some(ref ts) = order.target_string {
+                        if let Some(target) = parse_cell_target(ts) {
+                            self.order_harvest(subject_id, target);
+                        }
+                    }
+                }
+            }
             "Stop" => {
                 if let Some(subject_id) = order.subject_id {
                     if let Some(actor) = self.actors.get_mut(&subject_id) {
@@ -426,6 +461,29 @@ impl World {
                     });
                 }
             }
+        }
+    }
+
+    /// Handle a Harvest order: send a harvester to harvest at a location.
+    fn order_harvest(&mut self, actor_id: u32, target: (i32, i32)) {
+        let (speed, owner_id) = match self.actors.get(&actor_id) {
+            Some(a) => (self.actor_speed(actor_id), a.owner_id),
+            None => return,
+        };
+        let refinery_id = owner_id.and_then(|pid| self.find_refinery(pid)).unwrap_or(0);
+        if let Some(actor) = self.actors.get_mut(&actor_id) {
+            actor.activity = Some(Activity::Harvest {
+                state: HarvestState::FindingOre,
+                refinery_id,
+                carried_ore: 0,
+                carried_gems: 0,
+                capacity: 20,
+                path: Vec::new(),
+                path_index: 0,
+                speed,
+                harvest_ticks: 0,
+                last_harvest_cell: Some(target),
+            });
         }
     }
 
@@ -463,8 +521,348 @@ impl World {
         self.actors.insert(building_id, building);
         self.terrain.occupy_footprint(x, y, footprint_w, footprint_h, building_id);
 
-        eprintln!("PLACE: {} at ({},{}) id={} footprint={}x{}",
-            building_type, x, y, building_id, footprint_w, footprint_h);
+        // Update power for the owning player
+        let power = building_power(building_type);
+        if power != 0 {
+            self.update_player_power(owner_player_id, power);
+        }
+
+        // Enable production queues if this is a production building
+        self.enable_production_queues(owner_player_id, building_type);
+
+        eprintln!("PLACE: {} at ({},{}) id={} footprint={}x{} power={}",
+            building_type, x, y, building_id, footprint_w, footprint_h, power);
+    }
+
+    /// Update PowerManager trait on a player actor.
+    fn update_player_power(&mut self, player_id: u32, power_delta: i32) {
+        if let Some(player) = self.actors.get_mut(&player_id) {
+            for t in &mut player.traits {
+                if let TraitState::PowerManager { power_provided, power_drained } = t {
+                    if power_delta > 0 {
+                        *power_provided += power_delta;
+                    } else {
+                        *power_drained += -power_delta;
+                    }
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Enable the appropriate production queue when a production building is placed.
+    fn enable_production_queues(&mut self, player_id: u32, building_type: &str) {
+        let pq_type = match building_type {
+            "weap" | "weap.ukraine" => Some(PqType::Vehicle),
+            "tent" | "barr" => Some(PqType::Infantry),
+            "hpad" | "afld" => Some(PqType::Aircraft),
+            "spen" | "syrd" => Some(PqType::Ship),
+            _ => None,
+        };
+        if let Some(pq) = pq_type {
+            if let Some(player) = self.actors.get_mut(&player_id) {
+                for t in &mut player.traits {
+                    if let TraitState::ClassicProductionQueue { pq_type: pt, enabled, .. } = t {
+                        if *pt == pq {
+                            *enabled = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Tick all harvesters through their harvest cycle.
+    fn tick_harvesters(&mut self) {
+        let harvester_ids: Vec<u32> = self.actors.values()
+            .filter(|a| matches!(a.activity, Some(Activity::Harvest { .. })))
+            .map(|a| a.id)
+            .collect();
+
+        for hid in harvester_ids {
+            // Extract state we need (borrow checker requires splitting)
+            let (state, carried_ore, carried_gems, loc) = {
+                let actor = match self.actors.get(&hid) {
+                    Some(a) => a,
+                    None => continue,
+                };
+                if let Some(Activity::Harvest { state, carried_ore, carried_gems, .. }) = &actor.activity {
+                    (*state, *carried_ore, *carried_gems, actor.location)
+                } else {
+                    continue;
+                }
+            };
+
+            match state {
+                HarvestState::FindingOre => {
+                    let search_center = {
+                        let actor = self.actors.get(&hid).unwrap();
+                        if let Some(Activity::Harvest { last_harvest_cell, .. }) = &actor.activity {
+                            last_harvest_cell.or(loc)
+                        } else {
+                            loc
+                        }
+                    };
+                    if let Some(center) = search_center {
+                        if let Some(ore_cell) = self.terrain.find_nearest_resource(center.0, center.1, 15) {
+                            // Pathfind to ore
+                            if let Some(from) = loc {
+                                if let Some(path) = pathfinder::find_path(&self.terrain, from, ore_cell, Some(hid)) {
+                                    if path.len() > 1 {
+                                        if let Some(actor) = self.actors.get_mut(&hid) {
+                                            if let Some(Activity::Harvest { state: s, path: p, path_index: pi, .. }) = &mut actor.activity {
+                                                *s = HarvestState::MovingToOre;
+                                                *p = path;
+                                                *pi = 1;
+                                            }
+                                        }
+                                    } else {
+                                        // Already at ore cell
+                                        if let Some(actor) = self.actors.get_mut(&hid) {
+                                            if let Some(Activity::Harvest { state: s, harvest_ticks, .. }) = &mut actor.activity {
+                                                *s = HarvestState::Harvesting;
+                                                *harvest_ticks = 4; // BaleLoadDelay
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else if carried_ore + carried_gems > 0 {
+                            // No ore found but carrying resources — go deliver
+                            self.harvester_start_delivery(hid);
+                        }
+                    }
+                }
+                HarvestState::MovingToOre | HarvestState::MovingToRefinery => {
+                    // Reuse movement logic similar to Move activity
+                    let arrived = self.tick_harvest_movement(hid);
+                    if arrived {
+                        if state == HarvestState::MovingToOre {
+                            if let Some(actor) = self.actors.get_mut(&hid) {
+                                if let Some(Activity::Harvest { state: s, harvest_ticks, .. }) = &mut actor.activity {
+                                    *s = HarvestState::Harvesting;
+                                    *harvest_ticks = 4;
+                                }
+                            }
+                        } else {
+                            // Arrived at refinery
+                            if let Some(actor) = self.actors.get_mut(&hid) {
+                                if let Some(Activity::Harvest { state: s, .. }) = &mut actor.activity {
+                                    *s = HarvestState::Unloading;
+                                }
+                            }
+                        }
+                    }
+                }
+                HarvestState::Harvesting => {
+                    let actor = self.actors.get_mut(&hid).unwrap();
+                    if let Some(Activity::Harvest { harvest_ticks, .. }) = &mut actor.activity {
+                        *harvest_ticks -= 1;
+                        if *harvest_ticks <= 0 {
+                            let aloc = actor.location;
+                            // Try to harvest from current cell
+                            if let Some((hx, hy)) = aloc {
+                                if let Some(rt) = self.terrain.harvest_resource(hx, hy) {
+                                    // Reborrow after terrain mutation
+                                    let actor = self.actors.get_mut(&hid).unwrap();
+                                    if let Some(Activity::Harvest { carried_ore, carried_gems, capacity, state: s, harvest_ticks, last_harvest_cell, .. }) = &mut actor.activity {
+                                        match rt {
+                                            ResourceType::Ore => *carried_ore += 1,
+                                            ResourceType::Gems => *carried_gems += 1,
+                                            ResourceType::None => {}
+                                        }
+                                        *last_harvest_cell = Some((hx, hy));
+                                        if *carried_ore + *carried_gems >= *capacity {
+                                            // Full — deliver
+                                            *s = HarvestState::FindingOre; // Temporary, will be overridden
+                                        } else if self.terrain.has_resource(hx, hy) {
+                                            // More at this cell
+                                            *harvest_ticks = 4;
+                                        } else {
+                                            // Cell depleted, find next
+                                            *s = HarvestState::FindingOre;
+                                        }
+                                    }
+                                } else {
+                                    // No resource at current cell
+                                    let actor = self.actors.get_mut(&hid).unwrap();
+                                    if let Some(Activity::Harvest { state: s, .. }) = &mut actor.activity {
+                                        *s = HarvestState::FindingOre;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Check if we need to start delivery (full)
+                    let actor = self.actors.get(&hid).unwrap();
+                    if let Some(Activity::Harvest { carried_ore, carried_gems, capacity, state: s, .. }) = &actor.activity {
+                        if *carried_ore + *carried_gems >= *capacity && *s == HarvestState::FindingOre {
+                            self.harvester_start_delivery(hid);
+                        }
+                    }
+                }
+                HarvestState::Unloading => {
+                    // Unload one unit per tick (BaleUnloadDelay=1)
+                    let (ore, gems, owner) = {
+                        let actor = self.actors.get(&hid).unwrap();
+                        if let Some(Activity::Harvest { carried_ore, carried_gems, .. }) = &actor.activity {
+                            (*carried_ore, *carried_gems, actor.owner_id)
+                        } else {
+                            continue;
+                        }
+                    };
+                    if ore + gems > 0 {
+                        let (unload_type, value) = if gems > 0 {
+                            (ResourceType::Gems, resource_value(ResourceType::Gems))
+                        } else {
+                            (ResourceType::Ore, resource_value(ResourceType::Ore))
+                        };
+                        // Add cash to player
+                        if let Some(pid) = owner {
+                            if let Some(player) = self.actors.get_mut(&pid) {
+                                let current = player.cash();
+                                player.set_cash(current + value);
+                            }
+                        }
+                        // Decrement carried
+                        if let Some(actor) = self.actors.get_mut(&hid) {
+                            if let Some(Activity::Harvest { carried_ore, carried_gems, .. }) = &mut actor.activity {
+                                if unload_type == ResourceType::Gems {
+                                    *carried_gems -= 1;
+                                } else {
+                                    *carried_ore -= 1;
+                                }
+                            }
+                        }
+                    } else {
+                        // Done unloading — go find more ore
+                        if let Some(actor) = self.actors.get_mut(&hid) {
+                            if let Some(Activity::Harvest { state: s, .. }) = &mut actor.activity {
+                                *s = HarvestState::FindingOre;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Start a harvester moving to its refinery for delivery.
+    fn harvester_start_delivery(&mut self, harvester_id: u32) {
+        let (refinery_id, from) = {
+            let actor = match self.actors.get(&harvester_id) {
+                Some(a) => a,
+                None => return,
+            };
+            let rid = if let Some(Activity::Harvest { refinery_id, .. }) = &actor.activity {
+                *refinery_id
+            } else {
+                return;
+            };
+            (rid, actor.location)
+        };
+
+        // Find refinery location
+        let refinery_loc = self.actors.get(&refinery_id).and_then(|a| a.location);
+        if let (Some(from), Some(to)) = (from, refinery_loc) {
+            // Path to adjacent cell of refinery
+            let target = self.find_adjacent_cell(to.0, to.1);
+            if let Some(target) = target {
+                if let Some(path) = pathfinder::find_path(&self.terrain, from, target, Some(harvester_id)) {
+                    if let Some(actor) = self.actors.get_mut(&harvester_id) {
+                        if let Some(Activity::Harvest { state, path: p, path_index, .. }) = &mut actor.activity {
+                            *state = HarvestState::MovingToRefinery;
+                            *p = path;
+                            *path_index = if p.len() > 1 { 1 } else { 0 };
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+        // If pathfinding fails, just set to unloading (simplified)
+        if let Some(actor) = self.actors.get_mut(&harvester_id) {
+            if let Some(Activity::Harvest { state, .. }) = &mut actor.activity {
+                *state = HarvestState::Unloading;
+            }
+        }
+    }
+
+    /// Find an empty cell adjacent to a building location.
+    fn find_adjacent_cell(&self, bx: i32, by: i32) -> Option<(i32, i32)> {
+        for dy in -1..=2 {
+            for dx in -1..=3 {
+                let x = bx + dx;
+                let y = by + dy;
+                if self.terrain.is_passable(x, y) {
+                    return Some((x, y));
+                }
+            }
+        }
+        None
+    }
+
+    /// Tick movement for a harvester (shared between MovingToOre and MovingToRefinery).
+    /// Returns true if arrived at destination.
+    fn tick_harvest_movement(&mut self, actor_id: u32) -> bool {
+        let actor = match self.actors.get_mut(&actor_id) {
+            Some(a) => a,
+            None => return false,
+        };
+
+        if let Some(Activity::Harvest { path, path_index, speed, .. }) = &mut actor.activity {
+            if *path_index >= path.len() {
+                return true;
+            }
+            let target_cell = path[*path_index];
+            let target_center = center_of_cell(target_cell.0, target_cell.1);
+            let speed_val = *speed;
+
+            // Update facing
+            if let Some(current_loc) = actor.location {
+                let desired_facing = pathfinder::facing_between(current_loc, target_cell);
+                for t in &mut actor.traits {
+                    if let TraitState::Mobile { facing, .. } = t {
+                        *facing = desired_facing;
+                        break;
+                    }
+                }
+            }
+
+            // Interpolate position
+            let mut arrived = false;
+            for t in &mut actor.traits {
+                if let TraitState::Mobile { center_position, from_cell, to_cell, .. } = t {
+                    *to_cell = CPos::new(target_cell.0, target_cell.1);
+                    let dx = target_center.x - center_position.x;
+                    let dy = target_center.y - center_position.y;
+                    let dist_sq = (dx as i64) * (dx as i64) + (dy as i64) * (dy as i64);
+                    let speed_sq = (speed_val as i64) * (speed_val as i64);
+                    if dist_sq <= speed_sq {
+                        *center_position = target_center;
+                        *from_cell = CPos::new(target_cell.0, target_cell.1);
+                        *to_cell = CPos::new(target_cell.0, target_cell.1);
+                        arrived = true;
+                    } else {
+                        let abs_dx = dx.abs().max(1);
+                        let abs_dy = dy.abs().max(1);
+                        let max_comp = abs_dx.max(abs_dy);
+                        center_position.x += dx * speed_val / max_comp;
+                        center_position.y += dy * speed_val / max_comp;
+                    }
+                    break;
+                }
+            }
+
+            if arrived {
+                actor.location = Some(target_cell);
+                *path_index += 1;
+                if *path_index >= path.len() {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Get movement speed for an actor (world units per tick).
@@ -658,6 +1056,9 @@ impl World {
             }
         }
 
+        // Tick Harvest activities.
+        self.tick_harvesters();
+
         // Tick production queues: consume cash, advance build time.
         let player_ids: Vec<u32> = self.production.keys().copied().collect();
         let mut completed_items: Vec<(u32, String)> = Vec::new();
@@ -733,6 +1134,25 @@ impl World {
         let cell = CPos::new(x, y);
         let center = center_of_cell(x, y);
 
+        // Harvesters auto-start harvesting
+        let activity = if unit_type == "harv" {
+            let refinery_id = self.find_refinery(owner_player_id).unwrap_or(0);
+            Some(Activity::Harvest {
+                state: HarvestState::FindingOre,
+                refinery_id,
+                carried_ore: 0,
+                carried_gems: 0,
+                capacity: 20, // RA HARV capacity
+                path: Vec::new(),
+                path_index: 0,
+                speed,
+                harvest_ticks: 0,
+                last_harvest_cell: None,
+            })
+        } else {
+            None
+        };
+
         let actor = Actor {
             id: unit_id,
             kind,
@@ -746,11 +1166,23 @@ impl World {
                 },
                 TraitState::Health { hp },
             ],
-            activity: None,
+            activity,
         };
         self.actors.insert(unit_id, actor);
         eprintln!("SPAWN: {} id={} at ({},{}) owner={} speed={} hp={}",
             unit_type, unit_id, x, y, owner_player_id, speed, hp);
+    }
+
+    /// Find a refinery (PROC) owned by a player.
+    fn find_refinery(&self, owner_player_id: u32) -> Option<u32> {
+        for actor in self.actors.values() {
+            if actor.owner_id == Some(owner_player_id) && actor.kind == ActorKind::Building {
+                // Check if this is a refinery by looking at its location
+                // (simplified — in full implementation, building type would be stored)
+                return Some(actor.id);
+            }
+        }
+        None
     }
 
     /// Find a spawn location near a production building for the given owner.
@@ -939,6 +1371,34 @@ fn building_footprint(building_type: &str) -> (i32, i32, i32) {
         "atek" | "stek" => (2, 2, 60000),
         "pbox" | "hbox" | "gun" | "ftur" | "tsla" | "agun" | "sam" | "gap" => (1, 1, 40000),
         _ => (2, 2, 50000), // Default
+    }
+}
+
+/// Get power amount for a building type.
+/// Positive = provides power, negative = drains power.
+fn building_power(building_type: &str) -> i32 {
+    match building_type {
+        "powr" => 100,
+        "apwr" => 200,
+        // Consumers
+        "tsla" => -200,
+        "dome" => -200,
+        "mslo" => -150,
+        "sam" => -80,
+        "gap" => -60,
+        "atek" | "stek" => -50,
+        "agun" => -20,
+        // Most buildings don't consume power
+        _ => 0,
+    }
+}
+
+/// Resource value: cash per unit harvested.
+fn resource_value(rt: ResourceType) -> i32 {
+    match rt {
+        ResourceType::Ore => 25,
+        ResourceType::Gems => 75,
+        ResourceType::None => 0,
     }
 }
 
@@ -1280,6 +1740,30 @@ pub fn build_world(
                     terrain.occupy_footprint(x, y, 2, 2, actor.id);
                 }
                 _ => {}
+            }
+        }
+    }
+
+    // Seed ore patches around mine actors (simplified resource placement).
+    // In real OpenRA, SeedsResource handles this dynamically, but we
+    // pre-place ore fields around mine locations.
+    for actor in actors.values() {
+        if actor.kind == ActorKind::Mine {
+            if let Some((mx, my)) = actor.location {
+                // Place ore in a roughly circular patch around the mine
+                for dy in -3..=3i32 {
+                    for dx in -3..=3i32 {
+                        let dist = dx.abs() + dy.abs();
+                        if dist <= 4 {
+                            let x = mx + dx;
+                            let y = my + dy;
+                            if terrain.contains(x, y) && terrain.is_terrain_passable(x, y) {
+                                let density = if dist <= 1 { 12 } else if dist <= 2 { 8 } else { 4 };
+                                terrain.set_resource(x, y, ResourceType::Ore, density);
+                            }
+                        }
+                    }
+                }
             }
         }
     }

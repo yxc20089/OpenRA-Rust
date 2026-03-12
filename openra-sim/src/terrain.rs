@@ -45,6 +45,22 @@ impl<T: Default + Clone> CellLayer<T> {
 pub const COST_IMPASSABLE: i16 = i16::MAX;
 pub const COST_NORMAL: i16 = 100;
 
+/// Resource type in a cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResourceType {
+    #[default]
+    None,
+    Ore,
+    Gems,
+}
+
+/// Resource contents of a cell: type + density (0-12 for ore, 0-3 for gems).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResourceCell {
+    pub resource_type: ResourceType,
+    pub density: u8,
+}
+
 /// The world's terrain and occupancy state.
 #[derive(Debug, Clone)]
 pub struct TerrainMap {
@@ -55,6 +71,8 @@ pub struct TerrainMap {
     /// Actor ID occupying each cell (0 = empty). For buildings with footprints,
     /// all footprint cells store the building's actor ID.
     occupancy: CellLayer<u32>,
+    /// Resource layer: ore/gems per cell.
+    resources: CellLayer<ResourceCell>,
 }
 
 impl TerrainMap {
@@ -72,6 +90,7 @@ impl TerrainMap {
             height,
             costs,
             occupancy: CellLayer::new(width, height),
+            resources: CellLayer::new(width, height),
         }
     }
 
@@ -144,6 +163,62 @@ impl TerrainMap {
             self.costs.set(x, y, cost);
         }
     }
+
+    /// Get the resource at a cell.
+    pub fn resource(&self, x: i32, y: i32) -> ResourceCell {
+        if !self.contains(x, y) { return ResourceCell::default(); }
+        *self.resources.get(x, y)
+    }
+
+    /// Set resource at a cell.
+    pub fn set_resource(&mut self, x: i32, y: i32, resource_type: ResourceType, density: u8) {
+        if self.contains(x, y) {
+            self.resources.set(x, y, ResourceCell { resource_type, density });
+        }
+    }
+
+    /// Remove one unit of resource from a cell. Returns true if resource was removed.
+    pub fn harvest_resource(&mut self, x: i32, y: i32) -> Option<ResourceType> {
+        if !self.contains(x, y) { return None; }
+        let cell = *self.resources.get(x, y);
+        if cell.resource_type == ResourceType::None || cell.density == 0 {
+            return None;
+        }
+        let new_density = cell.density - 1;
+        if new_density == 0 {
+            self.resources.set(x, y, ResourceCell::default());
+        } else {
+            self.resources.set(x, y, ResourceCell { resource_type: cell.resource_type, density: new_density });
+        }
+        Some(cell.resource_type)
+    }
+
+    /// Check if a cell has harvestable resources.
+    pub fn has_resource(&self, x: i32, y: i32) -> bool {
+        if !self.contains(x, y) { return false; }
+        let cell = self.resources.get(x, y);
+        cell.resource_type != ResourceType::None && cell.density > 0
+    }
+
+    /// Find the nearest cell with resources within a search radius.
+    pub fn find_nearest_resource(&self, cx: i32, cy: i32, radius: i32) -> Option<(i32, i32)> {
+        let mut best: Option<(i32, i32)> = None;
+        let mut best_dist = i32::MAX;
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                let x = cx + dx;
+                let y = cy + dy;
+                if self.has_resource(x, y) {
+                    let dist = dx.abs() + dy.abs(); // Manhattan distance
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best = Some((x, y));
+                    }
+                }
+            }
+        }
+        best
+    }
 }
 
 #[cfg(test)]
@@ -188,6 +263,26 @@ mod tests {
 
         map.clear_occupant(5, 5);
         assert!(map.is_passable(5, 5));
+    }
+
+    #[test]
+    fn resource_layer() {
+        let mut map = TerrainMap::new(20, 20);
+        assert!(!map.has_resource(5, 5));
+
+        map.set_resource(5, 5, ResourceType::Ore, 12);
+        assert!(map.has_resource(5, 5));
+        assert_eq!(map.resource(5, 5).density, 12);
+
+        // Harvest one unit
+        let rt = map.harvest_resource(5, 5);
+        assert_eq!(rt, Some(ResourceType::Ore));
+        assert_eq!(map.resource(5, 5).density, 11);
+
+        // Find nearest resource
+        map.set_resource(10, 10, ResourceType::Gems, 3);
+        let nearest = map.find_nearest_resource(6, 6, 10);
+        assert_eq!(nearest, Some((5, 5))); // Closer
     }
 
     #[test]

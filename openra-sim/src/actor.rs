@@ -38,6 +38,41 @@ pub enum Activity {
         target_id: u32,
         weapon_range: i32, // cells
     },
+    /// Harvest resources: find ore → move → harvest → deliver → repeat.
+    Harvest {
+        state: HarvestState,
+        /// Refinery actor ID to deliver to.
+        refinery_id: u32,
+        /// Resources carried (ore units).
+        carried_ore: i32,
+        /// Resources carried (gem units).
+        carried_gems: i32,
+        /// Capacity (total units).
+        capacity: i32,
+        /// Movement path (reused for both to-ore and to-refinery).
+        path: Vec<(i32, i32)>,
+        path_index: usize,
+        speed: i32,
+        /// Ticks remaining for current harvest action.
+        harvest_ticks: i32,
+        /// Last harvested cell (for searching nearby).
+        last_harvest_cell: Option<(i32, i32)>,
+    },
+}
+
+/// Sub-state for the Harvest activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarvestState {
+    /// Searching for a resource cell.
+    FindingOre,
+    /// Moving to a resource cell.
+    MovingToOre,
+    /// Harvesting at current cell (waiting BaleLoadDelay ticks).
+    Harvesting,
+    /// Moving to refinery to deliver.
+    MovingToRefinery,
+    /// Unloading at refinery.
+    Unloading,
 }
 
 /// A game actor with its traits and current activity.
