@@ -233,6 +233,26 @@ impl GameRules {
         actor!("ca", ActorKind::Ship, 100000, 0, 2000, 0, 1, 1, false);
         actor!("pt", ActorKind::Ship, 100000, 0, 700, 0, 1, 1, false);
 
+        // Set prerequisites for units and buildings
+        // Infantry require barracks (tent/barr)
+        for name in &["e1", "e2", "e3", "e4", "e6", "e7", "shok", "medi", "mech", "dog", "spy", "thf"] {
+            if let Some(a) = actors.get_mut(*name) {
+                a.prerequisites = vec!["tent".to_string()];
+            }
+        }
+        // Vehicles require war factory (weap)
+        for name in &["1tnk", "2tnk", "3tnk", "4tnk", "v2rl", "arty", "apc", "jeep", "mnly", "ttnk", "ctnk"] {
+            if let Some(a) = actors.get_mut(*name) {
+                a.prerequisites = vec!["weap".to_string()];
+            }
+        }
+        // Buildings prerequisites
+        if let Some(a) = actors.get_mut("weap") { a.prerequisites = vec!["powr".to_string()]; }
+        if let Some(a) = actors.get_mut("proc") { a.prerequisites = vec!["powr".to_string()]; }
+        if let Some(a) = actors.get_mut("dome") { a.prerequisites = vec!["powr".to_string()]; }
+        if let Some(a) = actors.get_mut("atek") { a.prerequisites = vec!["dome".to_string()]; }
+        if let Some(a) = actors.get_mut("stek") { a.prerequisites = vec!["dome".to_string()]; }
+
         // Default weapon
         weapons.insert("default".to_string(), WeaponStats {
             damage: 100,

@@ -17,7 +17,7 @@ use crate::math::{CPos, WPos};
 use crate::pathfinder;
 use crate::rng::MersenneTwister;
 use crate::sync;
-use crate::terrain::{CellLayer, ResourceType, TerrainMap};
+use crate::terrain::{CellLayer, ResourceType, TerrainMap, COST_IMPASSABLE};
 use crate::traits::{PqType, TraitState};
 
 /// Lobby information extracted from the replay's SyncInfo orders.
@@ -156,6 +156,10 @@ pub struct ActorSnapshot {
     pub owner: u32,
     pub x: i32,
     pub y: i32,
+    /// Sub-cell center position X (world units, 1024 = 1 cell).
+    pub cx: i32,
+    /// Sub-cell center position Y (world units, 1024 = 1 cell).
+    pub cy: i32,
     pub actor_type: String,
     pub hp: i32,
     pub max_hp: i32,
@@ -374,15 +378,21 @@ impl World {
                 Some(Activity::Attack { .. }) => "attacking",
                 Some(Activity::Harvest { .. }) => "harvesting",
             }.to_string();
-            let facing = actor.traits.iter().find_map(|t| {
-                if let TraitState::Mobile { facing, .. } = t { Some(*facing) } else { None }
-            }).unwrap_or(0);
+            let (facing, cx, cy) = actor.traits.iter().find_map(|t| {
+                if let TraitState::Mobile { facing, center_position, .. } = t {
+                    Some((*facing, center_position.x, center_position.y))
+                } else { None }
+            }).unwrap_or_else(|| {
+                // Buildings: use cell center
+                let cp = center_of_cell(x, y);
+                (0, cp.x, cp.y)
+            });
             let target_id = match &actor.activity {
                 Some(Activity::Attack { target_id, .. }) => Some(*target_id),
                 _ => None,
             };
             actors.push(ActorSnapshot {
-                id: actor.id, kind: actor.kind, owner, x, y,
+                id: actor.id, kind: actor.kind, owner, x, y, cx, cy,
                 actor_type: actor_type_str, hp, max_hp, activity, facing,
                 target_id, rank: actor.rank,
             });
@@ -737,10 +747,14 @@ impl World {
             }
         }
 
-        // Clear terrain footprint
+        // Clear terrain footprint using actual building size from rules
         if let Some((x, y)) = loc {
-            // Use a rough footprint clear — in full impl, building type would be stored
-            self.terrain.clear_footprint(x, y, 3, 3);
+            let (fw, fh) = self.actors.get(&actor_id)
+                .and_then(|a| a.actor_type.as_deref())
+                .and_then(|at| self.rules.actor(at))
+                .map(|s| s.footprint)
+                .unwrap_or((2, 2));
+            self.terrain.clear_footprint(x, y, fw, fh);
         }
 
         // Remove actor
@@ -835,6 +849,13 @@ impl World {
         };
         self.actors.insert(building_id, building);
         self.terrain.occupy_footprint(x, y, footprint_w, footprint_h, building_id);
+
+        // Remove completed building from production queue
+        if let Some(items) = self.production.get_mut(&owner_player_id) {
+            if let Some(idx) = items.iter().position(|i| i.item_name == building_type && i.is_done()) {
+                items.remove(idx);
+            }
+        }
 
         // Update power for the owning player
         let power = self.rules.actor(building_type).map(|s| s.power).unwrap_or(0);
@@ -1557,6 +1578,7 @@ impl World {
         }
         // Second pass: check range and fire
         let mut attacks: Vec<(u32, u32, i32)> = Vec::new();
+        let mut chase_targets: Vec<(u32, (i32, i32))> = Vec::new();
         for (attacker_id, target_id, damage, weapon_range) in ready_attackers {
             let attacker_loc = self.actors.get(&attacker_id).and_then(|a| a.location);
             let target_loc = self.actors.get(&target_id).and_then(|a| a.location);
@@ -1579,6 +1601,9 @@ impl World {
                             }
                         }
                     }
+                } else {
+                    // Out of range: chase the target
+                    chase_targets.push((attacker_id, tloc));
                 }
             }
         }
@@ -1603,6 +1628,39 @@ impl World {
             if let Some(dead) = self.actors.remove(&id) {
                 if let Some(loc) = dead.location {
                     self.terrain.clear_occupant(loc.0, loc.1);
+                }
+            }
+        }
+
+        // Chase targets: pathfind toward target when out of range, preserving attack state
+        for (attacker_id, target_loc) in chase_targets {
+            let from = match self.actors.get(&attacker_id).and_then(|a| a.location) {
+                Some(loc) => loc,
+                None => continue,
+            };
+            // Pathfind toward target
+            if let Some(path) = pathfinder::find_path(&self.terrain, from, target_loc, Some(attacker_id)) {
+                if path.len() > 1 {
+                    let _speed = self.actor_speed(attacker_id);
+                    // Save attack params, switch to Move, then restore Attack after move completes
+                    // For simplicity: just move one cell closer each tick by updating location directly
+                    let next_cell = path[1];
+                    if self.terrain.occupant(next_cell.0, next_cell.1) == 0 || self.terrain.occupant(next_cell.0, next_cell.1) == attacker_id {
+                        self.terrain.clear_occupant(from.0, from.1);
+                        self.terrain.set_occupant(next_cell.0, next_cell.1, attacker_id);
+                        if let Some(actor) = self.actors.get_mut(&attacker_id) {
+                            actor.location = Some(next_cell);
+                            // Update Mobile trait center_position
+                            for t in &mut actor.traits {
+                                if let TraitState::Mobile { center_position, from_cell, to_cell, .. } = t {
+                                    *center_position = center_of_cell(next_cell.0, next_cell.1);
+                                    *from_cell = CPos::new(next_cell.0, next_cell.1);
+                                    *to_cell = CPos::new(next_cell.0, next_cell.1);
+                                    break;
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1693,7 +1751,10 @@ impl World {
             }
             let cash = self.actors.get(&pid).map(|a| a.cash()).unwrap_or(0);
             if let Some(items) = self.production.get_mut(&pid) {
-                if let Some(item) = items.first_mut() {
+                // Find first item that isn't a completed building waiting for placement
+                let tick_idx = items.iter().position(|i| !i.is_done());
+                if let Some(idx) = tick_idx {
+                    let item = &mut items[idx];
                     let consumed = item.tick(cash);
                     if consumed > 0 {
                         if let Some(player) = self.actors.get_mut(&pid) {
@@ -1702,9 +1763,15 @@ impl World {
                     }
                     if item.is_done() {
                         let name = item.item_name.clone();
-                        items.remove(0);
-                        eprintln!("PRODUCTION: {} complete for player {}", name, pid);
-                        completed_items.push((pid, name));
+                        if self.rules.is_unit(&name) {
+                            // Units: remove from queue and spawn immediately
+                            items.remove(idx);
+                            eprintln!("PRODUCTION: unit {} complete for player {}", name, pid);
+                            completed_items.push((pid, name));
+                        } else {
+                            eprintln!("PRODUCTION: building {} ready to place for player {}", name, pid);
+                        }
+                        // Buildings stay in queue as "ready to place" until PlaceBuilding order
                     }
                 }
             }
@@ -2246,6 +2313,109 @@ fn build_mcv_traits(spawn_x: i32, spawn_y: i32, facing: i32) -> Vec<TraitState> 
     ]
 }
 
+/// Apply TEMPERAT tileset passability to terrain map.
+/// Marks Water and Rock (cliff) tiles as impassable based on template ID and tile index.
+fn apply_temperat_passability(
+    tiles: &[Vec<openra_data::oramap::TileReference>],
+    terrain: &mut TerrainMap,
+) {
+    if tiles.is_empty() {
+        return;
+    }
+
+    // Template IDs where ALL tiles are Water or Rock (fully impassable).
+    static FULLY_IMPASSABLE: &[u16] = &[
+        1, 2, 57, 58, 59, 61, 62, 63, 65, 66, 68, 69, 70, 73, 75, 76, 77, 79, 80,
+        82, 83, 84, 87, 88, 91, 92, 93, 94, 95, 96, 97, 98, 99, 103, 104, 105, 106,
+        109, 110, 135, 137, 138, 139, 141, 142, 143, 144, 145, 146, 149, 151, 152,
+        153, 155, 156, 158, 159, 160, 163, 164, 167, 168, 169, 170, 171, 172,
+        216, 217, 218, 219, 220, 221, 222, 223, 224, 226, 231, 232, 233, 234,
+        401, 402, 403, 404, 405, 406, 407, 408,
+        500, 502, 503, 504, 505, 506, 507, 508,
+        550, 551, 552, 553, 554, 555, 556, 557,
+    ];
+
+    // Template IDs where only specific tile indices are impassable.
+    // Format: (template_id, &[impassable_tile_indices])
+    static PARTIAL_IMPASSABLE: &[(u16, &[u8])] = &[
+        (3, &[3, 9, 10, 12, 13, 16]), (4, &[20, 21, 22]), (5, &[9, 10, 12]),
+        (6, &[6, 7, 8]), (7, &[1, 4, 5, 6]), (8, &[6, 7, 8]), (9, &[6, 7, 8]),
+        (11, &[2, 6, 7, 8]), (12, &[10, 13, 17, 22, 23, 24, 28, 29]),
+        (13, &[5, 8, 9, 18]), (14, &[6, 10, 14]), (15, &[0, 1, 13, 19, 20]),
+        (16, &[13]), (17, &[0, 1, 6, 12]), (18, &[0, 3, 6]),
+        (20, &[0, 1, 3, 6]), (21, &[1, 8, 12, 16]), (22, &[2, 5, 10, 15]),
+        (23, &[1, 5, 10]), (24, &[0, 6, 7, 14, 15, 16, 17, 22]),
+        (25, &[1, 2, 7, 8, 9, 14]), (26, &[1, 4, 5]),
+        (27, &[0, 1, 2, 3, 4, 6, 7]), (28, &[0, 1, 2]), (29, &[0, 1, 2]),
+        (30, &[1, 2, 4, 5]), (33, &[3, 4, 8, 9, 12, 13, 14, 20]),
+        (34, &[2, 3, 4, 5]), (35, &[1, 3]), (36, &[5, 15, 21, 26]),
+        (37, &[3, 11, 14]), (38, &[3, 6, 9, 10]), (39, &[2, 5, 8]),
+        (41, &[0, 2, 5, 8]), (42, &[2, 7, 12, 13, 19, 24]),
+        (43, &[1, 6, 10, 11, 15]), (44, &[2, 11]), (45, &[7, 8]),
+        (46, &[0, 3]), (47, &[0, 2, 3, 6]), (48, &[0]), (49, &[0, 4, 8]),
+        (50, &[0, 1]), (51, &[1, 2, 3, 4, 7, 8]), (52, &[3]), (54, &[8]),
+        (55, &[6]), (56, &[0]), (60, &[0, 2, 3, 4, 5]), (64, &[1, 2, 3, 4]),
+        (67, &[0, 1, 2, 4, 5]), (71, &[0, 1, 3, 4]), (72, &[0]),
+        (74, &[0, 2, 3, 5]), (78, &[2, 3, 4]), (81, &[0, 1, 3, 4, 5]),
+        (85, &[0, 1, 2, 4, 5]), (86, &[0, 1, 3]), (89, &[0, 2, 3]),
+        (90, &[0, 1, 2]), (112, &[0, 1, 5, 10, 11, 12, 13, 14, 16]),
+        (113, &[0, 1, 2, 10, 11, 12]), (114, &[0, 4, 5, 6, 8, 9, 15]),
+        (115, &[2, 6, 12, 13, 14]), (116, &[2, 3, 5, 6, 8]),
+        (117, &[0, 2, 3, 5]), (118, &[0, 1, 3, 4]), (119, &[0]), (121, &[2]),
+        (122, &[3]), (123, &[2, 3, 5, 8, 11]), (124, &[9, 11, 13]),
+        (125, &[0, 1, 2, 4, 5, 7, 8]), (126, &[0, 2, 3, 4, 5, 6, 8]),
+        (127, &[0, 1, 2, 4, 5]), (128, &[0, 1, 2]), (130, &[3]),
+        (131, &[1, 4, 5, 8, 9, 12]), (132, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 12]),
+        (133, &[0, 3, 5, 6, 9]), (134, &[0, 1, 2, 3, 5, 6, 7, 8, 9]),
+        (136, &[0, 2, 3, 4, 5]), (140, &[1, 2, 3, 4]),
+        (147, &[0, 1, 3, 4]), (148, &[0, 2]), (150, &[2, 3, 5]),
+        (154, &[1, 2, 3, 4]), (157, &[0, 1, 2, 3, 4]),
+        (161, &[0, 1, 4, 5]), (162, &[0, 1, 3]), (165, &[0, 2, 3]),
+        (166, &[0, 1]), (182, &[1]), (185, &[7, 10]), (186, &[4]),
+        (188, &[8]), (190, &[8]), (193, &[0]), (213, &[0]),
+        (229, &[0]), (230, &[0]),
+        (235, &[1, 4, 7, 10, 11]), (236, &[1, 4, 7, 10, 11]),
+        (237, &[1, 2, 4, 5, 6, 7, 9, 10, 11]),
+        (238, &[1, 5, 8, 9, 12, 13]), (239, &[1, 5, 8, 9, 12, 13]),
+        (240, &[1, 2, 5, 6, 7, 8, 9, 11, 12, 13]),
+        (241, &[0, 6, 7]), (242, &[0, 6, 7]), (243, &[0, 1, 5, 6, 7]),
+        (244, &[1]), (245, &[0, 1, 5, 6, 7]), (246, &[0, 1, 5, 6, 7]),
+        (378, &[1, 4, 5, 8, 9]), (379, &[0, 3, 5, 6, 9]),
+        (380, &[0, 9, 14]), (382, &[5, 18, 19]), (383, &[15, 16]),
+        (400, &[1, 2, 3, 4, 5, 8, 9]),
+        (522, &[1, 4]), (523, &[1, 3, 6]), (524, &[1, 3, 6]),
+        (525, &[1, 2, 3, 6]), (527, &[0, 2, 5, 7]), (528, &[0, 2, 5, 7]),
+        (529, &[0, 1, 2, 5, 6, 7]), (531, &[4, 5]), (532, &[4, 5]),
+    ];
+
+    for (row_idx, row) in tiles.iter().enumerate() {
+        let y = row_idx as i32;
+        for (col_idx, tile) in row.iter().enumerate() {
+            let x = col_idx as i32;
+            if !terrain.contains(x, y) {
+                continue;
+            }
+
+            let tid = tile.type_id;
+            let idx = tile.index;
+
+            // Check fully impassable templates
+            if FULLY_IMPASSABLE.binary_search(&tid).is_ok() {
+                terrain.set_cost(x, y, COST_IMPASSABLE);
+                continue;
+            }
+
+            // Check partially impassable templates
+            if let Ok(pos) = PARTIAL_IMPASSABLE.binary_search_by_key(&tid, |&(t, _)| t) {
+                let (_, indices) = PARTIAL_IMPASSABLE[pos];
+                if indices.contains(&idx) {
+                    terrain.set_cost(x, y, COST_IMPASSABLE);
+                }
+            }
+        }
+    }
+}
+
 /// Build a World from parsed map data, game seed, and lobby info.
 /// If `rules` is Some, uses the provided GameRules; otherwise uses hardcoded defaults.
 pub fn build_world(
@@ -2411,8 +2581,9 @@ pub fn build_world(
         next_id += 1;
     }
 
-    // Initialize terrain map and mark existing buildings/trees as occupied.
+    // Initialize terrain map and mark impassable tiles (Water, Rock/Cliffs).
     let mut terrain = TerrainMap::new(map.map_size.0, map.map_size.1);
+    apply_temperat_passability(&map.tiles, &mut terrain);
     for actor in actors.values() {
         if let Some((x, y)) = actor.location {
             match actor.kind {

@@ -673,6 +673,16 @@ canvas.addEventListener('click', e => {
     }
 });
 
+canvas.addEventListener('dblclick', e => {
+    if (mode !== 'game' || !lastSnapshot) return;
+    const rect = canvas.getBoundingClientRect();
+    const cell = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
+    const actor = actorAtCell(cell.x, cell.y, lastSnapshot);
+    if (actor && actor.owner === humanPlayerId && actor.kind === 'Mcv') {
+        session.order_deploy(actor.id);
+    }
+});
+
 canvas.addEventListener('contextmenu', e => {
     e.preventDefault();
     if (mode !== 'game' || !lastSnapshot) return;
@@ -1443,7 +1453,9 @@ function drawBuilding(a) {
 }
 
 function drawUnit(a) {
-    const sx = a.x * cellPx - camX, sy = a.y * cellPx - camY;
+    // Use sub-cell center_position for smooth interpolated movement (1024 world units = 1 cell)
+    const sx = (a.cx !== undefined ? a.cx * cellPx / 1024 : a.x * cellPx) - camX;
+    const sy = (a.cy !== undefined ? a.cy * cellPx / 1024 : a.y * cellPx) - camY;
     if (sx + cellPx*2 < 0 || sx - cellPx > canvas.width || sy + cellPx*2 < 0 || sy - cellPx > canvas.height) return;
 
     const scale = cellPx / CELL_PX;
@@ -1806,32 +1818,79 @@ function computeVisibility(snapshot) {
     computeVisibility._visible = visibleNow;
 }
 
+let _shroudCanvas = null;
+let _shroudCtx = null;
+
 function drawShroud() {
     const visibleNow = computeVisibility._visible;
     if (!visibleNow) return;
-    // Determine visible cell range on screen
+
+    const w = canvas.width, h = canvas.height;
+
+    // Use an offscreen canvas for the shroud mask so we don't destroy
+    // already-drawn terrain/units on the main canvas.
+    if (!_shroudCanvas || _shroudCanvas.width !== w || _shroudCanvas.height !== h) {
+        _shroudCanvas = document.createElement('canvas');
+        _shroudCanvas.width = w;
+        _shroudCanvas.height = h;
+        _shroudCtx = _shroudCanvas.getContext('2d');
+    }
+    const sctx = _shroudCtx;
+
+    // Fill offscreen shroud canvas with black (unexplored = black)
+    sctx.clearRect(0, 0, w, h);
+    sctx.fillStyle = '#000';
+    sctx.fillRect(0, 0, w, h);
+
+    // Cut out explored/visible areas with soft radial gradients
+    sctx.globalCompositeOperation = 'destination-out';
+
+    if (lastSnapshot) {
+        for (const a of lastSnapshot.actors) {
+            if (a.owner !== humanPlayerId) continue;
+            const range = SIGHT_RANGES[a.kind] || 5;
+            let ax = a.x, ay = a.y;
+            if (a.kind === 'Building') {
+                const fp = BUILDING_FOOTPRINTS[a.actor_type] || [2,2];
+                ax = a.x + fp[0] / 2;
+                ay = a.y + fp[1] / 2;
+            }
+            const sx = ax * cellPx - camX + cellPx/2;
+            const sy = ay * cellPx - camY + cellPx/2;
+            const radius = range * cellPx;
+
+            const grad = sctx.createRadialGradient(sx, sy, radius * 0.7, sx, sy, radius);
+            grad.addColorStop(0, 'rgba(0,0,0,1)');
+            grad.addColorStop(1, 'rgba(0,0,0,0)');
+            sctx.fillStyle = grad;
+            sctx.fillRect(sx - radius, sy - radius, radius * 2, radius * 2);
+        }
+    }
+
+    // Also cut out explored cells (previously seen areas get partial transparency)
     const startCX = Math.floor(camX / cellPx);
     const startCY = Math.floor(camY / cellPx);
-    const endCX = Math.ceil((camX + canvas.width) / cellPx);
-    const endCY = Math.ceil((camY + canvas.height) / cellPx);
+    const endCX = Math.ceil((camX + w) / cellPx);
+    const endCY = Math.ceil((camY + h) / cellPx);
     for (let cy = startCY; cy <= endCY; cy++) {
         for (let cx = startCX; cx <= endCX; cx++) {
             if (cx < 0 || cy < 0 || cx >= mapW || cy >= mapH) continue;
             const key = `${cx},${cy}`;
-            const px = cx * cellPx - camX;
-            const py = cy * cellPx - camY;
-            if (visibleNow.has(key)) continue; // Fully visible
+            if (visibleNow.has(key)) continue;
             if (exploredCells.has(key)) {
-                // Fog: explored but not currently visible
-                ctx.fillStyle = 'rgba(0,0,0,0.45)';
-                ctx.fillRect(px, py, cellPx, cellPx);
-            } else {
-                // Shroud: never explored
-                ctx.fillStyle = '#000';
-                ctx.fillRect(px, py, cellPx, cellPx);
+                const px = cx * cellPx - camX;
+                const py = cy * cellPx - camY;
+                // Partially cut out explored-but-not-visible cells (60% visible)
+                sctx.fillStyle = 'rgba(0,0,0,0.6)';
+                sctx.fillRect(px, py, cellPx, cellPx);
             }
         }
     }
+
+    sctx.globalCompositeOperation = 'source-over';
+
+    // Composite the shroud mask onto the main canvas
+    ctx.drawImage(_shroudCanvas, 0, 0);
 }
 
 // ── Minimap (drawn in sidebar canvas) ──
@@ -1943,3 +2002,13 @@ catch (e) { console.warn('Failed to load sound atlas:', e); }
 document.addEventListener('click', () => { audioManager.init(); }, { once: true });
 
 showScreen('home');
+
+// Expose key variables for integration testing (Playwright)
+Object.defineProperties(window, {
+    _ora: { get: () => ({
+        session, currentTick, camX, camY, cellPx, humanPlayerId, lastSnapshot, mode,
+        selectedUnits, placementMode, commandMode, controlGroups,
+        gamePaused, buildableItems, exploredCells: exploredCells.size,
+        activeEffects, buildAnims, sellAnims,
+    }) },
+});
