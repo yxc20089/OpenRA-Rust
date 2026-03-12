@@ -375,9 +375,14 @@ impl World {
                 if let (Some(subject_id), Some(item_name)) = (order.subject_id, &order.target_string) {
                     let cost = production_cost(item_name);
                     if cost > 0 {
-                        eprintln!("ORDER: StartProduction subject={} item={} cost={}", subject_id, item_name, cost);
-                        let item = ProductionItem::new(item_name, cost, 60);
-                        self.production.entry(subject_id).or_default().push(item);
+                        // Check tech tree prerequisites
+                        if !self.has_prerequisites(subject_id, item_name) {
+                            eprintln!("ORDER: StartProduction BLOCKED — missing prerequisites for {}", item_name);
+                        } else {
+                            eprintln!("ORDER: StartProduction subject={} item={} cost={}", subject_id, item_name, cost);
+                            let item = ProductionItem::new(item_name, cost, 60);
+                            self.production.entry(subject_id).or_default().push(item);
+                        }
                     }
                 }
             }
@@ -436,6 +441,17 @@ impl World {
                     }
                 }
             }
+            "Sell" => {
+                if let Some(subject_id) = order.subject_id {
+                    self.order_sell(subject_id);
+                }
+            }
+            "PowerDown" => {
+                // Toggle power on a building (not yet tracked per-building)
+            }
+            "RepairBuilding" => {
+                // Start repairing a building (simplified: instant repair not implemented yet)
+            }
             "StartGame" | "Command" => {}
             other => {
                 eprintln!("ORDER: unhandled '{}' subject={:?}", other, order.subject_id);
@@ -462,6 +478,44 @@ impl World {
                 }
             }
         }
+    }
+
+    /// Handle Sell order: refund 50% of building cost and remove it.
+    fn order_sell(&mut self, actor_id: u32) {
+        let (owner_id, loc, kind) = match self.actors.get(&actor_id) {
+            Some(a) => (a.owner_id, a.location, a.kind),
+            None => return,
+        };
+        if kind != ActorKind::Building { return; }
+
+        // Refund 50% of estimated cost
+        let refund = self.estimate_building_sell_value(actor_id);
+        if let Some(pid) = owner_id {
+            if let Some(player) = self.actors.get_mut(&pid) {
+                let cash = player.cash();
+                player.set_cash(cash + refund);
+            }
+        }
+
+        // Clear terrain footprint
+        if let Some((x, y)) = loc {
+            // Use a rough footprint clear — in full impl, building type would be stored
+            self.terrain.clear_footprint(x, y, 3, 3);
+        }
+
+        // Remove actor
+        self.actors.remove(&actor_id);
+        eprintln!("SELL: building {} refund={}", actor_id, refund);
+    }
+
+    /// Estimate sell value for a building (50% of build cost).
+    fn estimate_building_sell_value(&self, actor_id: u32) -> i32 {
+        if let Some(actor) = self.actors.get(&actor_id) {
+            if let Some(ref at) = actor.actor_type {
+                return production_cost(at) / 2;
+            }
+        }
+        500
     }
 
     /// Handle a Harvest order: send a harvester to harvest at a location.
@@ -517,6 +571,7 @@ impl World {
                 TraitState::RevealsShroud,
             ],
             activity: None,
+            actor_type: Some(building_type.to_string()),
         };
         self.actors.insert(building_id, building);
         self.terrain.occupy_footprint(x, y, footprint_w, footprint_h, building_id);
@@ -1167,6 +1222,7 @@ impl World {
                 TraitState::Health { hp },
             ],
             activity,
+            actor_type: Some(unit_type.to_string()),
         };
         self.actors.insert(unit_id, actor);
         eprintln!("SPAWN: {} id={} at ({},{}) owner={} speed={} hp={}",
@@ -1176,13 +1232,34 @@ impl World {
     /// Find a refinery (PROC) owned by a player.
     fn find_refinery(&self, owner_player_id: u32) -> Option<u32> {
         for actor in self.actors.values() {
-            if actor.owner_id == Some(owner_player_id) && actor.kind == ActorKind::Building {
-                // Check if this is a refinery by looking at its location
-                // (simplified — in full implementation, building type would be stored)
+            if actor.owner_id == Some(owner_player_id)
+                && actor.kind == ActorKind::Building
+                && actor.actor_type.as_deref() == Some("proc")
+            {
                 return Some(actor.id);
             }
         }
         None
+    }
+
+    /// Check if a player has the required prerequisite buildings for an item.
+    fn has_prerequisites(&self, owner_player_id: u32, item_name: &str) -> bool {
+        let prereqs = production_prerequisites(item_name);
+        if prereqs.is_empty() {
+            return true;
+        }
+        // Check that the player owns at least one of each prerequisite building type
+        for &prereq in prereqs {
+            let has_it = self.actors.values().any(|a| {
+                a.owner_id == Some(owner_player_id)
+                    && a.kind == ActorKind::Building
+                    && a.actor_type.as_deref() == Some(prereq)
+            });
+            if !has_it {
+                return false;
+            }
+        }
+        true
     }
 
     /// Find a spawn location near a production building for the given owner.
@@ -1195,18 +1272,16 @@ impl World {
             if actor.owner_id != Some(owner_player_id) { continue; }
             if actor.kind != ActorKind::Building { continue; }
 
-            if let Some((bx, by)) = actor.location {
-                // Check if this is the right production building
-                let is_right_building = if is_infantry {
-                    // TENT (allies) or BARR (soviet) produce infantry
-                    true // Simplified: any building can produce for now
-                } else {
-                    true // WEAP produces vehicles
-                };
+            let btype = actor.actor_type.as_deref().unwrap_or("");
+            let is_right_building = if is_infantry {
+                matches!(btype, "tent" | "barr")
+            } else {
+                matches!(btype, "weap" | "weap.ukraine" | "hpad" | "afld" | "spen" | "syrd")
+            };
 
-                if is_right_building {
-                    // Find an empty adjacent cell for spawning
-                    let (fw, fh) = (3, 2); // Approximate footprint
+            if is_right_building {
+                if let Some((bx, by)) = actor.location {
+                    let (fw, fh, _) = building_footprint(btype);
                     for dy in -1..=fh {
                         for dx in -1..=fw {
                             let sx = bx + dx;
@@ -1261,6 +1336,7 @@ impl World {
                 TraitState::ConyardChronoReturn,
             ],
             activity: None,
+            actor_type: Some("fact".to_string()),
         };
         self.actors.insert(fact_id, fact_actor);
 
@@ -1438,6 +1514,42 @@ fn production_cost(name: &str) -> i32 {
     }
 }
 
+/// Get required prerequisite buildings for a producible item.
+/// Returns a list of building type strings that must exist for the owner.
+fn production_prerequisites(name: &str) -> &'static [&'static str] {
+    match name {
+        // Infantry — need barracks/tent
+        "e1" | "e2" | "e3" | "e4" | "dog" => &[],  // Basic infantry, just need barracks
+        "e6" | "e7" | "shok" => &["stek"],           // Advanced soviet infantry
+        "medi" | "mech" => &["fix"],                  // Medic/mechanic need service depot
+        "spy" | "thf" => &["atek"],                   // Spy/thief need tech center
+        // Vehicles — need war factory
+        "1tnk" | "2tnk" | "apc" | "jeep" | "mnly" | "harv" | "mcv" => &[],  // Basic vehicles
+        "3tnk" | "4tnk" | "v2rl" => &["stek"],       // Advanced soviet vehicles
+        "arty" => &[],                                 // Artillery
+        "ttnk" => &["atek"],                          // Tesla tank needs tech
+        "ctnk" => &["atek"],                          // Chrono tank needs tech
+        // Buildings
+        "powr" | "apwr" => &[],                       // Power plants
+        "tent" | "barr" => &["powr"],                 // Barracks need power
+        "weap" | "weap.ukraine" => &["powr"],         // War factory needs power
+        "proc" => &["powr"],                          // Refinery needs power
+        "dome" => &["powr"],                          // Radar dome
+        "fix" => &["weap"],                           // Service depot needs factory
+        "atek" => &["dome"],                          // Allied tech needs radar
+        "stek" => &["dome"],                          // Soviet tech needs radar
+        "hpad" | "afld" => &["dome"],                 // Airfield needs radar
+        "spen" | "syrd" => &["weap"],                 // Naval yard needs factory
+        // Defenses
+        "pbox" | "hbox" => &[],                       // Basic defense
+        "gun" | "ftur" => &["powr"],                  // Gun turret
+        "tsla" => &["stek"],                          // Tesla coil needs tech
+        "agun" | "sam" => &["dome"],                  // AA needs radar
+        "gap" => &["atek"],                           // Gap generator needs tech
+        _ => &[],
+    }
+}
+
 /// Check if an item name is a unit (vs building).
 fn is_unit_type(name: &str) -> bool {
     matches!(name,
@@ -1605,6 +1717,7 @@ pub fn build_world(
         location: None,
         traits: vec![TraitState::DebugPauseState { paused: true }],
         activity: None,
+        actor_type: None,
     });
     next_id += 1;
 
@@ -1622,6 +1735,7 @@ pub fn build_world(
             location: None,
             traits: build_player_traits(lobby.starting_cash),
             activity: None,
+            actor_type: None,
         });
         player_actor_ids.push(id);
         next_id += 1;
@@ -1637,6 +1751,7 @@ pub fn build_world(
             location: None,
             traits: build_player_traits(lobby.starting_cash),
             activity: None,
+            actor_type: None,
         });
         player_actor_ids.push(id);
         next_id += 1;
@@ -1651,6 +1766,7 @@ pub fn build_world(
         location: None,
         traits: build_player_traits(lobby.starting_cash),
         activity: None,
+        actor_type: None,
     });
     player_actor_ids.push(next_id);
     next_id += 1;
@@ -1699,6 +1815,7 @@ pub fn build_world(
             location: Some(map_actor.location),
             traits: trait_list,
             activity: None,
+            actor_type: Some(map_actor.actor_type.clone()),
         });
     }
 
@@ -1723,6 +1840,7 @@ pub fn build_world(
             location: Some((spawn_x, spawn_y)),
             traits: build_mcv_traits(spawn_x, spawn_y, facing),
             activity: None,
+            actor_type: Some("mcv".to_string()),
         });
         next_id += 1;
     }

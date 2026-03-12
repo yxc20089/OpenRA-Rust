@@ -88,6 +88,9 @@ pub struct Actor {
     pub traits: Vec<TraitState>,
     /// Current activity (Turn, Move, Attack, etc.).
     pub activity: Option<Activity>,
+    /// Actor type name from rules (e.g., "fact", "2tnk", "e1").
+    /// Not synced — used for game logic lookups.
+    pub actor_type: Option<String>,
 }
 
 impl Actor {
