@@ -809,6 +809,14 @@ const CURSOR_PLACE = (() => {
     </svg>`;
     return `url("data:image/svg+xml,${encodeURIComponent(svg)}") 16 16, cell`;
 })();
+const CURSOR_DEPLOY = (() => {
+    const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32'>
+        <polygon points='6,16 16,6 26,16' fill='none' stroke='yellow' stroke-width='2'/>
+        <polygon points='6,16 16,26 26,16' fill='none' stroke='yellow' stroke-width='2'/>
+        <rect x='12' y='12' width='8' height='8' fill='yellow' opacity='0.6'/>
+    </svg>`;
+    return `url("data:image/svg+xml,${encodeURIComponent(svg)}") 16 16, pointer`;
+})();
 
 // ── Mouse input ──
 function updateCursor() {
@@ -819,7 +827,12 @@ function updateCursor() {
     const actor = actorAtCell(mouseCell.x, mouseCell.y, lastSnapshot);
     if (actor) {
         if (actor.owner === humanPlayerId) {
-            canvas.style.cursor = CURSOR_SELECT;
+            // Show deploy cursor on MCV
+            if (actor.kind === 'Mcv' && selectedUnits.includes(actor.id)) {
+                canvas.style.cursor = CURSOR_DEPLOY;
+            } else {
+                canvas.style.cursor = CURSOR_SELECT;
+            }
         } else if (actor.owner > 2 && selectedUnits.length > 0) {
             canvas.style.cursor = CURSOR_ATTACK;
         } else {
