@@ -29,12 +29,12 @@ def test_attack_order_changes_activity(game_page):
 
 def test_attack_reduces_hp(game_page):
     """Attacking an enemy should reduce its HP over time."""
-    pid, fact, tent, weap = deploy_and_build_base(game_page)
-    # Build a tank
-    order_start_production(game_page, "2tnk")
+    pid, fact, barr, weap = deploy_and_build_base(game_page)
+    # Build an APC (soviet player)
+    order_start_production(game_page, "apc")
     wait_ticks(game_page, 400)
     snap = get_snapshot(game_page)
-    tank = next((a for a in snap["actors"] if a["owner"] == pid and a["actor_type"] == "2tnk"), None)
+    tank = next((a for a in snap["actors"] if a["owner"] == pid and a["actor_type"] == "apc"), None)
     enemy = _get_enemy(snap, pid)
     if not tank or not enemy:
         return

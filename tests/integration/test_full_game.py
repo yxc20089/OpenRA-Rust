@@ -128,17 +128,17 @@ def test_full_game_session(game_page):
     proc = find_actor(snap, actor_type="proc", owner=pid)
     assert proc, "Refinery not placed"
 
-    # ── 9. Build barracks ──
-    order_start_production(page, "tent")
+    # ── 9. Build barracks (soviet player uses barr) ──
+    order_start_production(page, "barr")
     wait_ticks(page, 350)
     tx, ty = fact["x"] - 2, fact["y"] + 3
-    order_place_building(page, "tent", tx, ty)
+    order_place_building(page, "barr", tx, ty)
     wait_ticks(page, 5)
-    screenshot(page, "10_tent_placed")
+    screenshot(page, "10_barr_placed")
 
     snap = get_snapshot(page)
-    tent = find_actor(snap, actor_type="tent", owner=pid)
-    assert tent, "Barracks not placed"
+    barr = find_actor(snap, actor_type="barr", owner=pid)
+    assert barr, "Barracks not placed"
 
     # ── 10. Build war factory ──
     order_start_production(page, "weap")

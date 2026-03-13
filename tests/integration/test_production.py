@@ -25,14 +25,15 @@ def test_build_power_plant(game_page):
 
 
 def test_build_barracks_and_train_infantry(game_page):
-    """Should be able to build barracks, then train infantry."""
+    """Should be able to build barracks, then train infantry.
+    Player is soviet (slot 0), so uses barr (soviet barracks)."""
     page = game_page
     pid, fact = _deploy_mcv(page)
     assert fact, "FACT required"
 
     _build_and_place(page, pid, "powr", fact, offset_x=3, offset_y=0)
-    tent = _build_and_place(page, pid, "tent", fact, offset_x=-2, offset_y=0)
-    assert tent, "Barracks should exist"
+    barr = _build_and_place(page, pid, "barr", fact, offset_x=-2, offset_y=0)
+    assert barr, "Barracks should exist"
 
     order_start_production(page, "e1")
     wait_ticks(page, 350)
@@ -102,17 +103,18 @@ def test_unit_spawns_near_building(game_page):
 
 
 def test_vehicle_spawns_near_weap(game_page):
-    """Vehicle should spawn near war factory after training."""
-    pid, fact, tent, weap = deploy_and_build_base(game_page)
+    """Vehicle should spawn near war factory after training.
+    Player is soviet, so uses apc (available to soviet)."""
+    pid, fact, barr, weap = deploy_and_build_base(game_page)
     if not weap:
         return
-    order_start_production(game_page, "2tnk")
+    order_start_production(game_page, "apc")
     wait_ticks(game_page, 400)
     snap = get_snapshot(game_page)
-    tanks = find_actors(snap, actor_type="2tnk", owner=pid)
-    if len(tanks) > 0:
-        tank = tanks[-1]
-        dist = abs(tank["x"] - weap["x"]) + abs(tank["y"] - weap["y"])
+    apcs = find_actors(snap, actor_type="apc", owner=pid)
+    if len(apcs) > 0:
+        apc = apcs[-1]
+        dist = abs(apc["x"] - weap["x"]) + abs(apc["y"] - weap["y"])
         assert dist < 15, f"Vehicle should spawn near war factory, dist={dist}"
 
 
@@ -133,12 +135,61 @@ def test_train_multiple_units(game_page):
 def test_cannot_produce_without_prereq(game_page):
     """Trying to produce advanced unit without prerequisites should fail gracefully."""
     pid, fact = _deploy_mcv(game_page)
-    # Try to produce a tank without war factory — should be no-op
+    # Try to produce an APC without war factory — should be no-op
     snap_before = get_snapshot(game_page)
     cash_before = get_player(snap_before, pid)["cash"]
-    order_start_production(game_page, "2tnk")
+    order_start_production(game_page, "apc")
     wait_ticks(game_page, 5)
     snap_after = get_snapshot(game_page)
     cash_after = get_player(snap_after, pid)["cash"]
     # Cash should not change if production was rejected
     assert cash_after == cash_before, "Cash should not change without prerequisites"
+
+
+def test_production_items_after_deploy(game_page):
+    """After deploying MCV, production items should be available and faction-filtered."""
+    page = game_page
+    pid, fact = _deploy_mcv(page)
+    assert fact, "FACT required"
+
+    # Get production items via WASM API
+    ORA = "window._ora"
+    items_json = page.evaluate(f"JSON.parse({ORA}.session.all_production_items_json())")
+
+    # Should have at least POWR available (unlocked)
+    unlocked = [i for i in items_json if not i["locked"]]
+    locked = [i for i in items_json if i["locked"]]
+    unlocked_names = [i["name"] for i in unlocked]
+    all_names = [i["name"] for i in items_json]
+
+    print(f"Total items: {len(items_json)}, unlocked: {len(unlocked)}, locked: {len(locked)}")
+    print(f"Unlocked: {unlocked_names}")
+    print(f"All items: {all_names}")
+    # Debug: show details of unlocked items
+    for i in unlocked:
+        print(f"  UNLOCKED: {i['name']} cost={i['cost']} prereqs={i.get('prerequisites', [])} queue={i.get('queue_type', '?')}")
+
+    assert len(items_json) > 0, "Should have production items after deploying MCV"
+    assert "powr" in unlocked_names, f"POWR should be unlocked, got unlocked: {unlocked_names}"
+
+    # FACT should NOT appear (it has ~disabled prerequisite)
+    assert "fact" not in unlocked_names, "FACT should not be buildable (has ~disabled)"
+
+    # After building POWR, more buildings should unlock
+    order_start_production(page, "powr")
+    wait_ticks(page, 350)
+    # Place the power plant
+    from helpers import order_place_building
+    order_place_building(page, "powr", fact["x"] + 3, fact["y"])
+    wait_ticks(page, 10)
+
+    items_after_powr = page.evaluate(f"JSON.parse({ORA}.session.all_production_items_json())")
+    unlocked_after = [i for i in items_after_powr if not i["locked"]]
+    unlocked_names_after = [i["name"] for i in unlocked_after]
+    print(f"After POWR - unlocked: {unlocked_names_after}")
+
+    # Player is soviet (slot 0 = soviet). After POWR, BARR and PROC should unlock.
+    # TENT requires structures.allies so should NOT unlock for soviet player.
+    assert "proc" in unlocked_names_after, f"PROC should be unlocked after POWR, got: {unlocked_names_after}"
+    assert "barr" in unlocked_names_after, f"BARR should be unlocked for soviet, got: {unlocked_names_after}"
+    assert "tent" not in unlocked_names_after, f"TENT should NOT be unlocked for soviet player, got: {unlocked_names_after}"

@@ -224,9 +224,12 @@ def build_and_place(page, pid, building_type, fact, offset_x=3, offset_y=0):
 
 
 def deploy_and_build_base(page):
-    """Full base setup: deploy MCV, powr, tent, weap. Returns (pid, fact, tent, weap)."""
+    """Full base setup: deploy MCV, powr, barr, proc, weap. Returns (pid, fact, barr, weap).
+    Player is soviet (slot 0), so uses barr (soviet barracks).
+    WEAP requires proc in YAML rules, so we build proc first."""
     pid, fact = deploy_mcv(page)
     powr = build_and_place(page, pid, "powr", fact, offset_x=3, offset_y=0)
-    tent = build_and_place(page, pid, "tent", fact, offset_x=-2, offset_y=0)
-    weap = build_and_place(page, pid, "weap", fact, offset_x=0, offset_y=2)
-    return pid, fact, tent, weap
+    barr = build_and_place(page, pid, "barr", fact, offset_x=-2, offset_y=0)
+    proc = build_and_place(page, pid, "proc", fact, offset_x=0, offset_y=2)
+    weap = build_and_place(page, pid, "weap", fact, offset_x=-3, offset_y=2)
+    return pid, fact, barr, weap

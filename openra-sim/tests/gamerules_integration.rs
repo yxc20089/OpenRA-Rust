@@ -132,3 +132,56 @@ fn provides_prerequisites_parsed_from_yaml() {
     let powr_order = powr.build_palette_order;
     assert!(powr_order < 100, "POWR should have low build_palette_order, got {}", powr_order);
 }
+
+#[test]
+fn debug_faction_filtering() {
+    if !ra_mod_available() {
+        eprintln!("Skipping: vendor/OpenRA not found");
+        return;
+    }
+
+    let mod_dir = std::path::Path::new(RA_MOD_DIR);
+    let ruleset = openra_data::rules::load_ruleset(mod_dir).expect("load");
+    let rules = openra_sim::gamerules::GameRules::from_ruleset(&ruleset);
+
+    // Check what FACT provides
+    let fact = rules.actor("fact").expect("fact must exist");
+    eprintln!("FACT provides_prerequisites ({}):", fact.provides_prerequisites.len());
+    for pp in &fact.provides_prerequisites {
+        eprintln!("  prereq='{}' factions={:?} requires={:?}", pp.prerequisite, pp.factions, pp.requires_prerequisites);
+    }
+
+    // Check POWR prerequisites
+    let powr = rules.actor("powr").expect("powr must exist");
+    eprintln!("POWR prerequisites: {:?}", powr.prerequisites);
+    eprintln!("POWR build_palette_order: {}", powr.build_palette_order);
+
+    // Check what buildings are available (cost > 0, Building queue type)
+    let mut building_count = 0;
+    for (name, stats) in &rules.actors {
+        if stats.cost > 0 && stats.is_building && stats.footprint != (1, 1) {
+            building_count += 1;
+            eprintln!("Building '{}': cost={} prereqs={:?} palette_order={}", name, stats.cost, stats.prerequisites, stats.build_palette_order);
+        }
+    }
+    eprintln!("Total buildings with cost > 0: {}", building_count);
+
+    // Check if POWR prereqs would pass for a soviet player with just FACT
+    // Prerequisites: ~techlevel.infonly
+    eprintln!("\nPOWR prereq check (simulated):");
+    for prereq_raw in &powr.prerequisites {
+        let prereq = prereq_raw.trim_start_matches('~');
+        eprintln!("  prereq_raw='{}' → prereq='{}'", prereq_raw, prereq);
+        if prereq == "disabled" { eprintln!("    → DISABLED"); }
+        else if prereq.starts_with("techlevel.") { eprintln!("    → SKIP (techlevel)"); }
+        else if prereq.starts_with('!') { eprintln!("    → NEGATION check"); }
+        else { eprintln!("    → NORMAL check against player prereqs"); }
+    }
+    
+    // Check some units
+    let e1 = rules.actor("e1").expect("e1 must exist");
+    eprintln!("\nE1 prerequisites: {:?}", e1.prerequisites);
+    
+    let tank1 = rules.actor("1tnk").expect("1tnk must exist");
+    eprintln!("1TNK prerequisites: {:?}", tank1.prerequisites);
+}
