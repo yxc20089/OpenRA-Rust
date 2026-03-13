@@ -659,6 +659,7 @@ function refreshQueue(snapshot) {
 }
 
 function refreshSelection() {
+    updateCursor();
     if (selectedUnits.length === 0 || !lastSnapshot) { selSection.style.display = 'none'; return; }
     selSection.style.display = 'block';
     const actors = lastSnapshot.actors.filter(a => selectedUnits.includes(a.id));
