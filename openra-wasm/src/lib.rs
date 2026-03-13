@@ -396,6 +396,15 @@ impl GameSession {
         });
     }
 
+    pub fn order_cancel_production(&mut self, item_name: &str) {
+        self.pending_orders.push(GameOrder {
+            order_string: "CancelProduction".into(),
+            subject_id: Some(self.human_player_id),
+            target_string: Some(item_name.to_string()),
+            extra_data: None,
+        });
+    }
+
     pub fn order_place_building(&mut self, building_type: &str, x: i32, y: i32) {
         self.pending_orders.push(GameOrder {
             order_string: "PlaceBuilding".into(),

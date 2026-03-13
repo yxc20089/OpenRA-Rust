@@ -591,6 +591,19 @@ function renderBuildable() {
                 session.order_start_production(item.name);
             };
         }
+        // Right-click on production icon to cancel if in queue
+        btn.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const myPlayer = lastSnapshot?.players?.find(p => p.index === humanPlayerId);
+            if (myPlayer?.production_queue?.some(q => q.item_name === item.name)) {
+                session.order_cancel_production(item.name);
+                if (placementMode && placementMode.type === item.name) {
+                    placementMode = null; showMsg('');
+                }
+                refreshBuildable();
+            }
+        });
         // Tooltip on hover
         btn.addEventListener('mouseenter', ev => {
             const tip = document.getElementById('tooltip');
@@ -629,11 +642,21 @@ function refreshQueue(snapshot) {
         const div = document.createElement('div');
         div.style.cssText = 'font-size:10px;padding:1px 0;';
         div.textContent = `${item.item_name} ${pct}%`;
+        div.style.cursor = 'pointer';
+        // Right-click to cancel queue item
+        div.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            session.order_cancel_production(item.item_name);
+            if (placementMode && placementMode.type === item.item_name) {
+                placementMode = null; showMsg('');
+            }
+            refreshBuildable();
+        });
         if (item.done) {
             div.style.color = '#4a8a2a';
             const bi = buildableItems?.find(b => b.name === item.item_name && b.is_building);
             if (bi) {
-                div.style.cursor = 'pointer';
                 div.textContent += ' [PLACE]';
                 div.onclick = () => {
                     placementMode = { type: item.item_name, footprint: [bi.footprint[0], bi.footprint[1]] };

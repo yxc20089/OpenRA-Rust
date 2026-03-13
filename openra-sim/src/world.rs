@@ -628,6 +628,29 @@ impl World {
                     }
                 }
             }
+            "CancelProduction" => {
+                if let (Some(subject_id), Some(item_name)) = (order.subject_id, &order.target_string) {
+                    if let Some(queue) = self.production.get_mut(&subject_id) {
+                        // Remove the last matching item from the queue (LIFO cancel)
+                        if let Some(pos) = queue.iter().rposition(|q| q.item_name == *item_name) {
+                            let removed = queue.remove(pos);
+                            // Refund remaining cost
+                            let refund = removed.remaining_cost;
+                            if refund > 0 {
+                                if let Some(player) = self.actors.get_mut(&subject_id) {
+                                    for t in &mut player.traits {
+                                        if let TraitState::PlayerResources { cash, .. } = t {
+                                            *cash += refund;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            eprintln!("ORDER: CancelProduction {} refund={}", item_name, refund);
+                        }
+                    }
+                }
+            }
             "Move" => {
                 if let Some(subject_id) = order.subject_id {
                     if let Some(ref ts) = order.target_string {
@@ -2236,11 +2259,50 @@ impl World {
         items
     }
 
+    /// Determine which production queue type an item belongs to.
+    fn item_queue_type(stats: &crate::gamerules::ActorStats) -> PqType {
+        match stats.kind {
+            ActorKind::Infantry => PqType::Infantry,
+            ActorKind::Vehicle | ActorKind::Mcv => PqType::Vehicle,
+            ActorKind::Aircraft => PqType::Aircraft,
+            ActorKind::Ship => PqType::Ship,
+            ActorKind::Building => {
+                // Defense buildings: small footprint turrets/walls
+                let defense_names = ["tsla", "sam", "gap", "agun", "pbox", "hbox", "gun", "ftur"];
+                // We can't check name here, so use footprint size as heuristic
+                if stats.footprint == (1, 1) && stats.kind == ActorKind::Building {
+                    PqType::Defense
+                } else {
+                    PqType::Building
+                }
+            }
+            _ => PqType::Building,
+        }
+    }
+
+    /// Check if a production queue type is enabled for a player.
+    fn is_queue_enabled(&self, player_id: u32, pq: PqType) -> bool {
+        if let Some(player) = self.actors.get(&player_id) {
+            for t in &player.traits {
+                if let TraitState::ClassicProductionQueue { pq_type, enabled, .. } = t {
+                    if *pq_type == pq {
+                        return *enabled;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Return ALL production items (buildable + locked) for the player.
+    /// Only includes items whose production queue is enabled.
     pub fn all_production_items(&self, player_id: u32) -> Vec<BuildableInfo> {
         let mut items = Vec::new();
         for (name, stats) in &self.rules.actors {
             if stats.cost <= 0 { continue; }
+            // Only show items whose production queue is enabled for this player
+            let pq = Self::item_queue_type(stats);
+            if !self.is_queue_enabled(player_id, pq) { continue; }
             let locked = !self.has_prerequisites(player_id, name);
             items.push(BuildableInfo {
                 name: name.clone(),
