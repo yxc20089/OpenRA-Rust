@@ -771,6 +771,27 @@ function actorAtCell(cx, cy, snapshot) {
 }
 
 // ── Mouse input ──
+function updateCursor() {
+    if (mode !== 'game' || !lastSnapshot) { canvas.style.cursor = 'default'; return; }
+    if (placementMode) { canvas.style.cursor = 'cell'; return; }
+    if (commandMode === 'attack-move') { canvas.style.cursor = 'crosshair'; return; }
+    if (commandMode === 'move') { canvas.style.cursor = 'move'; return; }
+    const actor = actorAtCell(mouseCell.x, mouseCell.y, lastSnapshot);
+    if (actor) {
+        if (actor.owner === humanPlayerId) {
+            canvas.style.cursor = 'pointer';
+        } else if (actor.owner > 2 && selectedUnits.length > 0) {
+            canvas.style.cursor = 'crosshair'; // attack cursor
+        } else {
+            canvas.style.cursor = 'default';
+        }
+    } else if (selectedUnits.length > 0) {
+        // Has selected units, hovering ground = move cursor
+        canvas.style.cursor = 'move';
+    } else {
+        canvas.style.cursor = 'default';
+    }
+}
 canvas.addEventListener('mousemove', e => {
     const rect = canvas.getBoundingClientRect();
     mouseCell = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
@@ -780,6 +801,8 @@ canvas.addEventListener('mousemove', e => {
         if (lastSnapshot) render(lastSnapshot);
     }
     if (placementMode && lastSnapshot) render(lastSnapshot);
+    // Dynamic cursor based on context
+    updateCursor();
     // Tooltip
     updateTooltip(e.clientX, e.clientY);
 });
@@ -878,6 +901,7 @@ canvas.addEventListener('contextmenu', e => {
         }
     }
     if (commandMode) { commandMode = null; showMsg(''); }
+    updateCursor();
 });
 
 function handleGameClick(cell, shiftKey) {
@@ -899,6 +923,8 @@ function handleGameClick(cell, shiftKey) {
         }
     } else if (actor && actor.owner !== humanPlayerId && actor.owner > 2 && selectedUnits.length > 0) {
         for (const uid of selectedUnits) session.order_attack(uid, actor.id);
+        audioManager.playVoice('affirm1');
+        return; // don't clear selection after attacking
     } else { if (!shiftKey) selectedUnits = []; }
     refreshSelection();
 }
@@ -1006,15 +1032,18 @@ document.addEventListener('keydown', e => {
     if (e.key === 'a' || e.key === 'A') {
         commandMode = 'attack-move';
         showMsg('Attack Move — right-click target');
+        updateCursor();
     }
     if (e.key === 'm' || e.key === 'M') {
         commandMode = 'move';
         showMsg('Move — right-click destination');
+        updateCursor();
     }
     // Guard: G and D (OpenRA uses D for guard)
     if (e.key === 'g' || e.key === 'G') {
         commandMode = 'guard';
         showMsg('Guard — right-click friendly unit');
+        updateCursor();
     }
 
     // Scatter: Ctrl+X (OpenRA mapping)

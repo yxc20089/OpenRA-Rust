@@ -901,6 +901,8 @@ impl SpriteAtlas {
                             for &px in &f.pixels {
                                 if px == 0 {
                                     rgba.extend_from_slice(&[0, 0, 0, 0]); // transparent
+                                } else if px == 4 {
+                                    rgba.extend_from_slice(&[0, 0, 0, 128]); // shadow
                                 } else {
                                     let c = pal.rgba(px);
                                     rgba.extend_from_slice(&c);
