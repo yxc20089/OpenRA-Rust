@@ -760,6 +760,7 @@ canvas.addEventListener('mouseleave', () => {
 });
 
 canvas.addEventListener('click', e => {
+    if (dragJustCompleted) { dragJustCompleted = false; return; }
     if (!lastSnapshot) return;
     const rect = canvas.getBoundingClientRect();
     const cell = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
@@ -877,6 +878,7 @@ function handleGameClick(cell, shiftKey) {
 // Drag select
 let dragStart = null;
 let dragCurrent = null;
+let dragJustCompleted = false;
 canvas.addEventListener('mousedown', e => {
     if (e.button !== 0) return;
     const rect = canvas.getBoundingClientRect();
@@ -897,6 +899,7 @@ canvas.addEventListener('mouseup', e => {
             if (a.x >= c1.x && a.x <= c2.x && a.y >= c1.y && a.y <= c2.y) selectedUnits.push(a.id);
         }
         refreshSelection();
+        dragJustCompleted = true; // Prevent click handler from clearing selection
     }
     dragStart = null;
     dragCurrent = null;
