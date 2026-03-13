@@ -188,7 +188,7 @@ impl Bot {
         // Check what buildings we actually have placed
         self.survey_buildings(world);
 
-        // Build order: powr(300) → tent(400) → produce some units → weap(2000) if affordable
+        // Build order: powr → tent → proc → weap → then produce units
         if !self.has_power && cash >= 300 {
             self.queue_building(orders, "powr");
             return;
@@ -199,8 +199,17 @@ impl Bot {
             return;
         }
 
+        if self.has_power && !self.has_refinery && cash >= 1500 {
+            self.queue_building(orders, "proc");
+            return;
+        }
+
+        if self.has_refinery && !self.has_war_factory && cash >= 2000 {
+            self.queue_building(orders, "weap");
+            return;
+        }
+
         // Once we have barracks, switch to producing units
-        // We'll build weap later if we get more cash
         if self.has_power && self.has_barracks {
             self.state = BotState::Producing;
         }
@@ -226,9 +235,9 @@ impl Bot {
         // Re-survey buildings in case they were destroyed
         self.survey_buildings(world);
 
-        // Build war factory if we can afford it and don't have one
-        if !self.has_war_factory && cash >= 2000 {
-            if !world.player_ready_building(self.player_id).is_some() {
+        // Build war factory if we can afford it, have refinery prereq, and don't have one
+        if !self.has_war_factory && self.has_refinery && cash >= 2000 {
+            if world.player_ready_building(self.player_id).is_none() {
                 self.queue_building(orders, "weap");
                 return;
             }
@@ -273,6 +282,9 @@ impl Bot {
     }
 
     fn do_attack(&mut self, world: &World, orders: &mut Vec<GameOrder>) {
+        // Continue producing while attacking
+        self.do_produce_units_only(world, orders);
+
         // Find enemy actors to attack
         let enemies = world.find_enemy_actors(self.player_id);
         if enemies.is_empty() {
@@ -281,16 +293,19 @@ impl Bot {
             return;
         }
 
+        // Get combat units (exclude harvesters)
         let our_units: Vec<u32> = world.actor_ids_for_player(self.player_id)
             .into_iter()
             .filter(|&id| {
-                world.actor_kind(id).map(|k| {
+                let is_combat = world.actor_kind(id).map(|k| {
                     matches!(k, ActorKind::Infantry | ActorKind::Vehicle)
-                }).unwrap_or(false)
+                }).unwrap_or(false);
+                let is_harv = world.actor_type_name(id).map(|t| t == "harv").unwrap_or(false);
+                is_combat && !is_harv
             })
             .collect();
 
-        // First, move units toward enemy base
+        // Move units toward enemy base
         if let Some(enemy_loc) = world.find_enemy_location(self.player_id) {
             for &unit_id in &our_units {
                 // Check if unit is close to any enemy — if so, attack directly
@@ -299,7 +314,6 @@ impl Bot {
                 for &(enemy_id, enemy_x, enemy_y) in &enemies {
                     let dist = (unit_loc.0 - enemy_x).abs() + (unit_loc.1 - enemy_y).abs();
                     if dist <= 8 {
-                        // Close enough — attack this enemy
                         orders.push(GameOrder {
                             order_string: "Attack".to_string(),
                             subject_id: Some(unit_id),
@@ -311,7 +325,6 @@ impl Bot {
                     }
                 }
                 if !attacked {
-                    // Move toward enemy base
                     orders.push(GameOrder {
                         order_string: "Move".to_string(),
                         subject_id: Some(unit_id),
@@ -322,12 +335,11 @@ impl Bot {
             }
         }
 
-        // Check if our units are all idle (attack wave done)
+        // Check if our combat units are all idle (attack wave done)
         let all_idle = our_units.iter().all(|&id| {
             world.actor_activity(id).map(|a| a == "idle").unwrap_or(true)
         });
         if all_idle && !our_units.is_empty() {
-            // Attack wave complete, go back to producing
             self.units_produced = 0;
             let wave_increase = match self.difficulty {
                 Difficulty::Easy => 2,
@@ -337,6 +349,33 @@ impl Bot {
             self.attack_threshold += wave_increase;
             self.state = BotState::Producing;
         }
+    }
+
+    /// Produce units without state transitions (used during Attacking).
+    fn do_produce_units_only(&mut self, world: &World, orders: &mut Vec<GameOrder>) {
+        let cash = self.player_cash(world);
+        if world.player_has_pending_production(self.player_id) {
+            return;
+        }
+        self.survey_buildings(world);
+
+        let unit = if self.has_war_factory && cash >= 800 && self.units_produced % 3 == 0 {
+            "2tnk"
+        } else if self.has_barracks && cash >= 300 && self.units_produced % 2 == 1 {
+            "e3"
+        } else if self.has_barracks && cash >= 100 {
+            "e1"
+        } else {
+            return;
+        };
+
+        orders.push(GameOrder {
+            order_string: "StartProduction".to_string(),
+            subject_id: Some(self.player_id),
+            target_string: Some(unit.to_string()),
+            extra_data: None,
+        });
+        self.units_produced += 1;
     }
 
     fn player_cash(&self, world: &World) -> i32 {

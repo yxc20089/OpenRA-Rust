@@ -8,3 +8,6 @@ license.workspace = true
 [dependencies]
 bitflags = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+num-bigint = "0.4"
+num-traits = "0.2"
+num-integer = "0.1"

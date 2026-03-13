@@ -1,11 +1,13 @@
 //! MIX archive file reader.
 //!
 //! Parses MIX files from Red Alert / Tiberian Dawn.
-//! Supports unencrypted C&C and RA format MIX archives.
+//! Supports both encrypted and unencrypted C&C and RA format MIX archives.
 //!
 //! Reference: OpenRA.Mods.Cnc/FileSystem/MixFile.cs
 
 use std::collections::HashMap;
+
+use crate::blowfish;
 
 /// A parsed MIX archive.
 pub struct MixArchive {
@@ -22,19 +24,102 @@ struct MixEntry {
 
 impl MixArchive {
     /// Parse a MIX archive from raw bytes.
+    /// Supports both encrypted and unencrypted formats.
     pub fn parse(data: Vec<u8>) -> Result<Self, String> {
         if data.len() < 6 {
             return Err("MIX file too small".into());
         }
 
-        let (header_offset, _is_ra_format) = detect_format(&data);
+        let (format, is_encrypted) = detect_format(&data);
 
+        if is_encrypted {
+            return Self::parse_encrypted(data);
+        }
+
+        let header_offset = match format {
+            MixFormat::CnC => 0,
+            MixFormat::RA => 4,
+        };
+
+        Self::parse_header_at(&data, header_offset)
+            .map(|(entries, data_start)| MixArchive { data, entries, data_start })
+    }
+
+    /// Parse an encrypted RA-format MIX archive.
+    fn parse_encrypted(data: Vec<u8>) -> Result<Self, String> {
+        if data.len() < 84 + 8 {
+            return Err("Encrypted MIX file too small".into());
+        }
+
+        // Read the 80-byte RSA-encrypted key block at offset 4
+        let keyblock = &data[4..84];
+        let bf_key = blowfish::decrypt_mix_key(keyblock);
+        let fish = blowfish::Blowfish::new(&bf_key);
+
+        // Decrypt first block (8 bytes) to get num_files
+        let first_block = read_u32_block(&data, 84, 1);
+        let decrypted_first = fish.decrypt(&first_block);
+        let header_bytes: Vec<u8> = decrypted_first.iter()
+            .flat_map(|&w| w.to_le_bytes())
+            .collect();
+        let num_files = u16::from_le_bytes([header_bytes[0], header_bytes[1]]) as usize;
+
+        // Calculate how many 8-byte blocks we need for the full header
+        // Header = 2 (num_files) + 4 (data_size) + num_files * 12 (entries)
+        let header_bytes_needed = 6 + num_files * 12; // PackageEntry.Size = 12
+        let block_count = (header_bytes_needed + 7) / 8; // round up to block boundary
+
+        // Decrypt all header blocks
+        let all_blocks = read_u32_block(&data, 84, block_count);
+        let decrypted = fish.decrypt(&all_blocks);
+        let header_data: Vec<u8> = decrypted.iter()
+            .flat_map(|&w| w.to_le_bytes())
+            .collect();
+
+        // Parse entries from decrypted header
+        let _data_size = u32::from_le_bytes([
+            header_data[2], header_data[3], header_data[4], header_data[5],
+        ]);
+
+        let mut entries = HashMap::with_capacity(num_files);
+        for i in 0..num_files {
+            let base = 6 + i * 12;
+            if base + 12 > header_data.len() {
+                return Err("Encrypted MIX header truncated".into());
+            }
+            let hash = u32::from_le_bytes([
+                header_data[base], header_data[base + 1],
+                header_data[base + 2], header_data[base + 3],
+            ]);
+            let offset = u32::from_le_bytes([
+                header_data[base + 4], header_data[base + 5],
+                header_data[base + 6], header_data[base + 7],
+            ]);
+            let length = u32::from_le_bytes([
+                header_data[base + 8], header_data[base + 9],
+                header_data[base + 10], header_data[base + 11],
+            ]);
+            entries.insert(hash, MixEntry { offset, length });
+        }
+
+        // Data starts after: 4 (flags) + 80 (key block) + block_count * 8 (encrypted header)
+        let data_start = 4 + 80 + block_count * 8;
+
+        Ok(MixArchive {
+            data,
+            entries,
+            data_start,
+        })
+    }
+
+    /// Parse header at a given offset (for unencrypted MIX files).
+    fn parse_header_at(data: &[u8], header_offset: usize) -> Result<(HashMap<u32, MixEntry>, usize), String> {
         if header_offset + 6 > data.len() {
             return Err("MIX header offset out of bounds".into());
         }
 
-        let num_files = read_u16(&data, header_offset) as usize;
-        let _data_size = read_u32(&data, header_offset + 2);
+        let num_files = read_u16(data, header_offset) as usize;
+        let _data_size = read_u32(data, header_offset + 2);
 
         let entries_start = header_offset + 6;
         let entries_end = entries_start + num_files * 12;
@@ -51,17 +136,13 @@ impl MixArchive {
         let mut entries = HashMap::with_capacity(num_files);
         for i in 0..num_files {
             let base = entries_start + i * 12;
-            let hash = read_u32(&data, base);
-            let offset = read_u32(&data, base + 4);
-            let length = read_u32(&data, base + 8);
+            let hash = read_u32(data, base);
+            let offset = read_u32(data, base + 4);
+            let length = read_u32(data, base + 8);
             entries.insert(hash, MixEntry { offset, length });
         }
 
-        Ok(MixArchive {
-            data,
-            entries,
-            data_start,
-        })
+        Ok((entries, data_start))
     }
 
     /// Get a file by name from the archive.
@@ -112,24 +193,35 @@ impl MixArchive {
     }
 }
 
-/// Detect MIX format and return (header_offset, is_ra_format).
-fn detect_format(data: &[u8]) -> (usize, bool) {
+enum MixFormat {
+    CnC,
+    RA,
+}
+
+/// Detect MIX format and return (format, is_encrypted).
+fn detect_format(data: &[u8]) -> (MixFormat, bool) {
     let first = read_u16(data, 0);
     if first != 0 {
         // C&C format: no flags, header starts at 0
-        (0, false)
+        (MixFormat::CnC, false)
     } else {
         // RA format: flags at offset 2
         let flags = read_u16(data, 2);
-        if flags & 0x2 != 0 {
-            // Encrypted — skip 80-byte key block
-            // We don't support decryption, but the freeware content shouldn't be encrypted
-            (84, true)
-        } else {
-            // Unencrypted RA format
-            (4, true)
+        let is_encrypted = flags & 0x2 != 0;
+        (MixFormat::RA, is_encrypted)
+    }
+}
+
+/// Read `count` 8-byte blocks as u32 pairs from data at the given offset.
+fn read_u32_block(data: &[u8], offset: usize, count: usize) -> Vec<u32> {
+    let mut result = Vec::with_capacity(count * 2);
+    for i in 0..(count * 2) {
+        let pos = offset + i * 4;
+        if pos + 4 <= data.len() {
+            result.push(read_u32(data, pos));
         }
     }
+    result
 }
 
 /// Compute the Classic MIX hash for a filename.
@@ -341,6 +433,36 @@ mod tests {
         if let Ok(data) = std::fs::read(path) {
             let mix = MixArchive::parse(data).expect("Failed to parse temperat.mix");
             assert!(mix.len() > 0);
+        }
+    }
+
+    #[test]
+    fn parse_encrypted_hires_mix() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../vendor/ra-content/hires.mix"
+        );
+        if let Ok(data) = std::fs::read(path) {
+            let mix = MixArchive::parse(data).expect("Failed to parse encrypted hires.mix");
+            assert!(mix.len() > 0, "hires.mix should have entries");
+            // Infantry sprites should be in hires.mix
+            assert!(mix.contains("e1.shp"), "e1.shp should be in hires.mix");
+            assert!(mix.contains("e2.shp"), "e2.shp should be in hires.mix");
+            // Verify we can actually read the sprite data
+            let e1_data = mix.get("e1.shp").expect("e1.shp data should be readable");
+            assert!(e1_data.len() > 100, "e1.shp should have meaningful data");
+        }
+    }
+
+    #[test]
+    fn parse_encrypted_local_mix() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../vendor/ra-content/local.mix"
+        );
+        if let Ok(data) = std::fs::read(path) {
+            let mix = MixArchive::parse(data).expect("Failed to parse encrypted local.mix");
+            assert!(mix.len() > 0, "local.mix should have entries");
         }
     }
 }

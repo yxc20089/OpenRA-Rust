@@ -204,7 +204,12 @@ impl GameSession {
 
     /// Start a bot-vs-bot game (human observes).
     pub fn new_bot_vs_bot(map_index: u8, difficulty: u8) -> Result<GameSession, JsValue> {
-        Self::create(map_index, difficulty, true)
+        Self::create_n(map_index, difficulty, 2)
+    }
+
+    /// Start an N-player all-bot game (human observes).
+    pub fn new_bot_ffa(map_index: u8, difficulty: u8, num_players: u8) -> Result<GameSession, JsValue> {
+        Self::create_n(map_index, difficulty, num_players.max(2))
     }
 
     fn create(map_index: u8, difficulty: u8, bot_vs_bot: bool) -> Result<GameSession, JsValue> {
@@ -214,21 +219,61 @@ impl GameSession {
 
         let seed = (js_sys::Math::random() * 2_147_483_647.0) as i32;
 
+        let factions = ["soviet", "allies"];
+        let mut slots = Vec::new();
+        // Slot 0 = human (unless bot_vs_bot), slot 1 = bot
+        slots.push(SlotInfo {
+            player_reference: "Multi0".to_string(),
+            faction: factions[0].to_string(),
+            is_bot: bot_vs_bot,
+        });
+        slots.push(SlotInfo {
+            player_reference: "Multi1".to_string(),
+            faction: factions[1].to_string(),
+            is_bot: true,
+        });
+
         let lobby = LobbyInfo {
             starting_cash: 5000,
             allow_spectators: true,
-            occupied_slots: vec![
-                SlotInfo {
-                    player_reference: "Multi0".to_string(),
-                    faction: "soviet".to_string(),
-                    is_bot: bot_vs_bot,
-                },
-                SlotInfo {
-                    player_reference: "Multi1".to_string(),
-                    faction: "soviet".to_string(),
-                    is_bot: true,
-                },
-            ],
+            occupied_slots: slots,
+        };
+
+        let map_tiles_json = map_tiles_to_json(&map);
+        let world = world::build_world(&map, seed, &lobby, None, difficulty);
+        let player_ids = world.player_ids().to_vec();
+        let human_player_id = player_ids[player_ids.len() - 1 - 2]; // 2 slots
+
+        Ok(GameSession {
+            world,
+            human_player_id,
+            pending_orders: Vec::new(),
+            frame: 0,
+            map_tiles_json,
+        })
+    }
+
+    fn create_n(map_index: u8, difficulty: u8, num_players: u8) -> Result<GameSession, JsValue> {
+        let map_data = BUNDLED_MAPS.get(map_index as usize).unwrap_or(&BUNDLED_MAPS[0]).1;
+        let map = oramap::parse(map_data)
+            .map_err(|e| JsValue::from_str(&format!("Failed to parse map: {}", e)))?;
+
+        let seed = (js_sys::Math::random() * 2_147_483_647.0) as i32;
+
+        let factions = ["soviet", "allies"];
+        let mut slots = Vec::new();
+        for i in 0..num_players {
+            slots.push(SlotInfo {
+                player_reference: format!("Multi{}", i),
+                faction: factions[(i as usize) % 2].to_string(),
+                is_bot: true,
+            });
+        }
+
+        let lobby = LobbyInfo {
+            starting_cash: 5000,
+            allow_spectators: true,
+            occupied_slots: slots,
         };
 
         let map_tiles_json = map_tiles_to_json(&map);
@@ -548,6 +593,15 @@ const SPRITE_DATA: &[(&str, &[u8])] = &[
     ("turr", include_bytes!("../../vendor/extracted-sprites/turr.shp")),
     ("mgun", include_bytes!("../../vendor/extracted-sprites/mgun.shp")),
     ("ssam", include_bytes!("../../vendor/extracted-sprites/ssam.shp")),
+    // ── Infantry (extracted from hires.mix) ──
+    ("e1", include_bytes!("../../vendor/extracted-sprites/e1.shp")),
+    ("e2", include_bytes!("../../vendor/extracted-sprites/e2.shp")),
+    ("e3", include_bytes!("../../vendor/extracted-sprites/e3.shp")),
+    ("e4", include_bytes!("../../vendor/extracted-sprites/e4.shp")),
+    ("e7", include_bytes!("../../vendor/extracted-sprites/e7.shp")),
+    ("spy", include_bytes!("../../vendor/extracted-sprites/spy.shp")),
+    ("thf", include_bytes!("../../vendor/extracted-sprites/thf.shp")),
+    ("medi", include_bytes!("../../vendor/extracted-sprites/medi.shp")),
     // ── Infantry (bits/) ──
     ("e6", include_bytes!("../../vendor/OpenRA/mods/ra/bits/e6.shp")),
     ("zombie", include_bytes!("../../vendor/OpenRA/mods/ra/bits/zombie.shp")),
@@ -872,94 +926,6 @@ impl SpriteAtlas {
                 }).collect();
                 sprites.insert(sprite_name, frames);
             }
-        }
-
-        // Generate placeholder sprites for missing infantry
-        // Infantry need 8 standing frames (one per facing) + 48 walk frames (6 per facing)
-        let missing_infantry = ["e1", "e2", "e3", "e4", "e7", "spy", "thf", "shok", "medi", "mech"];
-        let inf_w: u16 = 50;
-        let inf_h: u16 = 39;
-        for name in &missing_infantry {
-            if sprites.contains_key(*name) { continue; }
-            let mut frames = Vec::new();
-            let total_frames = 56; // 8 standing + 48 walk (6 per facing)
-            for f in 0..total_frames {
-                let facing = f / 7; // 0-7 facings
-                let walk_frame = f % 7; // 0=standing, 1-6=walk cycle
-                let mut rgba = vec![0u8; inf_w as usize * inf_h as usize * 4];
-                // Draw a simple soldier silhouette
-                let cx = inf_w as i32 / 2;
-                let cy = inf_h as i32 / 2;
-                // Body color: use remap index 80 (will be recolored per player)
-                let body_color = pal.rgba(80);
-                let head_color = [200u8, 180, 140, 255]; // skin tone
-                let gun_color = [60u8, 60, 60, 255];
-                // Head (circle)
-                for dy in -4i32..=4 {
-                    for dx in -3i32..=3 {
-                        if dx*dx + dy*dy <= 12 {
-                            let px = (cx + dx) as usize;
-                            let py = (cy - 10 + dy) as usize;
-                            if px < inf_w as usize && py < inf_h as usize {
-                                let idx = (py * inf_w as usize + px) * 4;
-                                rgba[idx..idx+4].copy_from_slice(&head_color);
-                            }
-                        }
-                    }
-                }
-                // Body (rectangle)
-                for dy in -5i32..=5 {
-                    for dx in -4i32..=4 {
-                        let px = (cx + dx) as usize;
-                        let py = (cy + dy) as usize;
-                        if px < inf_w as usize && py < inf_h as usize {
-                            let idx = (py * inf_w as usize + px) * 4;
-                            rgba[idx..idx+4].copy_from_slice(&body_color);
-                        }
-                    }
-                }
-                // Legs (with walk animation offset)
-                let leg_offset = if walk_frame == 0 { 0 } else { ((walk_frame as i32 - 1) % 3) - 1 };
-                for dy in 6i32..=10 {
-                    // Left leg
-                    let lx = cx - 2 + leg_offset;
-                    let px = lx as usize;
-                    let py = (cy + dy) as usize;
-                    if px < inf_w as usize && py < inf_h as usize {
-                        let idx = (py * inf_w as usize + px) * 4;
-                        rgba[idx..idx+4].copy_from_slice(&body_color);
-                    }
-                    // Right leg
-                    let rx = cx + 2 - leg_offset;
-                    let px2 = rx as usize;
-                    if px2 < inf_w as usize && py < inf_h as usize {
-                        let idx = (py * inf_w as usize + px2) * 4;
-                        rgba[idx..idx+4].copy_from_slice(&body_color);
-                    }
-                }
-                // Gun (direction-dependent)
-                let (gx, gy): (i32, i32) = match facing {
-                    0 => (0, -6),   // N
-                    1 => (5, -4),   // NE
-                    2 => (6, 0),    // E
-                    3 => (5, 4),    // SE
-                    4 => (0, 6),    // S
-                    5 => (-5, 4),   // SW
-                    6 => (-6, 0),   // W
-                    _ => (-5, -4),  // NW
-                };
-                for i in 0..4 {
-                    let px = (cx + gx * i / 3) as usize;
-                    let py = (cy + gy * i / 3) as usize;
-                    if px < inf_w as usize && py < inf_h as usize {
-                        let idx = (py * inf_w as usize + px) * 4;
-                        rgba[idx..idx+4].copy_from_slice(&gun_color);
-                    }
-                }
-                let indexed = vec![80u8; inf_w as usize * inf_h as usize]; // remap color
-                frames.push(SpriteFrame { width: inf_w, height: inf_h, rgba, indexed });
-            }
-            sprites.insert(name.to_string(), frames);
         }
 
         Ok(SpriteAtlas { sprites })

@@ -298,6 +298,10 @@ impl World {
         self.actors.get(&actor_id).map(|a| a.kind)
     }
 
+    pub fn actor_type_name(&self, actor_id: u32) -> Option<&str> {
+        self.actors.get(&actor_id).and_then(|a| a.actor_type.as_deref())
+    }
+
     /// Get building types owned by a player.
     pub fn player_building_types(&self, player_id: u32) -> Vec<String> {
         self.actors.values()
@@ -906,6 +910,11 @@ impl World {
 
         // Enable production queues if this is a production building
         self.enable_production_queues(owner_player_id, building_type);
+
+        // Refinery auto-spawns a harvester (like OpenRA)
+        if building_type == "proc" {
+            self.spawn_unit("harv", owner_player_id);
+        }
 
         eprintln!("PLACE: {} at ({},{}) id={} footprint={}x{} power={}",
             building_type, x, y, building_id, footprint_w, footprint_h, power);
@@ -2048,6 +2057,8 @@ impl World {
             let btype = actor.actor_type.as_deref().unwrap_or("");
             let is_right_building = if is_infantry {
                 matches!(btype, "tent" | "barr")
+            } else if unit_type == "harv" {
+                matches!(btype, "proc" | "weap" | "weap.ukraine")
             } else {
                 matches!(btype, "weap" | "weap.ukraine" | "hpad" | "afld" | "spen" | "syrd")
             };

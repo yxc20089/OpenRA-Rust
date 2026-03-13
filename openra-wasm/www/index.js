@@ -411,6 +411,11 @@ async function startBotVsBot(mapIdx, diff) {
     await _initGame();
 }
 
+async function startBotFFA(mapIdx, diff, numPlayers) {
+    session = GameSession.new_bot_ffa(mapIdx, diff, numPlayers);
+    await _initGame();
+}
+
 async function _initGame() {
     mode = 'game'; humanPlayerId = session.human_player_id();
     selectedUnits = []; placementMode = null; playing = true;
@@ -479,11 +484,38 @@ function refreshBuildable() {
     renderBuildable();
 }
 
+// OpenRA-style build order for production panel sorting
+const BUILDING_ORDER = [
+    'powr','apwr','barr','tent','proc','weap','dome','fix','hpad','afld',
+    'sam','agun','gun','ftur','pbox','tsla','gap','iron','silo',
+    'atek','stek','kenn','hosp','bio','miss','pdox','fcom','spen','syrd',
+    'brik','sbag','fenc','cycl','barb'
+];
+const UNIT_ORDER = [
+    // Infantry
+    'e1','e2','e3','e4','e6','e7','spy','thf','medi','mech','shok',
+    // Vehicles
+    'mcv','harv','1tnk','2tnk','3tnk','4tnk','jeep','apc','arty','v2rl',
+    'mnly','mrj','mgg','stnk','ftrk','truk',
+    // Aircraft
+    'heli','hind','mig','yak','tran','badr','mh60',
+    // Naval
+    'ss','dd','ca','pt','lst'
+];
+
 function renderBuildable() {
     if (!buildableItems) return;
+    // Only show buildable (unlocked) items, matching OpenRA behavior
     const items = activeTab === 'buildings'
-        ? buildableItems.filter(i => i.is_building)
-        : buildableItems.filter(i => !i.is_building);
+        ? buildableItems.filter(i => i.is_building && !i.locked)
+        : buildableItems.filter(i => !i.is_building && !i.locked);
+    // Sort by predefined order
+    const order = activeTab === 'buildings' ? BUILDING_ORDER : UNIT_ORDER;
+    items.sort((a, b) => {
+        const ai = order.indexOf(a.name);
+        const bi = order.indexOf(b.name);
+        return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
+    });
     prodPanel.innerHTML = '';
     for (const item of items) {
         const btn = document.createElement('button');
@@ -2118,7 +2150,7 @@ Object.defineProperties(window, {
         selectedUnits, placementMode, commandMode, controlGroups,
         gamePaused, buildableItems, exploredCells: exploredCells.size,
         activeEffects, buildAnims, sellAnims,
-        startBotVsBot, render, updateHUD, centerCamera, GameSession, spriteInfo,
+        startBotVsBot, startBotFFA, render, updateHUD, centerCamera, GameSession, spriteInfo,
         setCam: (x, y) => { camX = x; camY = y; },
         setFog: (on) => { if (!on) humanPlayerId = null; },
     }) },

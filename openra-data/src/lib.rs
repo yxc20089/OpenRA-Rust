@@ -6,6 +6,7 @@
 //! - Palette files (color lookup tables)
 
 pub mod aud;
+pub mod blowfish;
 pub mod miniyaml;
 pub mod mix;
 pub mod oramap;
