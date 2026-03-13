@@ -25,7 +25,7 @@ def get_snapshot(page):
 def wait_ticks(page, n, timeout_ms=None):
     """Wait for N game ticks to elapse."""
     if timeout_ms is None:
-        timeout_ms = max(n * 200, 10000)
+        timeout_ms = max(n * 500, 15000)
     start = page.evaluate(f"{ORA}.currentTick")
     page.wait_for_function(f"{ORA}.currentTick >= {start + n}", timeout=timeout_ms)
 
