@@ -501,6 +501,33 @@ const INFANTRY_SEQUENCES = {
     shok: { runStart: 16, runLength: 6, shootStart: 64, shootLength: 8 },
 };
 
+// Cameo icon mapping: unit/building name → icon sprite name
+const CAMEO_ICONS = {
+    // Buildings
+    fact:'facticon', powr:'powricon', apwr:'apwricon', tent:'tenticon',
+    barr:'barricon', proc:'procicon', weap:'weapicon', dome:'domeicon',
+    fix:'fixicon', hpad:'hpadicon', afld:'afldicon', sam:'samicon',
+    agun:'agunicon', gun:'gunicon', ftur:'fturicon', tsla:'tslaicon',
+    pbox:'pboxicon', gap:'gapicon', iron:'ironicon', silo:'siloicon',
+    atek:'atekicon', stek:'stekicon', kenn:'kennicon', pdox:'pdoxicon',
+    spen:'spenicon', syrd:'syrdicon', hosp:'hospicon',
+    brik:'brikicon', sbag:'sbagicon', fenc:'fencicon',
+    // Vehicles
+    mcv:'mcvicon', harv:'harvicon', '1tnk':'1tnkicon', '2tnk':'2tnkicon',
+    '3tnk':'3tnkicon', '4tnk':'4tnkicon', v2rl:'v2rlicon', arty:'artyicon',
+    jeep:'jeepicon', apc:'apcicon', mnly:'mnlyicon', mrj:'mrjicon',
+    mgg:'mggicon', truk:'trukicon', stnk:'stnkicon', ftrk:'ftrkicon',
+    // Aircraft
+    mig:'migicon', yak:'yakicon', heli:'heliicon', hind:'hindicon',
+    tran:'tranicon', mh60:'mh60icon',
+    // Ships
+    ss:'ssicon', ca:'caicon', dd:'ddicon', pt:'pticon', lst:'lsticon',
+    // Infantry
+    e1:'e1icon', e2:'e2icon', e3:'e3icon', e4:'e4icon', e6:'e6icon',
+    e7:'e7icon', spy:'spyicon', thf:'thficon', medi:'mediicon',
+    dog:'dogicon',
+};
+
 // OpenRA-style build order for production panel sorting
 const BUILDING_ORDER = [
     'powr','apwr','barr','tent','proc','weap','dome','fix','hpad','afld',
@@ -537,9 +564,10 @@ function renderBuildable() {
     for (const item of items) {
         const btn = document.createElement('button');
         btn.className = 'prod-icon' + (item.locked ? ' locked' : '');
-        // Try to render sprite icon
-        const iconInfo = spriteInfo[item.name];
-        const iconFrames = spriteImages[item.name];
+        // Try to render cameo icon, fall back to unit sprite
+        const cameoName = CAMEO_ICONS[item.name];
+        const iconInfo = spriteInfo[cameoName] || spriteInfo[item.name];
+        const iconFrames = spriteImages[cameoName] || spriteImages[item.name];
         if (iconInfo && iconFrames && iconFrames[0]) {
             const iconCanvas = document.createElement('canvas');
             iconCanvas.width = 64; iconCanvas.height = 48;
