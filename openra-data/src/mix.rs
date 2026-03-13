@@ -93,6 +93,23 @@ impl MixArchive {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Get a file by its raw hash ID.
+    pub fn get_by_hash(&self, hash: u32) -> Option<&[u8]> {
+        let entry = self.entries.get(&hash)?;
+        let start = self.data_start + entry.offset as usize;
+        let end = start + entry.length as usize;
+        if end <= self.data.len() {
+            Some(&self.data[start..end])
+        } else {
+            None
+        }
+    }
+
+    /// Return all hash IDs in the archive.
+    pub fn hash_ids(&self) -> Vec<u32> {
+        self.entries.keys().copied().collect()
+    }
 }
 
 /// Detect MIX format and return (header_offset, is_ra_format).
