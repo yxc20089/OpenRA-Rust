@@ -586,7 +586,10 @@ function renderBuildable() {
         btn.appendChild(nameSpan);
         btn.appendChild(costSpan);
         if (!item.locked) {
-            btn.onclick = () => session.order_start_production(item.name);
+            btn.onclick = (e) => {
+                if (e.detail > 1) return; // ignore double/triple clicks
+                session.order_start_production(item.name);
+            };
         }
         // Tooltip on hover
         btn.addEventListener('mouseenter', ev => {
