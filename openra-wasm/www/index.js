@@ -770,24 +770,59 @@ function actorAtCell(cx, cy, snapshot) {
     return best;
 }
 
+// ── Custom cursor images (SVG data URIs) ──
+const CURSOR_ATTACK = (() => {
+    const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32'>
+        <circle cx='16' cy='16' r='10' fill='none' stroke='red' stroke-width='2'/>
+        <line x1='16' y1='2' x2='16' y2='10' stroke='red' stroke-width='2'/>
+        <line x1='16' y1='22' x2='16' y2='30' stroke='red' stroke-width='2'/>
+        <line x1='2' y1='16' x2='10' y2='16' stroke='red' stroke-width='2'/>
+        <line x1='22' y1='16' x2='30' y2='16' stroke='red' stroke-width='2'/>
+        <circle cx='16' cy='16' r='2' fill='red'/>
+    </svg>`;
+    return `url("data:image/svg+xml,${encodeURIComponent(svg)}") 16 16, crosshair`;
+})();
+const CURSOR_MOVE = (() => {
+    const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32'>
+        <polygon points='16,2 22,10 10,10' fill='lime' stroke='#040' stroke-width='1'/>
+        <polygon points='16,30 10,22 22,22' fill='lime' stroke='#040' stroke-width='1'/>
+        <polygon points='2,16 10,10 10,22' fill='lime' stroke='#040' stroke-width='1'/>
+        <polygon points='30,16 22,10 22,22' fill='lime' stroke='#040' stroke-width='1'/>
+    </svg>`;
+    return `url("data:image/svg+xml,${encodeURIComponent(svg)}") 16 16, move`;
+})();
+const CURSOR_SELECT = (() => {
+    const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32'>
+        <polygon points='4,4 4,18 10,13 15,22 18,20 13,12 19,8' fill='white' stroke='black' stroke-width='1'/>
+    </svg>`;
+    return `url("data:image/svg+xml,${encodeURIComponent(svg)}") 4 4, default`;
+})();
+const CURSOR_PLACE = (() => {
+    const svg = `<svg xmlns='http://www.w3.org/2000/svg' width='32' height='32'>
+        <rect x='4' y='4' width='24' height='24' fill='none' stroke='lime' stroke-width='2' stroke-dasharray='4,2'/>
+        <line x1='16' y1='8' x2='16' y2='24' stroke='lime' stroke-width='2'/>
+        <line x1='8' y1='16' x2='24' y2='16' stroke='lime' stroke-width='2'/>
+    </svg>`;
+    return `url("data:image/svg+xml,${encodeURIComponent(svg)}") 16 16, cell`;
+})();
+
 // ── Mouse input ──
 function updateCursor() {
     if (mode !== 'game' || !lastSnapshot) { canvas.style.cursor = 'default'; return; }
-    if (placementMode) { canvas.style.cursor = 'cell'; return; }
-    if (commandMode === 'attack-move') { canvas.style.cursor = 'crosshair'; return; }
-    if (commandMode === 'move') { canvas.style.cursor = 'move'; return; }
+    if (placementMode) { canvas.style.cursor = CURSOR_PLACE; return; }
+    if (commandMode === 'attack-move') { canvas.style.cursor = CURSOR_ATTACK; return; }
+    if (commandMode === 'move') { canvas.style.cursor = CURSOR_MOVE; return; }
     const actor = actorAtCell(mouseCell.x, mouseCell.y, lastSnapshot);
     if (actor) {
         if (actor.owner === humanPlayerId) {
-            canvas.style.cursor = 'pointer';
+            canvas.style.cursor = CURSOR_SELECT;
         } else if (actor.owner > 2 && selectedUnits.length > 0) {
-            canvas.style.cursor = 'crosshair'; // attack cursor
+            canvas.style.cursor = CURSOR_ATTACK;
         } else {
             canvas.style.cursor = 'default';
         }
     } else if (selectedUnits.length > 0) {
-        // Has selected units, hovering ground = move cursor
-        canvas.style.cursor = 'move';
+        canvas.style.cursor = CURSOR_MOVE;
     } else {
         canvas.style.cursor = 'default';
     }
@@ -866,8 +901,8 @@ canvas.addEventListener('contextmenu', e => {
     if (mode !== 'game' || !lastSnapshot) return;
     const rect = canvas.getBoundingClientRect();
     const cell = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
-    if (placementMode) { placementMode = null; showMsg(''); return; }
-    if (selectedUnits.length === 0) { commandMode = null; return; }
+    if (placementMode) { placementMode = null; showMsg(''); updateCursor(); return; }
+    if (selectedUnits.length === 0) { commandMode = null; updateCursor(); return; }
 
     const target = actorAtCell(cell.x, cell.y, lastSnapshot);
 
@@ -969,6 +1004,7 @@ document.addEventListener('keydown', e => {
         if (commandMode) { commandMode = null; showMsg(''); }
         else if (placementMode) { placementMode = null; showMsg(''); }
         else { selectedUnits = []; refreshSelection(); }
+        updateCursor();
         return;
     }
 
