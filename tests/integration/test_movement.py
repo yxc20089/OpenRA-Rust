@@ -75,7 +75,7 @@ def test_move_command_mode(game_page):
 
 
 def test_scatter_command(game_page):
-    """Pressing X with units selected should scatter them."""
+    """Pressing Ctrl+X with units selected should scatter them."""
     pid, fact = deploy_mcv(game_page)
     snap = get_snapshot(game_page)
     units = [a for a in snap["actors"] if a["owner"] == pid and a["kind"] in ("Vehicle", "Infantry")]
@@ -84,14 +84,14 @@ def test_scatter_command(game_page):
     # Select a unit
     u = units[0]
     click_cell(game_page, u["x"], u["y"])
-    game_page.keyboard.press("x")
+    game_page.keyboard.press("Control+x")
     wait_ticks(game_page, 5)
     snap = get_snapshot(game_page)
     scattered = find_actor(snap, id=u["id"])
     assert scattered, "Unit should still exist after scatter"
     # Unit should be moving or have moved
     assert scattered["activity"] == "moving" or scattered["x"] != u["x"] or scattered["y"] != u["y"], \
-        "Unit should scatter (move) after X"
+        "Unit should scatter (move) after Ctrl+X"
 
 
 def test_move_to_occupied_cell(game_page):

@@ -81,18 +81,18 @@ canvas { display: block; width: 100%; height: 100%; image-rendering: pixelated; 
 
 /* ── Right Sidebar (OpenRA style) ── */
 #sidebar {
-  width: 238px; background: #1a1a14; border-left: 2px solid #3a3a28;
+  width: 280px; background: #1a1a14; border-left: 2px solid #3a3a28;
   flex-shrink: 0; display: flex; flex-direction: column; overflow: hidden;
   order: 1;
 }
 
 /* Radar/Minimap area */
 #radar-area {
-  height: 232px; background: #0a0a08; padding: 5px 8px;
+  height: 272px; background: #0a0a08; padding: 5px 8px;
   border-bottom: 2px solid #3a3a28;
 }
 #minimap-canvas {
-  width: 222px; height: 222px; background: #000;
+  width: 264px; height: 264px; background: #000;
   image-rendering: pixelated;
 }
 
@@ -126,14 +126,16 @@ canvas { display: block; width: 100%; height: 100%; image-rendering: pixelated; 
   gap: 2px; align-content: start;
 }
 .prod-icon {
-  width: 100%; aspect-ratio: 62/46; background: #1a1a14; border: 1px solid #2a2a1e;
+  width: 100%; aspect-ratio: 64/48; background: #1a1a14; border: 1px solid #2a2a1e;
   cursor: pointer; display: flex; flex-direction: column; align-items: center;
-  justify-content: center; font-size: 9px; color: #888; position: relative;
+  justify-content: center; font-size: 10px; color: #888; position: relative;
   font-family: inherit;
 }
 .prod-icon:hover { border-color: #c8a830; background: #2a2a1e; }
-.prod-icon .name { font-size: 9px; color: #ccc; }
-.prod-icon .cost { font-size: 8px; color: #c8a830; }
+.prod-icon.locked { opacity: 0.4; filter: grayscale(0.7); cursor: default; }
+.prod-icon.locked:hover { border-color: #2a2a1e; background: #1a1a14; }
+.prod-icon .name { font-size: 10px; color: #ccc; }
+.prod-icon .cost { font-size: 9px; color: #c8a830; }
 .prod-icon.building-ready { border-color: #4a8a2a; }
 .prod-icon .progress-bar {
   position: absolute; bottom: 0; left: 0; height: 3px; background: #c84040;

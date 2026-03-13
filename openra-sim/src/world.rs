@@ -188,7 +188,7 @@ pub struct ProductionSnapshot {
     pub done: bool,
 }
 
-/// Info about an item the player can build.
+/// Info about an item the player can build (or is locked).
 #[derive(Debug, Serialize)]
 pub struct BuildableInfo {
     pub name: String,
@@ -197,6 +197,8 @@ pub struct BuildableInfo {
     pub is_building: bool,
     pub power: i32,
     pub footprint: (i32, i32),
+    pub locked: bool,
+    pub prerequisites: Vec<String>,
 }
 
 pub struct SyncHashDebug {
@@ -2186,6 +2188,28 @@ impl World {
                 is_building: stats.is_building,
                 power: stats.power,
                 footprint: stats.footprint,
+                locked: false,
+                prerequisites: stats.prerequisites.clone(),
+            });
+        }
+        items
+    }
+
+    /// Return ALL production items (buildable + locked) for the player.
+    pub fn all_production_items(&self, player_id: u32) -> Vec<BuildableInfo> {
+        let mut items = Vec::new();
+        for (name, stats) in &self.rules.actors {
+            if stats.cost <= 0 { continue; }
+            let locked = !self.has_prerequisites(player_id, name);
+            items.push(BuildableInfo {
+                name: name.clone(),
+                cost: stats.cost,
+                kind: stats.kind,
+                is_building: stats.is_building,
+                power: stats.power,
+                footprint: stats.footprint,
+                locked,
+                prerequisites: stats.prerequisites.clone(),
             });
         }
         items

@@ -475,7 +475,7 @@ document.querySelectorAll('.prod-tab').forEach(tab => {
 
 function refreshBuildable() {
     if (mode !== 'game') return;
-    try { buildableItems = JSON.parse(session.buildable_items_json()); } catch { buildableItems = []; }
+    try { buildableItems = JSON.parse(session.all_production_items_json()); } catch { buildableItems = []; }
     renderBuildable();
 }
 
@@ -487,18 +487,18 @@ function renderBuildable() {
     prodPanel.innerHTML = '';
     for (const item of items) {
         const btn = document.createElement('button');
-        btn.className = 'prod-icon';
+        btn.className = 'prod-icon' + (item.locked ? ' locked' : '');
         // Try to render sprite icon
         const iconInfo = spriteInfo[item.name];
         const iconFrames = spriteImages[item.name];
         if (iconInfo && iconFrames && iconFrames[0]) {
             const iconCanvas = document.createElement('canvas');
-            iconCanvas.width = 62; iconCanvas.height = 36;
+            iconCanvas.width = 64; iconCanvas.height = 48;
             const ictx = iconCanvas.getContext('2d');
             const aspect = iconInfo.width / iconInfo.height;
-            let iw = 62, ih = 36;
-            if (aspect > 62/36) { ih = Math.round(62 / aspect); } else { iw = Math.round(36 * aspect); }
-            ictx.drawImage(iconFrames[0], (62-iw)/2, (36-ih)/2, iw, ih);
+            let iw = 64, ih = 48;
+            if (aspect > 64/48) { ih = Math.round(64 / aspect); } else { iw = Math.round(48 * aspect); }
+            ictx.drawImage(iconFrames[0], (64-iw)/2, (48-ih)/2, iw, ih);
             iconCanvas.style.cssText = 'display:block;width:100%;image-rendering:pixelated;';
             btn.appendChild(iconCanvas);
         }
@@ -508,7 +508,31 @@ function renderBuildable() {
         costSpan.className = 'cost'; costSpan.textContent = `$${item.cost}`;
         btn.appendChild(nameSpan);
         btn.appendChild(costSpan);
-        btn.onclick = () => session.order_start_production(item.name);
+        if (!item.locked) {
+            btn.onclick = () => session.order_start_production(item.name);
+        }
+        // Tooltip on hover
+        btn.addEventListener('mouseenter', ev => {
+            const tip = document.getElementById('tooltip');
+            let html = `<span class="tt-name">${item.name}</span><br>$${item.cost}`;
+            if (item.power > 0) html += `<br><span style="color:#6a8a4a">+${item.power} power</span>`;
+            else if (item.power < 0) html += `<br><span style="color:#c84040">${item.power} power</span>`;
+            if (item.locked && item.prerequisites?.length) {
+                html += `<br><span style="color:#c84040">Requires: ${item.prerequisites.join(', ')}</span>`;
+            }
+            tip.innerHTML = html;
+            tip.style.display = 'block';
+            tip.style.left = (ev.clientX + 14) + 'px';
+            tip.style.top = (ev.clientY + 14) + 'px';
+        });
+        btn.addEventListener('mouseleave', () => {
+            document.getElementById('tooltip').style.display = 'none';
+        });
+        btn.addEventListener('mousemove', ev => {
+            const tip = document.getElementById('tooltip');
+            tip.style.left = (ev.clientX + 14) + 'px';
+            tip.style.top = (ev.clientY + 14) + 'px';
+        });
         prodPanel.appendChild(btn);
     }
     if (lastSnapshot) refreshQueue(lastSnapshot);
@@ -645,24 +669,39 @@ function updateTooltip(mx, my) {
 }
 
 function actorAtCell(cx, cy, snapshot) {
+    // Check buildings (exact footprint match)
     for (const a of snapshot.actors) {
         if (a.kind === 'Building') {
             const fp = BUILDING_FOOTPRINTS[a.actor_type] || [2,2];
             if (cx >= a.x && cx < a.x + fp[0] && cy >= a.y && cy < a.y + fp[1]) return a;
         }
     }
+    // Try exact cell match for units first
     for (const a of snapshot.actors) {
         if (a.kind !== 'Building' && a.kind !== 'Tree' && a.kind !== 'Mine') {
             if (a.x === cx && a.y === cy) return a;
         }
     }
-    return null;
+    // Fall back to adjacent cells (1-cell radius) for easier unit selection
+    let best = null, bestDist = 99;
+    for (const a of snapshot.actors) {
+        if (a.kind !== 'Building' && a.kind !== 'Tree' && a.kind !== 'Mine') {
+            const d = Math.abs(a.x - cx) + Math.abs(a.y - cy);
+            if (d <= 1 && d < bestDist) { best = a; bestDist = d; }
+        }
+    }
+    return best;
 }
 
 // ── Mouse input ──
 canvas.addEventListener('mousemove', e => {
     const rect = canvas.getBoundingClientRect();
     mouseCell = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
+    // Track drag for marquee visual
+    if (dragStart) {
+        dragCurrent = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+        if (lastSnapshot) render(lastSnapshot);
+    }
     if (placementMode && lastSnapshot) render(lastSnapshot);
     // Tooltip
     updateTooltip(e.clientX, e.clientY);
@@ -675,8 +714,25 @@ canvas.addEventListener('click', e => {
     if (!lastSnapshot) return;
     const rect = canvas.getBoundingClientRect();
     const cell = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
-    if (mode === 'game') handleGameClick(cell, e.shiftKey);
-    else if (mode === 'replay') {
+    if (mode === 'game') {
+        // Ctrl+click: force attack ground
+        if (e.ctrlKey && selectedUnits.length > 0) {
+            const target = actorAtCell(cell.x, cell.y, lastSnapshot);
+            if (target) {
+                for (const uid of selectedUnits) session.order_attack(uid, target.id);
+            } else {
+                // Attack-move to ground position
+                for (const uid of selectedUnits) session.order_attack_move(uid, cell.x, cell.y);
+            }
+            return;
+        }
+        // Alt+click: force move
+        if (e.altKey && selectedUnits.length > 0) {
+            for (const uid of selectedUnits) session.order_move(uid, cell.x, cell.y);
+            return;
+        }
+        handleGameClick(cell, e.shiftKey);
+    } else if (mode === 'replay') {
         const actor = actorAtCell(cell.x, cell.y, lastSnapshot);
         selectedUnits = actor ? [actor.id] : [];
         refreshSelection();
@@ -688,8 +744,19 @@ canvas.addEventListener('dblclick', e => {
     const rect = canvas.getBoundingClientRect();
     const cell = screenToWorld(e.clientX - rect.left, e.clientY - rect.top);
     const actor = actorAtCell(cell.x, cell.y, lastSnapshot);
-    if (actor && actor.owner === humanPlayerId && actor.kind === 'Mcv') {
+    if (!actor || actor.owner !== humanPlayerId) return;
+    if (actor.kind === 'Mcv') {
         session.order_deploy(actor.id);
+    } else if (actor.kind !== 'Building' && actor.kind !== 'Tree' && actor.kind !== 'Mine') {
+        // Double-click: select all visible units of same type
+        selectedUnits = lastSnapshot.actors
+            .filter(a => a.actor_type === actor.actor_type && a.owner === humanPlayerId)
+            .filter(a => {
+                const ax = a.x * cellPx - camX, ay = a.y * cellPx - camY;
+                return ax >= 0 && ax < canvas.width && ay >= 0 && ay < canvas.height;
+            })
+            .map(a => a.id);
+        refreshSelection();
     }
 });
 
@@ -760,13 +827,15 @@ function handleGameClick(cell, shiftKey) {
 
 // Drag select
 let dragStart = null;
+let dragCurrent = null;
 canvas.addEventListener('mousedown', e => {
     if (e.button !== 0) return;
     const rect = canvas.getBoundingClientRect();
     dragStart = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    dragCurrent = null;
 });
 canvas.addEventListener('mouseup', e => {
-    if (e.button !== 0 || !dragStart || !lastSnapshot || mode !== 'game') { dragStart = null; return; }
+    if (e.button !== 0 || !dragStart || !lastSnapshot || mode !== 'game') { dragStart = null; dragCurrent = null; return; }
     const rect = canvas.getBoundingClientRect();
     const end = { x: e.clientX - rect.left, y: e.clientY - rect.top };
     if (Math.abs(end.x - dragStart.x) > 10 || Math.abs(end.y - dragStart.y) > 10) {
@@ -781,6 +850,8 @@ canvas.addEventListener('mouseup', e => {
         refreshSelection();
     }
     dragStart = null;
+    dragCurrent = null;
+    if (lastSnapshot) render(lastSnapshot);
 });
 
 // ── Keyboard ──
@@ -837,12 +908,18 @@ document.addEventListener('keydown', e => {
     if (e.key === 's' || e.key === 'S') {
         for (const uid of selectedUnits) session.order_stop(uid);
     }
-    if (e.key === 'd' || e.key === 'D') {
+    // Deploy: F (OpenRA) and D (legacy)
+    if (e.key === 'f' || e.key === 'F' || e.key === 'd' || e.key === 'D') {
         if (!lastSnapshot) return;
         for (const uid of selectedUnits) {
             const a = lastSnapshot.actors.find(a => a.id === uid);
             if (a && a.kind === 'Mcv') session.order_deploy(uid);
         }
+    }
+
+    // Sell: Z
+    if (e.key === 'z' || e.key === 'Z') {
+        for (const uid of selectedUnits) session.order_sell(uid);
     }
 
     // Command modes
@@ -854,19 +931,56 @@ document.addEventListener('keydown', e => {
         commandMode = 'move';
         showMsg('Move — right-click destination');
     }
+    // Guard: G and D (OpenRA uses D for guard)
     if (e.key === 'g' || e.key === 'G') {
         commandMode = 'guard';
         showMsg('Guard — right-click friendly unit');
     }
 
-    // Scatter: move each selected unit to random adjacent cell
-    if (e.key === 'x' || e.key === 'X') {
+    // Scatter: Ctrl+X (OpenRA mapping)
+    if ((e.key === 'x' || e.key === 'X') && e.ctrlKey) {
+        e.preventDefault();
         for (const uid of selectedUnits) {
             const dx = Math.floor(Math.random() * 3) - 1;
             const dy = Math.floor(Math.random() * 3) - 1;
             const a = lastSnapshot?.actors.find(a => a.id === uid);
             if (a) session.order_move(uid, a.x + dx, a.y + dy);
         }
+    }
+
+    // Select all units: Q
+    if (e.key === 'q' || e.key === 'Q') {
+        if (!lastSnapshot) return;
+        selectedUnits = lastSnapshot.actors
+            .filter(a => a.owner === humanPlayerId && a.kind !== 'Building' && a.kind !== 'Tree' && a.kind !== 'Mine')
+            .map(a => a.id);
+        refreshSelection();
+    }
+
+    // Select all of same type: W
+    if (e.key === 'w' || e.key === 'W') {
+        if (!lastSnapshot || selectedUnits.length === 0) return;
+        const selActor = lastSnapshot.actors.find(a => a.id === selectedUnits[0]);
+        if (selActor) {
+            selectedUnits = lastSnapshot.actors
+                .filter(a => a.actor_type === selActor.actor_type && a.owner === humanPlayerId)
+                .map(a => a.id);
+            refreshSelection();
+        }
+    }
+
+    // Cycle harvesters: N
+    if (e.key === 'n' || e.key === 'N') {
+        if (!lastSnapshot) return;
+        const harvs = lastSnapshot.actors.filter(a => a.owner === humanPlayerId && a.actor_type === 'harv');
+        if (harvs.length === 0) return;
+        const curId = selectedUnits[0] || 0;
+        const curIdx = harvs.findIndex(a => a.id === curId);
+        const next = harvs[(curIdx + 1) % harvs.length];
+        selectedUnits = [next.id];
+        camX = next.x * cellPx - canvas.width / 2;
+        camY = next.y * cellPx - canvas.height / 2;
+        refreshSelection();
     }
 
     // Tab: cycle to next owned unit not in viewport
@@ -1098,6 +1212,20 @@ function render(snapshot) {
         }
     }
 
+    // Drag selection marquee
+    if (dragStart && dragCurrent) {
+        const dx = Math.min(dragStart.x, dragCurrent.x);
+        const dy = Math.min(dragStart.y, dragCurrent.y);
+        const dw = Math.abs(dragCurrent.x - dragStart.x);
+        const dh = Math.abs(dragCurrent.y - dragStart.y);
+        if (dw > 5 || dh > 5) {
+            ctx.strokeStyle = '#fff'; ctx.lineWidth = 1;
+            ctx.strokeRect(dx, dy, dw, dh);
+            ctx.fillStyle = 'rgba(255,255,255,0.1)';
+            ctx.fillRect(dx, dy, dw, dh);
+        }
+    }
+
     // Placement ghost
     if (placementMode && mouseCell.x >= 0) drawPlacementGhost();
 
@@ -1207,7 +1335,7 @@ function updateAnimations(snapshot) {
     // Clean up finished build anims
     for (const [id, anim] of Object.entries(buildAnims)) {
         const elapsed = currentTick - anim.startTick;
-        if (elapsed >= anim.totalFrames) {
+        if (elapsed >= anim.totalFrames * 3) {
             // "Construction complete" voice when own building finishes
             if (anim.owner === humanPlayerId) {
                 audioManager.playVoice('conscmp1');
@@ -1338,13 +1466,19 @@ function drawBuilding(a) {
     const centerX = sx + bw / 2;
     const centerY = sy + bh / 2;
 
+    // Building shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.15)';
+    ctx.fillRect(sx + 2, sy + 2, bw, bh);
+
     // Check for active construction animation
     const buildAnim = buildAnims[a.id];
     if (buildAnim) {
         const elapsed = currentTick - buildAnim.startTick;
         const makeInfo = spriteInfo[buildAnim.sprite];
         if (makeInfo && spriteImages[buildAnim.sprite]) {
-            const frame = Math.min(elapsed, makeInfo.frames - 1);
+            // Scale elapsed ticks to frame count proportionally over build duration
+            const buildDuration = buildAnim.totalFrames * 3; // spread animation over longer period
+            const frame = Math.min(Math.floor(elapsed * makeInfo.frames / buildDuration), makeInfo.frames - 1);
             const drawW = makeInfo.width * scale;
             const drawH = makeInfo.height * scale;
             const dx = centerX - drawW / 2;

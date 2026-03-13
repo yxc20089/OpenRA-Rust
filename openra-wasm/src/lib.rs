@@ -281,6 +281,12 @@ impl GameSession {
         serde_json::to_string(&items).unwrap_or_default()
     }
 
+    /// Get ALL production items (buildable + locked) for the human player as JSON.
+    pub fn all_production_items_json(&self) -> String {
+        let items = self.world.all_production_items(self.human_player_id);
+        serde_json::to_string(&items).unwrap_or_default()
+    }
+
     /// Check if building can be placed at (x, y).
     pub fn can_place_building(&self, building_type: &str, x: i32, y: i32) -> bool {
         self.world.can_place_building(self.human_player_id, building_type, x, y)

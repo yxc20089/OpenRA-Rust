@@ -233,25 +233,36 @@ impl GameRules {
         actor!("ca", ActorKind::Ship, 100000, 0, 2000, 0, 1, 1, false);
         actor!("pt", ActorKind::Ship, 100000, 0, 700, 0, 1, 1, false);
 
-        // Set prerequisites for units and buildings
+        // Set prerequisites for units and buildings (matching OpenRA rules)
         // Infantry require barracks (tent/barr)
         for name in &["e1", "e2", "e3", "e4", "e6", "e7", "shok", "medi", "mech", "dog", "spy", "thf"] {
             if let Some(a) = actors.get_mut(*name) {
                 a.prerequisites = vec!["tent".to_string()];
             }
         }
-        // Vehicles require war factory (weap)
-        for name in &["1tnk", "2tnk", "3tnk", "4tnk", "v2rl", "arty", "apc", "jeep", "mnly", "ttnk", "ctnk"] {
+        // Basic vehicles require war factory (weap)
+        for name in &["1tnk", "2tnk", "apc", "jeep", "mnly", "harv"] {
             if let Some(a) = actors.get_mut(*name) {
                 a.prerequisites = vec!["weap".to_string()];
             }
         }
-        // Buildings prerequisites
-        if let Some(a) = actors.get_mut("weap") { a.prerequisites = vec!["powr".to_string()]; }
+        // Heavy/advanced vehicles require weap + dome (radar dome)
+        for name in &["3tnk", "4tnk", "v2rl", "arty", "ttnk", "ctnk"] {
+            if let Some(a) = actors.get_mut(*name) {
+                a.prerequisites = vec!["weap".to_string(), "dome".to_string()];
+            }
+        }
+        // Buildings prerequisites (matching OpenRA)
+        if let Some(a) = actors.get_mut("tent") { a.prerequisites = vec!["powr".to_string()]; }
+        if let Some(a) = actors.get_mut("barr") { a.prerequisites = vec!["powr".to_string()]; }
+        if let Some(a) = actors.get_mut("weap") { a.prerequisites = vec!["proc".to_string()]; }
         if let Some(a) = actors.get_mut("proc") { a.prerequisites = vec!["powr".to_string()]; }
-        if let Some(a) = actors.get_mut("dome") { a.prerequisites = vec!["powr".to_string()]; }
-        if let Some(a) = actors.get_mut("atek") { a.prerequisites = vec!["dome".to_string()]; }
-        if let Some(a) = actors.get_mut("stek") { a.prerequisites = vec!["dome".to_string()]; }
+        if let Some(a) = actors.get_mut("dome") { a.prerequisites = vec!["proc".to_string()]; }
+        if let Some(a) = actors.get_mut("fix") { a.prerequisites = vec!["weap".to_string()]; }
+        if let Some(a) = actors.get_mut("hpad") { a.prerequisites = vec!["dome".to_string()]; }
+        if let Some(a) = actors.get_mut("afld") { a.prerequisites = vec!["dome".to_string()]; }
+        if let Some(a) = actors.get_mut("atek") { a.prerequisites = vec!["weap".to_string(), "dome".to_string()]; }
+        if let Some(a) = actors.get_mut("stek") { a.prerequisites = vec!["weap".to_string(), "dome".to_string()]; }
 
         // Default weapon
         weapons.insert("default".to_string(), WeaponStats {
