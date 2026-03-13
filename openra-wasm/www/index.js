@@ -488,17 +488,17 @@ function refreshBuildable() {
 // stand is always frames 0-7 (one per facing)
 // run: Start=runStart, Length=runLength, Facings=8
 const INFANTRY_SEQUENCES = {
-    e1:   { runStart: 16, runLength: 6 },
-    e2:   { runStart: 16, runLength: 6 },
-    e3:   { runStart: 16, runLength: 6 },
-    e4:   { runStart: 16, runLength: 6 },
+    e1:   { runStart: 16, runLength: 6, shootStart: 64, shootLength: 8 },
+    e2:   { runStart: 16, runLength: 6, shootStart: 64, shootLength: 20 },
+    e3:   { runStart: 16, runLength: 6, shootStart: 64, shootLength: 8 },
+    e4:   { runStart: 16, runLength: 6, shootStart: 64, shootLength: 16 },
     e6:   { runStart: 16, runLength: 6 },
     e7:   { runStart:  8, runLength: 6 },
-    spy:  { runStart: 16, runLength: 6 },
+    spy:  { runStart: 16, runLength: 6, shootStart: 64, shootLength: 8 },
     thf:  { runStart:  8, runLength: 6 },
     medi: { runStart:  8, runLength: 6 },
     mech: { runStart:  8, runLength: 6 },
-    shok: { runStart: 16, runLength: 6 },
+    shok: { runStart: 16, runLength: 6, shootStart: 64, shootLength: 8 },
 };
 
 // OpenRA-style build order for production panel sorting
@@ -1387,7 +1387,7 @@ function updateAnimations(snapshot) {
     // Clean up finished build anims
     for (const [id, anim] of Object.entries(buildAnims)) {
         const elapsed = currentTick - anim.startTick;
-        if (elapsed >= anim.totalFrames * 3) {
+        if (elapsed >= anim.totalFrames) {
             // "Construction complete" voice when own building finishes
             if (anim.owner === humanPlayerId) {
                 audioManager.playVoice('conscmp1');
@@ -1528,9 +1528,8 @@ function drawBuilding(a) {
         const elapsed = currentTick - buildAnim.startTick;
         const makeInfo = spriteInfo[buildAnim.sprite];
         if (makeInfo && spriteImages[buildAnim.sprite]) {
-            // Scale elapsed ticks to frame count proportionally over build duration
-            const buildDuration = buildAnim.totalFrames * 3; // spread animation over longer period
-            const frame = Math.min(Math.floor(elapsed * makeInfo.frames / buildDuration), makeInfo.frames - 1);
+            // Play make animation at 1 frame per tick (matching OpenRA Tick: 40 at 25fps)
+            const frame = Math.min(elapsed, makeInfo.frames - 1);
             const drawW = makeInfo.width * scale;
             const drawH = makeInfo.height * scale;
             const dx = centerX - drawW / 2;
@@ -1689,7 +1688,9 @@ function drawUnit(a) {
                 // Use OpenRA sequence offsets for infantry animations
                 const seq = INFANTRY_SEQUENCES[a.actor_type];
                 if (seq && info.frames > seq.runStart) {
-                    if (a.activity === 'moving') {
+                    if (a.activity === 'attacking' && seq.shootStart !== undefined && info.frames > seq.shootStart) {
+                        frame = seq.shootStart + facingIdx * seq.shootLength + (currentTick % seq.shootLength);
+                    } else if (a.activity === 'moving') {
                         frame = seq.runStart + facingIdx * seq.runLength + (currentTick % seq.runLength);
                     } else {
                         frame = facingIdx; // stand: frames 0-7

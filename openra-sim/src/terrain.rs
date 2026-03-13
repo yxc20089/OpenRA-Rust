@@ -147,19 +147,31 @@ impl TerrainMap {
     }
 
     /// Occupy a rectangular footprint for a building.
+    /// Also marks cells as impassable so units cannot path through buildings.
     pub fn occupy_footprint(&mut self, top_left_x: i32, top_left_y: i32, w: i32, h: i32, actor_id: u32) {
         for dy in 0..h {
             for dx in 0..w {
-                self.set_occupant(top_left_x + dx, top_left_y + dy, actor_id);
+                let x = top_left_x + dx;
+                let y = top_left_y + dy;
+                self.set_occupant(x, y, actor_id);
+                if self.contains(x, y) {
+                    self.costs.set(x, y, COST_IMPASSABLE);
+                }
             }
         }
     }
 
     /// Clear a rectangular footprint.
+    /// Restores cells to normal passable terrain.
     pub fn clear_footprint(&mut self, top_left_x: i32, top_left_y: i32, w: i32, h: i32) {
         for dy in 0..h {
             for dx in 0..w {
-                self.clear_occupant(top_left_x + dx, top_left_y + dy);
+                let x = top_left_x + dx;
+                let y = top_left_y + dy;
+                self.clear_occupant(x, y);
+                if self.contains(x, y) {
+                    self.costs.set(x, y, COST_NORMAL);
+                }
             }
         }
     }

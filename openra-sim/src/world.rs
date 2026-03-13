@@ -331,6 +331,24 @@ impl World {
     }
 
     /// Find the location of an enemy unit or building.
+    /// Find nearest passable cell adjacent to a target location (for attacking buildings).
+    fn find_adjacent_passable(&self, target: (i32, i32), actor_id: u32) -> Option<(i32, i32)> {
+        // If target itself is passable, use it directly
+        if self.terrain.is_passable_for(target.0, target.1, actor_id) {
+            return Some(target);
+        }
+        // Check all 8 neighbors
+        let dirs = [(0,-1),(1,-1),(1,0),(1,1),(0,1),(-1,1),(-1,0),(-1,-1)];
+        for (dx, dy) in &dirs {
+            let nx = target.0 + dx;
+            let ny = target.1 + dy;
+            if self.terrain.is_passable_for(nx, ny, actor_id) {
+                return Some((nx, ny));
+            }
+        }
+        None
+    }
+
     pub fn find_enemy_location(&self, player_id: u32) -> Option<(i32, i32)> {
         for actor in self.actors.values() {
             if let Some(owner) = actor.owner_id {
@@ -1729,7 +1747,16 @@ impl World {
         // Remove dead actors
         for id in dead_actors {
             if let Some(dead) = self.actors.remove(&id) {
-                if let Some(loc) = dead.location {
+                if dead.kind == ActorKind::Building {
+                    // Clear full building footprint (restores passability)
+                    if let Some(loc) = dead.location {
+                        let (fw, fh) = dead.actor_type.as_deref()
+                            .and_then(|t| self.rules.actor(t))
+                            .map(|s| s.footprint)
+                            .unwrap_or((2, 2));
+                        self.terrain.clear_footprint(loc.0, loc.1, fw, fh);
+                    }
+                } else if let Some(loc) = dead.location {
                     self.terrain.clear_occupant(loc.0, loc.1);
                 }
             }
@@ -1741,8 +1768,11 @@ impl World {
                 Some(loc) => loc,
                 None => continue,
             };
+            // Find nearest passable cell adjacent to the target (for attacking buildings)
+            let chase_dest = self.find_adjacent_passable(target_loc, attacker_id)
+                .unwrap_or(target_loc);
             // Pathfind toward target
-            if let Some(path) = pathfinder::find_path(&self.terrain, from, target_loc, Some(attacker_id)) {
+            if let Some(path) = pathfinder::find_path(&self.terrain, from, chase_dest, Some(attacker_id)) {
                 if path.len() > 1 {
                     let _speed = self.actor_speed(attacker_id);
                     // Save attack params, switch to Move, then restore Attack after move completes
