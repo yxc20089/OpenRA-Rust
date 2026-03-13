@@ -484,6 +484,23 @@ function refreshBuildable() {
     renderBuildable();
 }
 
+// Infantry animation sequence offsets from OpenRA sequences/infantry.yaml
+// stand is always frames 0-7 (one per facing)
+// run: Start=runStart, Length=runLength, Facings=8
+const INFANTRY_SEQUENCES = {
+    e1:   { runStart: 16, runLength: 6 },
+    e2:   { runStart: 16, runLength: 6 },
+    e3:   { runStart: 16, runLength: 6 },
+    e4:   { runStart: 16, runLength: 6 },
+    e6:   { runStart: 16, runLength: 6 },
+    e7:   { runStart:  8, runLength: 6 },
+    spy:  { runStart: 16, runLength: 6 },
+    thf:  { runStart:  8, runLength: 6 },
+    medi: { runStart:  8, runLength: 6 },
+    mech: { runStart:  8, runLength: 6 },
+    shok: { runStart: 16, runLength: 6 },
+};
+
 // OpenRA-style build order for production panel sorting
 const BUILDING_ORDER = [
     'powr','apwr','barr','tent','proc','weap','dome','fix','hpad','afld',
@@ -1666,13 +1683,13 @@ function drawUnit(a) {
             } else if (a.kind === 'Infantry' && info.frames >= 8) {
                 const step = 1024 / 8;
                 const facingIdx = Math.floor(((a.facing + step/2) & 1023) / step) % 8;
-                if (info.frames > 8) {
-                    // Walk cycle: frames_per_facing includes standing + walk frames
-                    const fpf = Math.floor(info.frames / 8);
-                    if (a.activity === 'moving' && fpf > 1) {
-                        frame = facingIdx * fpf + 1 + (currentTick % (fpf - 1));
+                // Use OpenRA sequence offsets for infantry animations
+                const seq = INFANTRY_SEQUENCES[a.actor_type];
+                if (seq && info.frames > seq.runStart) {
+                    if (a.activity === 'moving') {
+                        frame = seq.runStart + facingIdx * seq.runLength + (currentTick % seq.runLength);
                     } else {
-                        frame = facingIdx * fpf; // Standing frame
+                        frame = facingIdx; // stand: frames 0-7
                     }
                 } else {
                     frame = facingIdx;
