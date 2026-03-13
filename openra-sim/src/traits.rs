@@ -16,7 +16,7 @@ pub(crate) fn hash_bool(b: bool) -> i32 {
 }
 
 /// Production queue type (named instance on Player actor).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PqType {
     Building,
     Defense,

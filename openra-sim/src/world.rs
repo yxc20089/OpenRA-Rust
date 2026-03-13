@@ -237,7 +237,9 @@ pub struct World {
     /// Ticks until next SeedsResource seeding event.
     seeds_resource_ticks: i32,
     /// Active production items per player actor ID.
-    production: HashMap<u32, Vec<ProductionItem>>,
+    /// Production queues: player_id → (queue_type → items).
+    /// Each queue type builds independently. Buildings queue sequentially within each type.
+    production: HashMap<u32, HashMap<PqType, Vec<ProductionItem>>>,
     /// Terrain and occupancy map.
     pub terrain: TerrainMap,
     /// Map dimensions (cells).
@@ -450,19 +452,23 @@ impl World {
                     (0, 0)
                 })
                 .unwrap_or((0, 0));
-            let production_queue = self.production.get(&pid).map(|items| {
-                items.iter().map(|item| {
-                    let progress = if item.total_time > 0 {
-                        1.0 - (item.remaining_time as f32 / item.total_time as f32)
-                    } else {
-                        1.0
-                    };
-                    ProductionSnapshot {
-                        item_name: item.item_name.clone(),
-                        progress,
-                        done: item.remaining_time <= 0,
+            let production_queue = self.production.get(&pid).map(|queues| {
+                let mut all_items: Vec<ProductionSnapshot> = Vec::new();
+                for (_pq, items) in queues {
+                    for item in items {
+                        let progress = if item.total_time > 0 {
+                            1.0 - (item.remaining_time as f32 / item.total_time as f32)
+                        } else {
+                            1.0
+                        };
+                        all_items.push(ProductionSnapshot {
+                            item_name: item.item_name.clone(),
+                            progress,
+                            done: item.remaining_time <= 0,
+                        });
                     }
-                }).collect()
+                }
+                all_items
             }).unwrap_or_default();
             PlayerSnapshot { index: pid, cash, power_provided, power_drained, production_queue }
         }).collect();
@@ -621,32 +627,35 @@ impl World {
                         if !self.has_prerequisites(subject_id, item_name) {
                             eprintln!("ORDER: StartProduction BLOCKED — missing prerequisites for {}", item_name);
                         } else {
-                            eprintln!("ORDER: StartProduction subject={} item={} cost={}", subject_id, item_name, cost);
+                            let pq = Self::item_queue_type_by_name(&self.rules, item_name);
+                            eprintln!("ORDER: StartProduction subject={} item={} cost={} queue={:?}", subject_id, item_name, cost, pq);
                             let item = ProductionItem::new(item_name, cost, 60);
-                            self.production.entry(subject_id).or_default().push(item);
+                            self.production.entry(subject_id).or_default()
+                                .entry(pq).or_default().push(item);
                         }
                     }
                 }
             }
             "CancelProduction" => {
                 if let (Some(subject_id), Some(item_name)) = (order.subject_id, &order.target_string) {
-                    if let Some(queue) = self.production.get_mut(&subject_id) {
-                        // Remove the last matching item from the queue (LIFO cancel)
-                        if let Some(pos) = queue.iter().rposition(|q| q.item_name == *item_name) {
-                            let removed = queue.remove(pos);
-                            // Refund remaining cost
-                            let refund = removed.remaining_cost;
-                            if refund > 0 {
-                                if let Some(player) = self.actors.get_mut(&subject_id) {
-                                    for t in &mut player.traits {
-                                        if let TraitState::PlayerResources { cash, .. } = t {
-                                            *cash += refund;
-                                            break;
+                    let pq = Self::item_queue_type_by_name(&self.rules, item_name);
+                    if let Some(queues) = self.production.get_mut(&subject_id) {
+                        if let Some(items) = queues.get_mut(&pq) {
+                            if let Some(pos) = items.iter().rposition(|q| q.item_name == *item_name) {
+                                let removed = items.remove(pos);
+                                let refund = removed.remaining_cost;
+                                if refund > 0 {
+                                    if let Some(player) = self.actors.get_mut(&subject_id) {
+                                        for t in &mut player.traits {
+                                            if let TraitState::PlayerResources { cash, .. } = t {
+                                                *cash += refund;
+                                                break;
+                                            }
                                         }
                                     }
                                 }
+                                eprintln!("ORDER: CancelProduction {} refund={}", item_name, refund);
                             }
-                            eprintln!("ORDER: CancelProduction {} refund={}", item_name, refund);
                         }
                     }
                 }
@@ -912,7 +921,9 @@ impl World {
     /// Handle PlaceBuilding order: create building actor and occupy terrain.
     fn order_place_building(&mut self, owner_player_id: u32, building_type: &str, x: i32, y: i32) {
         // Verify the building is actually completed in the production queue
+        let pq = Self::item_queue_type_by_name(&self.rules, building_type);
         let has_completed = self.production.get(&owner_player_id)
+            .and_then(|queues| queues.get(&pq))
             .map(|items| items.iter().any(|i| i.item_name == building_type && i.is_done()))
             .unwrap_or(false);
         if !has_completed {
@@ -945,9 +956,11 @@ impl World {
         self.terrain.occupy_footprint(x, y, footprint_w, footprint_h, building_id);
 
         // Remove completed building from production queue
-        if let Some(items) = self.production.get_mut(&owner_player_id) {
-            if let Some(idx) = items.iter().position(|i| i.item_name == building_type && i.is_done()) {
-                items.remove(idx);
+        if let Some(queues) = self.production.get_mut(&owner_player_id) {
+            if let Some(items) = queues.get_mut(&pq) {
+                if let Some(idx) = items.iter().position(|i| i.item_name == building_type && i.is_done()) {
+                    items.remove(idx);
+                }
             }
         }
 
@@ -1913,29 +1926,31 @@ impl World {
             if is_low_power && self.world_tick % 2 == 0 {
                 continue; // 50% production speed when low power
             }
-            let cash = self.actors.get(&pid).map(|a| a.cash()).unwrap_or(0);
-            if let Some(items) = self.production.get_mut(&pid) {
-                // Find first item that isn't a completed building waiting for placement
-                let tick_idx = items.iter().position(|i| !i.is_done());
-                if let Some(idx) = tick_idx {
-                    let item = &mut items[idx];
-                    let consumed = item.tick(cash);
-                    if consumed > 0 {
-                        if let Some(player) = self.actors.get_mut(&pid) {
-                            player.set_cash(cash - consumed);
+            let mut cash = self.actors.get(&pid).map(|a| a.cash()).unwrap_or(0);
+            if let Some(queues) = self.production.get_mut(&pid) {
+                // Tick each queue type independently
+                for (_pq, items) in queues.iter_mut() {
+                    // Find first item that isn't a completed building waiting for placement
+                    let tick_idx = items.iter().position(|i| !i.is_done());
+                    if let Some(idx) = tick_idx {
+                        let item = &mut items[idx];
+                        let consumed = item.tick(cash);
+                        if consumed > 0 {
+                            cash -= consumed;
+                            if let Some(player) = self.actors.get_mut(&pid) {
+                                player.set_cash(cash);
+                            }
                         }
-                    }
-                    if item.is_done() {
-                        let name = item.item_name.clone();
-                        if self.rules.is_unit(&name) {
-                            // Units: remove from queue and spawn immediately
-                            items.remove(idx);
-                            eprintln!("PRODUCTION: unit {} complete for player {}", name, pid);
-                            completed_items.push((pid, name));
-                        } else {
-                            eprintln!("PRODUCTION: building {} ready to place for player {}", name, pid);
+                        if item.is_done() {
+                            let name = item.item_name.clone();
+                            if self.rules.is_unit(&name) {
+                                items.remove(idx);
+                                eprintln!("PRODUCTION: unit {} complete for player {}", name, pid);
+                                completed_items.push((pid, name));
+                            } else {
+                                eprintln!("PRODUCTION: building {} ready to place for player {}", name, pid);
+                            }
                         }
-                        // Buildings stay in queue as "ready to place" until PlaceBuilding order
                     }
                 }
             }
@@ -2275,10 +2290,7 @@ impl World {
             ActorKind::Aircraft => PqType::Aircraft,
             ActorKind::Ship => PqType::Ship,
             ActorKind::Building => {
-                // Defense buildings: small footprint turrets/walls
-                let defense_names = ["tsla", "sam", "gap", "agun", "pbox", "hbox", "gun", "ftur"];
-                // We can't check name here, so use footprint size as heuristic
-                if stats.footprint == (1, 1) && stats.kind == ActorKind::Building {
+                if stats.footprint == (1, 1) {
                     PqType::Defense
                 } else {
                     PqType::Building
@@ -2286,6 +2298,13 @@ impl World {
             }
             _ => PqType::Building,
         }
+    }
+
+    /// Determine queue type by item name (looks up rules).
+    fn item_queue_type_by_name(rules: &crate::gamerules::GameRules, item_name: &str) -> PqType {
+        rules.actor(item_name)
+            .map(|s| Self::item_queue_type(s))
+            .unwrap_or(PqType::Building)
     }
 
     /// Check if a production queue type is enabled for a player.
@@ -2413,19 +2432,24 @@ impl World {
 
     /// Check if a player has any items currently in production (not yet complete).
     pub fn player_has_pending_production(&self, player_id: u32) -> bool {
-        if let Some(items) = self.production.get(&player_id) {
-            items.iter().any(|item| !item.is_done())
-        } else {
-            false
+        if let Some(queues) = self.production.get(&player_id) {
+            for items in queues.values() {
+                if items.iter().any(|item| !item.is_done()) {
+                    return true;
+                }
+            }
         }
+        false
     }
 
     /// Get the first completed building in the production queue awaiting placement.
     pub fn player_ready_building(&self, player_id: u32) -> Option<String> {
-        if let Some(items) = self.production.get(&player_id) {
-            for item in items {
-                if item.is_done() {
-                    return Some(item.item_name.clone());
+        if let Some(queues) = self.production.get(&player_id) {
+            for items in queues.values() {
+                for item in items {
+                    if item.is_done() {
+                        return Some(item.item_name.clone());
+                    }
                 }
             }
         }
