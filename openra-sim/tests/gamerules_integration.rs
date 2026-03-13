@@ -78,3 +78,57 @@ fn from_ruleset_matches_defaults_for_common_units() {
         }
     }
 }
+
+#[test]
+fn provides_prerequisites_parsed_from_yaml() {
+    if !ra_mod_available() {
+        eprintln!("Skipping: vendor/OpenRA not found");
+        return;
+    }
+
+    let mod_dir = std::path::Path::new(RA_MOD_DIR);
+    let ruleset = openra_data::rules::load_ruleset(mod_dir).expect("load");
+    let rules = openra_sim::gamerules::GameRules::from_ruleset(&ruleset);
+
+    // FACT should provide structures.allies and structures.soviet
+    let fact = rules.actor("fact").expect("fact");
+    let fact_prereq_names: Vec<&str> = fact.provides_prerequisites.iter().map(|p| p.prerequisite.as_str()).collect();
+    assert!(fact_prereq_names.contains(&"structures.allies"), "FACT should provide structures.allies, got: {:?}", fact_prereq_names);
+    assert!(fact_prereq_names.contains(&"structures.soviet"), "FACT should provide structures.soviet, got: {:?}", fact_prereq_names);
+
+    // POWR should provide anypower
+    let powr = rules.actor("powr").expect("powr");
+    let powr_prereq_names: Vec<&str> = powr.provides_prerequisites.iter().map(|p| p.prerequisite.as_str()).collect();
+    assert!(powr_prereq_names.contains(&"anypower"), "POWR should provide anypower, got: {:?}", powr_prereq_names);
+
+    // WEAP should provide vehicles.allies and vehicles.soviet
+    let weap = rules.actor("weap").expect("weap");
+    let weap_prereq_names: Vec<&str> = weap.provides_prerequisites.iter().map(|p| p.prerequisite.as_str()).collect();
+    assert!(weap_prereq_names.contains(&"vehicles.allies"), "WEAP should provide vehicles.allies, got: {:?}", weap_prereq_names);
+    assert!(weap_prereq_names.contains(&"vehicles.soviet"), "WEAP should provide vehicles.soviet, got: {:?}", weap_prereq_names);
+
+    // 1TNK should require vehicles.allies (faction-gated)
+    let tank1 = rules.actor("1tnk").expect("1tnk");
+    assert!(tank1.prerequisites.iter().any(|p| p.contains("vehicles.allies")),
+        "1TNK should require vehicles.allies, got: {:?}", tank1.prerequisites);
+
+    // 3TNK should require vehicles.soviet
+    let tank3 = rules.actor("3tnk").expect("3tnk");
+    assert!(tank3.prerequisites.iter().any(|p| p.contains("vehicles.soviet")),
+        "3TNK should require vehicles.soviet, got: {:?}", tank3.prerequisites);
+
+    // TENT prerequisites should include structures.allies
+    let tent = rules.actor("tent").expect("tent");
+    assert!(tent.prerequisites.iter().any(|p| p.contains("structures.allies")),
+        "TENT should require structures.allies, got: {:?}", tent.prerequisites);
+
+    // BARR prerequisites should include structures.soviet
+    let barr = rules.actor("barr").expect("barr");
+    assert!(barr.prerequisites.iter().any(|p| p.contains("structures.soviet")),
+        "BARR should require structures.soviet, got: {:?}", barr.prerequisites);
+
+    // Build palette order should be parsed
+    assert!(tank1.build_palette_order < 9999, "1TNK should have build_palette_order < 9999, got {}", tank1.build_palette_order);
+    let powr_order = powr.build_palette_order;
+    assert!(powr_order < 100, "POWR should have low build_palette_order, got {}", powr_order);
+}

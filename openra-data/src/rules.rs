@@ -158,6 +158,29 @@ fn node_to_weapon(node: &MiniYamlNode) -> WeaponInfo {
     }
 }
 
+/// Build a Ruleset from pre-loaded YAML source strings.
+/// Works in WASM (no filesystem access needed).
+pub fn load_ruleset_from_strings(rule_sources: &[&str], weapon_sources: &[&str]) -> Ruleset {
+    let merged = miniyaml::parse_and_merge(rule_sources);
+    let resolved = miniyaml::resolve_inherits(merged);
+
+    let mut actors = BTreeMap::new();
+    for node in &resolved {
+        actors.insert(node.key.clone(), node_to_actor(node));
+    }
+
+    let mut weapons = BTreeMap::new();
+    if !weapon_sources.is_empty() {
+        let weapon_merged = miniyaml::parse_and_merge(weapon_sources);
+        let weapon_resolved = miniyaml::resolve_inherits(weapon_merged);
+        for node in &weapon_resolved {
+            weapons.insert(node.key.clone(), node_to_weapon(node));
+        }
+    }
+
+    Ruleset { actors, weapons }
+}
+
 /// Load a ruleset from a mod directory (e.g., "/path/to/OpenRA/mods/ra").
 ///
 /// Reads rules/*.yaml and weapons/*.yaml, merges them with defaults,
@@ -166,8 +189,6 @@ pub fn load_ruleset(mod_dir: &Path) -> std::io::Result<Ruleset> {
     let rules_dir = mod_dir.join("rules");
     let weapons_dir = mod_dir.join("weapons");
 
-    // Load and merge all rules files in a deterministic order.
-    // defaults.yaml must come first, then other files alphabetically.
     let rule_files = &[
         "defaults.yaml",
         "player.yaml",
@@ -193,18 +214,10 @@ pub fn load_ruleset(mod_dir: &Path) -> std::io::Result<Ruleset> {
     }
 
     let source_refs: Vec<&str> = rule_sources.iter().map(|s| s.as_str()).collect();
-    let merged = miniyaml::parse_and_merge(&source_refs);
-    let resolved = miniyaml::resolve_inherits(merged);
-
-    let mut actors = BTreeMap::new();
-    for node in &resolved {
-        actors.insert(node.key.clone(), node_to_actor(node));
-    }
 
     // Load weapons
-    let mut weapons = BTreeMap::new();
+    let mut weapon_sources_owned = Vec::new();
     if weapons_dir.exists() {
-        let mut weapon_sources = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&weapons_dir) {
             let mut filenames: Vec<_> = entries
                 .filter_map(|e| e.ok())
@@ -213,18 +226,13 @@ pub fn load_ruleset(mod_dir: &Path) -> std::io::Result<Ruleset> {
                 .collect();
             filenames.sort();
             for path in &filenames {
-                weapon_sources.push(std::fs::read_to_string(path)?);
+                weapon_sources_owned.push(std::fs::read_to_string(path)?);
             }
         }
-        let weapon_refs: Vec<&str> = weapon_sources.iter().map(|s| s.as_str()).collect();
-        let weapon_merged = miniyaml::parse_and_merge(&weapon_refs);
-        let weapon_resolved = miniyaml::resolve_inherits(weapon_merged);
-        for node in &weapon_resolved {
-            weapons.insert(node.key.clone(), node_to_weapon(node));
-        }
     }
+    let weapon_refs: Vec<&str> = weapon_sources_owned.iter().map(|s| s.as_str()).collect();
 
-    Ok(Ruleset { actors, weapons })
+    Ok(load_ruleset_from_strings(&source_refs, &weapon_refs))
 }
 
 #[cfg(test)]

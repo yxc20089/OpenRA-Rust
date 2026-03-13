@@ -43,7 +43,7 @@ let paletteRGB = null;
 let tilesetTemplates = {};
 let mapTiles = null;
 let playerSpriteCache = {};
-let activeTab = 'buildings';
+let activeTab = 'Building';
 let currentTick = 0;
 
 // Power state per player (for low-power indicator)
@@ -468,15 +468,7 @@ function gameLoop() {
 
 function showMsg(text) { hudMsg.textContent = text; setTimeout(() => { if (hudMsg.textContent === text) hudMsg.textContent = ''; }, 3000); }
 
-// ── Production tab switching ──
-document.querySelectorAll('.prod-tab').forEach(tab => {
-    tab.addEventListener('click', () => {
-        activeTab = tab.dataset.tab;
-        document.querySelectorAll('.prod-tab').forEach(t => t.classList.remove('active'));
-        tab.classList.add('active');
-        renderBuildable();
-    });
-});
+// Tab switching is now handled dynamically in renderBuildable()
 
 function refreshBuildable() {
     if (mode !== 'game') return;
@@ -528,38 +520,35 @@ const CAMEO_ICONS = {
     dog:'dogicon',
 };
 
-// OpenRA-style build order for production panel sorting
-const BUILDING_ORDER = [
-    'powr','apwr','barr','tent','proc','weap','dome','fix','hpad','afld',
-    'sam','agun','gun','ftur','pbox','tsla','gap','iron','silo',
-    'atek','stek','kenn','hosp','bio','miss','pdox','fcom','spen','syrd',
-    'brik','sbag','fenc','cycl','barb'
-];
-const UNIT_ORDER = [
-    // Infantry
-    'e1','e2','e3','e4','e6','e7','spy','thf','medi','mech','shok',
-    // Vehicles
-    'mcv','harv','1tnk','2tnk','3tnk','4tnk','jeep','apc','arty','v2rl',
-    'mnly','mrj','mgg','stnk','ftrk','truk',
-    // Aircraft
-    'heli','hind','mig','yak','tran','badr','mh60',
-    // Naval
-    'ss','dd','ca','pt','lst'
-];
+// Queue type tab ordering and labels
+const QUEUE_ORDER = ['Building', 'Defense', 'Infantry', 'Vehicle', 'Aircraft', 'Ship'];
+const QUEUE_LABELS = { Building: 'Bld', Defense: 'Def', Infantry: 'Inf', Vehicle: 'Veh', Aircraft: 'Air', Ship: 'Shp' };
 
 function renderBuildable() {
     if (!buildableItems) return;
-    // Only show buildable (unlocked) items, matching OpenRA behavior
-    const items = activeTab === 'buildings'
-        ? buildableItems.filter(i => i.is_building && !i.locked)
-        : buildableItems.filter(i => !i.is_building && !i.locked);
-    // Sort by predefined order
-    const order = activeTab === 'buildings' ? BUILDING_ORDER : UNIT_ORDER;
-    items.sort((a, b) => {
-        const ai = order.indexOf(a.name);
-        const bi = order.indexOf(b.name);
-        return (ai === -1 ? 999 : ai) - (bi === -1 ? 999 : bi);
-    });
+
+    // Determine which queue types have items
+    const availableQueues = QUEUE_ORDER.filter(q =>
+        buildableItems.some(i => i.queue_type === q)
+    );
+    // Default to first available tab if current tab not available
+    if (!availableQueues.includes(activeTab)) activeTab = availableQueues[0] || 'Building';
+
+    // Render dynamic tabs
+    const tabContainer = document.getElementById('prod-tabs');
+    tabContainer.innerHTML = '';
+    for (const q of availableQueues) {
+        const btn = document.createElement('button');
+        btn.className = 'prod-tab' + (q === activeTab ? ' active' : '');
+        btn.textContent = QUEUE_LABELS[q] || q;
+        btn.onclick = () => { activeTab = q; renderBuildable(); };
+        tabContainer.appendChild(btn);
+    }
+
+    // Filter by active queue tab, only show unlocked items
+    const items = buildableItems.filter(i => i.queue_type === activeTab && !i.locked);
+    // Sort by build palette order from YAML rules
+    items.sort((a, b) => (a.build_palette_order || 9999) - (b.build_palette_order || 9999));
     prodPanel.innerHTML = '';
     for (const item of items) {
         const btn = document.createElement('button');

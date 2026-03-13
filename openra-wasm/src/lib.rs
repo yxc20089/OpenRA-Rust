@@ -34,6 +34,31 @@ const SPEECH_MIX: &[u8] = include_bytes!("../../vendor/ra-content/speech.mix");
 /// Bundled tileset YAML for template→image mapping.
 const TEMPERAT_TILESET: &str = include_str!("../../vendor/OpenRA/mods/ra/tilesets/temperat.yaml");
 
+/// Bundled game rules YAML files for production/tech tree.
+const RULES_DEFAULTS: &str = include_str!("../../vendor/OpenRA/mods/ra/rules/defaults.yaml");
+const RULES_PLAYER: &str = include_str!("../../vendor/OpenRA/mods/ra/rules/player.yaml");
+const RULES_WORLD: &str = include_str!("../../vendor/OpenRA/mods/ra/rules/world.yaml");
+const RULES_INFANTRY: &str = include_str!("../../vendor/OpenRA/mods/ra/rules/infantry.yaml");
+const RULES_VEHICLES: &str = include_str!("../../vendor/OpenRA/mods/ra/rules/vehicles.yaml");
+const RULES_AIRCRAFT: &str = include_str!("../../vendor/OpenRA/mods/ra/rules/aircraft.yaml");
+const RULES_SHIPS: &str = include_str!("../../vendor/OpenRA/mods/ra/rules/ships.yaml");
+const RULES_STRUCTURES: &str = include_str!("../../vendor/OpenRA/mods/ra/rules/structures.yaml");
+const RULES_MISC: &str = include_str!("../../vendor/OpenRA/mods/ra/rules/misc.yaml");
+const RULES_FAKES: &str = include_str!("../../vendor/OpenRA/mods/ra/rules/fakes.yaml");
+const RULES_HUSKS: &str = include_str!("../../vendor/OpenRA/mods/ra/rules/husks.yaml");
+
+/// Load game rules from bundled YAML files.
+fn load_bundled_rules() -> openra_sim::gamerules::GameRules {
+    let rule_sources: &[&str] = &[
+        RULES_DEFAULTS, RULES_PLAYER, RULES_WORLD,
+        RULES_INFANTRY, RULES_VEHICLES, RULES_AIRCRAFT,
+        RULES_SHIPS, RULES_STRUCTURES, RULES_MISC,
+        RULES_FAKES, RULES_HUSKS,
+    ];
+    let ruleset = openra_data::rules::load_ruleset_from_strings(rule_sources, &[]);
+    openra_sim::gamerules::GameRules::from_ruleset(&ruleset)
+}
+
 /// Parse tileset YAML to get template_id → (image_filename, size_w, size_h) mapping.
 fn parse_tileset_templates() -> HashMap<u16, (String, u32, u32)> {
     let mut templates = HashMap::new();
@@ -240,7 +265,8 @@ impl GameSession {
         };
 
         let map_tiles_json = map_tiles_to_json(&map);
-        let world = world::build_world(&map, seed, &lobby, None, difficulty);
+        let rules = load_bundled_rules();
+        let world = world::build_world(&map, seed, &lobby, Some(rules), difficulty);
         let player_ids = world.player_ids().to_vec();
         let human_player_id = player_ids[player_ids.len() - 1 - 2]; // 2 slots
 
@@ -277,7 +303,8 @@ impl GameSession {
         };
 
         let map_tiles_json = map_tiles_to_json(&map);
-        let world = world::build_world(&map, seed, &lobby, None, difficulty);
+        let rules = load_bundled_rules();
+        let world = world::build_world(&map, seed, &lobby, Some(rules), difficulty);
         let player_ids = world.player_ids().to_vec();
         let num_slots = lobby.occupied_slots.len();
         let human_player_id = player_ids[player_ids.len() - 1 - num_slots];

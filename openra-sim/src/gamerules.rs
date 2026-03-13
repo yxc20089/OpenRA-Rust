@@ -16,6 +16,17 @@ pub enum ArmorType {
     Concrete,
 }
 
+/// A virtual prerequisite that a building provides to its owner.
+#[derive(Debug, Clone)]
+pub struct ProvidesPrereq {
+    /// Factions this applies to (empty = all factions).
+    pub factions: Vec<String>,
+    /// The prerequisite name provided (e.g., "structures.allies").
+    pub prerequisite: String,
+    /// Additional prerequisites required for this provision to be active.
+    pub requires_prerequisites: Vec<String>,
+}
+
 /// Compiled stats for one actor type.
 #[derive(Debug, Clone)]
 pub struct ActorStats {
@@ -30,6 +41,8 @@ pub struct ActorStats {
     pub prerequisites: Vec<String>,
     pub weapons: Vec<String>,
     pub sight_range: i32,
+    pub provides_prerequisites: Vec<ProvidesPrereq>,
+    pub build_palette_order: i32,
 }
 
 /// Compiled stats for one weapon type.
@@ -107,6 +120,32 @@ impl GameRules {
 
             let kind = classify_actor(info);
 
+            let build_palette_order = info.trait_info("Buildable")
+                .and_then(|t| t.get_i32("BuildPaletteOrder"))
+                .unwrap_or(9999);
+
+            // Parse ProvidesPrerequisite traits
+            let mut provides_prerequisites = Vec::new();
+            for pp in info.traits_of("ProvidesPrerequisite") {
+                let prerequisite = pp.get("Prerequisite")
+                    .map(|s| s.to_lowercase())
+                    .unwrap_or_else(|| key.clone()); // @buildingname: provides own name
+
+                let factions: Vec<String> = pp.get("Factions")
+                    .map(|s| s.split(',').map(|f| f.trim().to_lowercase()).collect())
+                    .unwrap_or_default();
+
+                let requires_prerequisites: Vec<String> = pp.get("RequiresPrerequisites")
+                    .map(|s| s.split(',').map(|p| p.trim().to_lowercase()).collect())
+                    .unwrap_or_default();
+
+                provides_prerequisites.push(ProvidesPrereq {
+                    factions,
+                    prerequisite,
+                    requires_prerequisites,
+                });
+            }
+
             actors.insert(key, ActorStats {
                 kind,
                 hp,
@@ -119,6 +158,8 @@ impl GameRules {
                 prerequisites,
                 weapons: weapon_names,
                 sight_range,
+                provides_prerequisites,
+                build_palette_order,
             });
         }
 
@@ -160,6 +201,7 @@ impl GameRules {
                     footprint: ($fw, $fh), armor_type: ArmorType::None,
                     is_building: $building, prerequisites: Vec::new(),
                     weapons: Vec::new(), sight_range: if $building { 5 } else { 4 },
+                    provides_prerequisites: Vec::new(), build_palette_order: 9999,
                 });
             };
         }
@@ -264,6 +306,54 @@ impl GameRules {
         if let Some(a) = actors.get_mut("atek") { a.prerequisites = vec!["weap".to_string(), "dome".to_string()]; }
         if let Some(a) = actors.get_mut("stek") { a.prerequisites = vec!["weap".to_string(), "dome".to_string()]; }
 
+        // ProvidesPrerequisite for buildings (simplified defaults for testing)
+        // FACT provides structures.allies / structures.soviet based on faction
+        if let Some(a) = actors.get_mut("fact") {
+            a.provides_prerequisites = vec![
+                ProvidesPrereq { factions: vec!["allies".into(),"england".into(),"france".into(),"germany".into()], prerequisite: "structures.allies".into(), requires_prerequisites: vec![] },
+                ProvidesPrereq { factions: vec!["soviet".into(),"russia".into(),"ukraine".into()], prerequisite: "structures.soviet".into(), requires_prerequisites: vec![] },
+                ProvidesPrereq { factions: vec![], prerequisite: "fact".into(), requires_prerequisites: vec![] },
+            ];
+        }
+        // POWR/APWR provide anypower
+        if let Some(a) = actors.get_mut("powr") { a.provides_prerequisites = vec![ProvidesPrereq { factions: vec![], prerequisite: "anypower".into(), requires_prerequisites: vec![] }]; }
+        if let Some(a) = actors.get_mut("apwr") { a.provides_prerequisites = vec![ProvidesPrereq { factions: vec![], prerequisite: "anypower".into(), requires_prerequisites: vec![] }]; }
+        // TENT provides barracks + infantry.allies
+        if let Some(a) = actors.get_mut("tent") {
+            a.provides_prerequisites = vec![
+                ProvidesPrereq { factions: vec![], prerequisite: "barracks".into(), requires_prerequisites: vec![] },
+                ProvidesPrereq { factions: vec![], prerequisite: "tent".into(), requires_prerequisites: vec![] },
+                ProvidesPrereq { factions: vec!["allies".into(),"england".into(),"france".into(),"germany".into()], prerequisite: "infantry.allies".into(), requires_prerequisites: vec![] },
+            ];
+        }
+        // BARR provides barracks + infantry.soviet
+        if let Some(a) = actors.get_mut("barr") {
+            a.provides_prerequisites = vec![
+                ProvidesPrereq { factions: vec![], prerequisite: "barracks".into(), requires_prerequisites: vec![] },
+                ProvidesPrereq { factions: vec![], prerequisite: "barr".into(), requires_prerequisites: vec![] },
+                ProvidesPrereq { factions: vec!["soviet".into(),"russia".into(),"ukraine".into()], prerequisite: "infantry.soviet".into(), requires_prerequisites: vec![] },
+            ];
+        }
+        // WEAP provides vehicles.allies / vehicles.soviet
+        if let Some(a) = actors.get_mut("weap") {
+            a.provides_prerequisites = vec![
+                ProvidesPrereq { factions: vec![], prerequisite: "weap".into(), requires_prerequisites: vec![] },
+                ProvidesPrereq { factions: vec!["allies".into(),"england".into(),"france".into(),"germany".into()], prerequisite: "vehicles.allies".into(), requires_prerequisites: vec![] },
+                ProvidesPrereq { factions: vec!["soviet".into(),"russia".into(),"ukraine".into()], prerequisite: "vehicles.soviet".into(), requires_prerequisites: vec![] },
+            ];
+        }
+        // Other buildings provide themselves
+        for bname in &["proc","dome","fix","hpad","afld","spen","syrd","atek","stek","sam","agun","gap","tsla","pbox","hbox","gun","ftur"] {
+            if let Some(a) = actors.get_mut(*bname) {
+                if a.provides_prerequisites.is_empty() {
+                    a.provides_prerequisites = vec![ProvidesPrereq { factions: vec![], prerequisite: bname.to_string(), requires_prerequisites: vec![] }];
+                }
+            }
+        }
+        // ATEK/STEK also provide techcenter
+        if let Some(a) = actors.get_mut("atek") { a.provides_prerequisites.push(ProvidesPrereq { factions: vec![], prerequisite: "techcenter".into(), requires_prerequisites: vec![] }); }
+        if let Some(a) = actors.get_mut("stek") { a.provides_prerequisites.push(ProvidesPrereq { factions: vec![], prerequisite: "techcenter".into(), requires_prerequisites: vec![] }); }
+
         // Default weapon
         weapons.insert("default".to_string(), WeaponStats {
             damage: 100,
@@ -343,13 +433,13 @@ fn classify_actor(info: &openra_data::rules::ActorInfo) -> ActorKind {
     } else if info.has_trait("Aircraft") {
         ActorKind::Aircraft
     } else if info.has_trait("Mobile") {
-        // Check locomotor or other hints
-        if info.trait_info("Mobile")
+        let locomotor = info.trait_info("Mobile")
             .and_then(|m| m.get("Locomotor"))
-            .map(|l| l.contains("foot"))
-            .unwrap_or(false)
-        {
+            .unwrap_or("");
+        if locomotor.contains("foot") {
             ActorKind::Infantry
+        } else if locomotor.contains("naval") || locomotor.contains("lcraft") {
+            ActorKind::Ship
         } else {
             ActorKind::Vehicle
         }

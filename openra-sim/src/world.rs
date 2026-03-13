@@ -199,6 +199,8 @@ pub struct BuildableInfo {
     pub footprint: (i32, i32),
     pub locked: bool,
     pub prerequisites: Vec<String>,
+    pub queue_type: String,
+    pub build_palette_order: i32,
 }
 
 pub struct SyncHashDebug {
@@ -209,6 +211,18 @@ pub struct SyncHashDebug {
 }
 
 /// The game world state.
+/// Convert a PqType to its string name for the frontend.
+fn pq_type_name(pq: PqType) -> &'static str {
+    match pq {
+        PqType::Building => "Building",
+        PqType::Defense => "Defense",
+        PqType::Infantry => "Infantry",
+        PqType::Vehicle => "Vehicle",
+        PqType::Aircraft => "Aircraft",
+        PqType::Ship => "Ship",
+    }
+}
+
 pub struct World {
     /// All actors keyed by ID. BTreeMap ensures deterministic iteration order.
     actors: BTreeMap<u32, Actor>,
@@ -260,6 +274,8 @@ pub struct World {
     superweapon_timers: HashMap<(String, u32), i32>,
     /// Actors with invulnerability ticks remaining (Iron Curtain).
     invulnerable: HashMap<u32, i32>,
+    /// Player faction mapping: player_actor_id → faction name.
+    player_factions: HashMap<u32, String>,
 }
 
 impl World {
@@ -2096,6 +2112,49 @@ impl World {
         None
     }
 
+    /// Compute all virtual prerequisites a player currently has based on owned buildings and faction.
+    fn compute_player_prerequisites(&self, player_id: u32) -> HashSet<String> {
+        let faction = self.player_factions.get(&player_id)
+            .map(|s| s.as_str())
+            .unwrap_or("allies");
+
+        let mut provided = HashSet::new();
+
+        // First pass: collect unconditional prerequisites
+        for actor in self.actors.values() {
+            if actor.owner_id != Some(player_id) || actor.kind != ActorKind::Building { continue; }
+            let btype = actor.actor_type.as_deref().unwrap_or("");
+            if let Some(stats) = self.rules.actor(btype) {
+                for pp in &stats.provides_prerequisites {
+                    if !pp.requires_prerequisites.is_empty() { continue; } // skip conditional for now
+                    if pp.factions.is_empty() || pp.factions.iter().any(|f| f == faction) {
+                        provided.insert(pp.prerequisite.clone());
+                    }
+                }
+                // @buildingname convention: building always provides its own name
+                provided.insert(btype.to_string());
+            }
+        }
+
+        // Second pass: conditional prerequisites (RequiresPrerequisites)
+        for actor in self.actors.values() {
+            if actor.owner_id != Some(player_id) || actor.kind != ActorKind::Building { continue; }
+            let btype = actor.actor_type.as_deref().unwrap_or("");
+            if let Some(stats) = self.rules.actor(btype) {
+                for pp in &stats.provides_prerequisites {
+                    if pp.requires_prerequisites.is_empty() { continue; }
+                    if pp.factions.is_empty() || pp.factions.iter().any(|f| f == faction) {
+                        if pp.requires_prerequisites.iter().all(|rp| provided.contains(rp)) {
+                            provided.insert(pp.prerequisite.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        provided
+    }
+
     /// Check if a player has the required prerequisite buildings for an item.
     fn has_prerequisites(&self, owner_player_id: u32, item_name: &str) -> bool {
         let prereqs = match self.rules.actor(item_name) {
@@ -2105,14 +2164,26 @@ impl World {
         if prereqs.is_empty() {
             return true;
         }
-        // Check that the player owns at least one of each prerequisite building type
-        for prereq in prereqs {
-            let has_it = self.actors.values().any(|a| {
-                a.owner_id == Some(owner_player_id)
-                    && a.kind == ActorKind::Building
-                    && a.actor_type.as_deref() == Some(prereq.as_str())
-            });
-            if !has_it {
+
+        let player_prereqs = self.compute_player_prerequisites(owner_player_id);
+
+        for prereq_raw in prereqs {
+            let prereq = prereq_raw.trim_start_matches('~');
+
+            // ~disabled means never buildable
+            if prereq == "disabled" { return false; }
+
+            // ~techlevel.* — all satisfied in standard skirmish games
+            if prereq.starts_with("techlevel.") { continue; }
+
+            // ~!foo = negated prerequisite (must NOT have foo)
+            if let Some(negated) = prereq.strip_prefix('!') {
+                if player_prereqs.contains(negated) { return false; }
+                continue;
+            }
+
+            // Normal prerequisite check against virtual prerequisites
+            if !player_prereqs.contains(prereq) {
                 return false;
             }
         }
@@ -2268,6 +2339,7 @@ impl World {
         for (name, stats) in &self.rules.actors {
             if stats.cost <= 0 { continue; }
             if !self.has_prerequisites(player_id, name) { continue; }
+            let pq = Self::item_queue_type(stats);
             items.push(BuildableInfo {
                 name: name.clone(),
                 cost: stats.cost,
@@ -2277,6 +2349,8 @@ impl World {
                 footprint: stats.footprint,
                 locked: false,
                 prerequisites: stats.prerequisites.clone(),
+                queue_type: pq_type_name(pq).to_string(),
+                build_palette_order: stats.build_palette_order,
             });
         }
         items
@@ -2340,6 +2414,8 @@ impl World {
                 footprint: stats.footprint,
                 locked,
                 prerequisites: stats.prerequisites.clone(),
+                queue_type: pq_type_name(pq).to_string(),
+                build_palette_order: stats.build_palette_order,
             });
         }
         items
@@ -2812,8 +2888,10 @@ pub fn build_world(
 
     // Playable players
     let mut bot_player_ids: Vec<u32> = Vec::new();
+    let mut player_factions: HashMap<u32, String> = HashMap::new();
     for slot in &lobby.occupied_slots {
         let id = next_id;
+        player_factions.insert(id, slot.faction.clone());
         actors.insert(id, Actor {
             id,
             kind: ActorKind::Player,
@@ -3007,6 +3085,7 @@ pub fn build_world(
         rally_points: HashMap::new(),
         superweapon_timers: HashMap::new(),
         invulnerable: HashMap::new(),
+        player_factions,
     };
 
     // Initial shroud reveal around starting units
