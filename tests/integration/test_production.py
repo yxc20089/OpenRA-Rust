@@ -122,8 +122,9 @@ def test_train_multiple_units(game_page):
     if not tent:
         return
     order_start_production(game_page, "e1")
+    wait_ticks(game_page, 50)  # Let first order start processing
     order_start_production(game_page, "e1")
-    wait_ticks(game_page, 700)
+    wait_ticks(game_page, 800)
     snap = get_snapshot(game_page)
     e1_units = find_actors(snap, actor_type="e1", owner=pid)
     assert len(e1_units) >= 2, f"Should have at least 2 infantry, got {len(e1_units)}"
