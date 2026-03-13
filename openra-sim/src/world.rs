@@ -911,6 +911,14 @@ impl World {
 
     /// Handle PlaceBuilding order: create building actor and occupy terrain.
     fn order_place_building(&mut self, owner_player_id: u32, building_type: &str, x: i32, y: i32) {
+        // Verify the building is actually completed in the production queue
+        let has_completed = self.production.get(&owner_player_id)
+            .map(|items| items.iter().any(|i| i.item_name == building_type && i.is_done()))
+            .unwrap_or(false);
+        if !has_completed {
+            eprintln!("PLACE BLOCKED: {} not completed in queue", building_type);
+            return;
+        }
         let (footprint_w, footprint_h, hp) = self.rules.actor(building_type)
             .map(|s| (s.footprint.0, s.footprint.1, s.hp))
             .unwrap_or((2, 2, 50000));

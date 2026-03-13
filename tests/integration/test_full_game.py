@@ -117,10 +117,21 @@ def test_full_game_session(game_page):
     player = get_player(snap, pid)
     print(f"Power after powr: provided={player.get('power_provided',0)}, drained={player.get('power_drained',0)}")
 
-    # ── 8. Build barracks ──
+    # ── 8. Build refinery (required for weap) ──
+    order_start_production(page, "proc")
+    wait_ticks(page, 350)
+    rx, ry = fact["x"] - 3, fact["y"]
+    order_place_building(page, "proc", rx, ry)
+    wait_ticks(page, 5)
+
+    snap = get_snapshot(page)
+    proc = find_actor(snap, actor_type="proc", owner=pid)
+    assert proc, "Refinery not placed"
+
+    # ── 9. Build barracks ──
     order_start_production(page, "tent")
     wait_ticks(page, 350)
-    tx, ty = fact["x"] - 2, fact["y"]
+    tx, ty = fact["x"] - 2, fact["y"] + 3
     order_place_building(page, "tent", tx, ty)
     wait_ticks(page, 5)
     screenshot(page, "10_tent_placed")
@@ -129,7 +140,7 @@ def test_full_game_session(game_page):
     tent = find_actor(snap, actor_type="tent", owner=pid)
     assert tent, "Barracks not placed"
 
-    # ── 9. Build war factory ──
+    # ── 10. Build war factory ──
     order_start_production(page, "weap")
     wait_ticks(page, 400)
     wx, wy = fact["x"], fact["y"] + 3

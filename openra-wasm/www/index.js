@@ -661,10 +661,8 @@ function refreshQueue(snapshot) {
                 div.onclick = () => {
                     placementMode = { type: item.item_name, footprint: [bi.footprint[0], bi.footprint[1]] };
                     showMsg(`Place ${item.item_name}`);
+                    updateCursor();
                 };
-                if (!placementMode) {
-                    placementMode = { type: item.item_name, footprint: [bi.footprint[0], bi.footprint[1]] };
-                }
             }
         }
         queueList.appendChild(div);
