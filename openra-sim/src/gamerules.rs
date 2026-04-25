@@ -164,7 +164,12 @@ impl GameRules {
         }
 
         for (name, info) in &ruleset.weapons {
-            let damage = info.get_i32("Damage").unwrap_or(0);
+            // C# OpenRA stores `Damage` inside `Warhead@<n>: SpreadDamage` —
+            // walk the warhead children rather than the top-level `Damage:`
+            // field (which is empty for almost every weapon).
+            let damage = parse_damage_from_warheads(info)
+                .or_else(|| info.get_i32("Damage"))
+                .unwrap_or(0);
             let range = info.get("Range")
                 .map(|s| parse_range(s))
                 .unwrap_or(5 * 1024);
@@ -448,6 +453,34 @@ fn classify_actor(info: &openra_data::rules::ActorInfo) -> ActorKind {
     }
 }
 
+/// Walk a weapon's warhead children for the first `Warhead@*: SpreadDamage`
+/// block carrying a `Damage:` field. Returns `None` if no warhead has a
+/// damage value (e.g. CreateEffect / LeaveSmudge warheads).
+///
+/// Reference: `OpenRA.Mods.Common/Warheads/SpreadDamageWarhead.cs`.
+fn parse_damage_from_warheads(info: &openra_data::rules::WeaponInfo) -> Option<i32> {
+    for child in &info.children {
+        if !child.key.starts_with("Warhead") {
+            continue;
+        }
+        // The MiniYAML inheritance resolver leaves `Warhead@1Dam: SpreadDamage`
+        // as a node whose `value == "SpreadDamage"`. Other warhead types
+        // (CreateEffect, LeaveSmudge, ...) carry no Damage field; skip
+        // them by checking the value before peeking at children.
+        if child.value != "SpreadDamage" {
+            continue;
+        }
+        for gc in &child.children {
+            if gc.key == "Damage" {
+                if let Ok(d) = gc.value.parse::<i32>() {
+                    return Some(d);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Parse Versus block from weapon warhead children.
 fn parse_versus(info: &openra_data::rules::WeaponInfo) -> BTreeMap<ArmorType, i32> {
     let mut versus = BTreeMap::new();
@@ -520,5 +553,35 @@ mod tests {
         assert_eq!(parse_range("5c512"), 5632);
         assert_eq!(parse_range("3c0"), 3072);
         assert_eq!(parse_range("10"), 10240);
+    }
+
+    #[test]
+    fn weapon_damage_from_warhead_for_real_yaml() {
+        // Load the vendored RA ruleset and check Phase 6's representative
+        // weapons end up with the right damage values. Skips silently
+        // if the vendor dir is missing (CI without submodules).
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let mod_dir =
+            std::path::PathBuf::from(format!("{}/../vendor/OpenRA/mods/ra", manifest));
+        if !mod_dir.exists() {
+            eprintln!("skipping: vendored OpenRA mod dir not found");
+            return;
+        }
+        let ruleset = openra_data::rules::load_ruleset(&mod_dir).unwrap();
+        let rules = GameRules::from_ruleset(&ruleset);
+
+        // 25mm cannon (1tnk): SpreadDamage Damage = 2500
+        let w = rules.weapon("25mm").expect("25mm not parsed");
+        assert_eq!(w.damage, 2500, "25mm damage");
+        // 90mm (2tnk): inherits from ^Cannon Damage = 4000
+        let w = rules.weapon("90mm").expect("90mm not parsed");
+        assert_eq!(w.damage, 4000, "90mm damage");
+        // 105mm (3tnk): inherits 4000, burst 2
+        let w = rules.weapon("105mm").expect("105mm not parsed");
+        assert_eq!(w.damage, 4000, "105mm damage");
+        assert_eq!(w.burst, 2, "105mm burst");
+        // TurretGun (gun building): explicit Damage 6000
+        let w = rules.weapon("TurretGun").expect("TurretGun not parsed");
+        assert_eq!(w.damage, 6000, "TurretGun damage");
     }
 }
