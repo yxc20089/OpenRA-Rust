@@ -9,8 +9,14 @@
 //! - Map dimensions and bounds
 //! - Player definitions
 //! - Initial actors (trees, mines, spawn points)
+//!
+//! For the rush-hour scenario, see [`load_rush_hour_map`] which combines a
+//! base `.oramap` (for terrain + bounds) with a discovery scenario YAML
+//! (for the per-faction actor list).
 
+use crate::miniyaml;
 use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 
 /// A player definition from the map
 #[derive(Debug, Clone)]
@@ -293,6 +299,549 @@ fn parse_map_bin(data: &[u8], width: i32, height: i32) -> Vec<Vec<TileReference>
 
     tiles
 }
+
+// ---------------------------------------------------------------------------
+// Rush-hour scenario loader.
+//
+// Combines a base `.oramap` (terrain + bounds) with a Python-style scenario
+// YAML such as `OpenRA-RL-Training/scenarios/discovery/rush-hour.yaml`,
+// expanding `count: N` and `spawn_point` selection into a flat actor list.
+// ---------------------------------------------------------------------------
+
+/// One actor placed on the map by the rush-hour scenario.
+#[derive(Debug, Clone)]
+pub struct ScenarioActor {
+    /// Actor type, lowercase as written in the YAML (e.g. `"e1"`, `"dog"`).
+    /// Matches `Rules::unit(name)` after uppercasing.
+    pub actor_type: String,
+    /// Either `"agent"` or `"enemy"` from the scenario's owner tag.
+    pub owner: String,
+    /// Cell coordinates `(x, y)`. The scenario YAML uses cell units (1 cell
+    /// per integer step), the same convention as `MapActor::location`.
+    pub position: (i32, i32),
+}
+
+impl ScenarioActor {
+    /// Whether this actor is infantry-class (used by tests asserting the
+    /// "13 enemy + 5 own infantry" rush-hour spec). Matches the C# OpenRA
+    /// definition: any actor whose root chain is `^Infantry` (E1, E2, E3,
+    /// E4, E6, E7, MEDI, MECH, SHOK, SPY, ENGI, THF, DOG, CIV*).
+    pub fn is_infantry(&self) -> bool {
+        let t = self.actor_type.to_ascii_lowercase();
+        matches!(
+            t.as_str(),
+            "e1" | "e2"
+                | "e3"
+                | "e4"
+                | "e6"
+                | "e7"
+                | "medi"
+                | "mech"
+                | "shok"
+                | "spy"
+                | "engi"
+                | "thf"
+                | "dog"
+                | "c1"
+                | "c2"
+                | "c3"
+                | "c4"
+                | "c5"
+                | "c6"
+                | "c7"
+                | "c8"
+                | "c9"
+                | "c10"
+        )
+    }
+}
+
+/// Combined map definition for the rush-hour scenario: terrain from the
+/// base `.oramap`, actor placements from the scenario YAML.
+#[derive(Debug, Clone)]
+pub struct MapDef {
+    pub title: String,
+    pub tileset: String,
+    pub map_size: (i32, i32),
+    pub bounds: (i32, i32, i32, i32),
+    pub tiles: Vec<Vec<TileReference>>,
+    /// Player faction strings from the scenario YAML.
+    pub agent_faction: String,
+    pub enemy_faction: String,
+    /// All actors placed by the scenario (own + enemy), flattened across
+    /// `count:` expansion. The chosen `spawn_point` filter is already
+    /// applied to player actors; enemy actors do not have spawn_point.
+    pub actors: Vec<ScenarioActor>,
+}
+
+impl MapDef {
+    /// Actors owned by the agent (player).
+    pub fn agent_actors(&self) -> impl Iterator<Item = &ScenarioActor> {
+        self.actors.iter().filter(|a| a.owner == "agent")
+    }
+    /// Actors owned by the enemy (creeps).
+    pub fn enemy_actors(&self) -> impl Iterator<Item = &ScenarioActor> {
+        self.actors.iter().filter(|a| a.owner == "enemy")
+    }
+}
+
+/// Errors loading the rush-hour map.
+#[derive(Debug)]
+pub enum MapLoadError {
+    /// I/O failure reading either the scenario YAML or the base `.oramap`.
+    Io(io::Error),
+    /// The scenario YAML was missing a required field (e.g. `actors:`).
+    BadScenario(String),
+    /// The base map referenced by `base_map:` could not be located.
+    MissingBaseMap(PathBuf),
+}
+
+impl std::fmt::Display for MapLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MapLoadError::Io(e) => write!(f, "i/o error: {e}"),
+            MapLoadError::BadScenario(msg) => write!(f, "invalid scenario yaml: {msg}"),
+            MapLoadError::MissingBaseMap(p) => write!(
+                f,
+                "base map not found at {} — set base_map: in the scenario yaml \
+or place rush-hour-arena.oramap next to the scenario",
+                p.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MapLoadError {}
+
+impl From<io::Error> for MapLoadError {
+    fn from(e: io::Error) -> Self {
+        MapLoadError::Io(e)
+    }
+}
+
+/// Load the rush-hour scenario map.
+///
+/// `path` should point to the scenario YAML file (e.g.
+/// `scenarios/discovery/rush-hour.yaml`). The function:
+///
+/// 1. Parses the scenario's flat fields (`agent.faction`, `enemy.faction`,
+///    `base_map`).
+/// 2. Resolves the base map: if the `path/base_map` reference exists, loads
+///    that. Otherwise falls back to a sibling `rush-hour-arena.oramap`,
+///    then to `~/Projects/openra-rl/maps/rush-hour-arena.oramap`,
+///    then to `~/Projects/OpenRA-RL-Training/scenarios/maps/rush-hour-arena.oramap`.
+///    On total failure returns [`MapLoadError::MissingBaseMap`].
+/// 3. Expands the actor list: each entry's `count: N` is repeated N times
+///    (jitter is ignored — tests want a deterministic count). For agent
+///    actors, only entries matching the chosen `spawn_point` (default 0)
+///    are kept; enemy actors do not have spawn_points and are always kept.
+pub fn load_rush_hour_map(path: &Path) -> Result<MapDef, MapLoadError> {
+    load_rush_hour_map_with_spawn(path, 0)
+}
+
+/// Variant of [`load_rush_hour_map`] that selects a specific spawn point
+/// for the agent (0..=3 in the rush-hour scenario).
+pub fn load_rush_hour_map_with_spawn(
+    path: &Path,
+    spawn_point: i32,
+) -> Result<MapDef, MapLoadError> {
+    let scenario_text = std::fs::read_to_string(path)?;
+    let scenario = parse_scenario_yaml(&scenario_text)
+        .map_err(|e| MapLoadError::BadScenario(e.to_string()))?;
+
+    // Resolve the base_map path. Try, in order:
+    //   1) {scenario_dir}/{base_map} (relative ref in scenario yaml)
+    //   2) {scenario_dir}/rush-hour-arena.oramap
+    //   3) ~/Projects/openra-rl/maps/rush-hour-arena.oramap
+    //   4) ~/Projects/OpenRA-RL-Training/scenarios/maps/rush-hour-arena.oramap
+    let scenario_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tried: Vec<PathBuf> = Vec::new();
+
+    let mut base_path: Option<PathBuf> = None;
+    if let Some(rel) = &scenario.base_map_ref {
+        let p = scenario_dir.join(rel);
+        if p.exists() {
+            base_path = Some(p);
+        } else {
+            tried.push(p);
+        }
+    }
+    if base_path.is_none() {
+        let p = scenario_dir.join("rush-hour-arena.oramap");
+        if p.exists() {
+            base_path = Some(p);
+        } else {
+            tried.push(p);
+        }
+    }
+    if base_path.is_none()
+        && let Ok(home) = std::env::var("HOME")
+    {
+        for candidate in [
+            "Projects/openra-rl/maps/rush-hour-arena.oramap",
+            "Projects/OpenRA-RL-Training/scenarios/maps/rush-hour-arena.oramap",
+        ] {
+            let p = PathBuf::from(&home).join(candidate);
+            if p.exists() {
+                base_path = Some(p);
+                break;
+            } else {
+                tried.push(p);
+            }
+        }
+    }
+
+    let base_path = base_path
+        .ok_or_else(|| MapLoadError::MissingBaseMap(tried.last().cloned().unwrap_or_default()))?;
+
+    let base_bytes = std::fs::read(&base_path)?;
+    let base = parse(&base_bytes)?;
+
+    // Expand actors.
+    let actors = expand_scenario_actors(&scenario.actors, spawn_point);
+
+    Ok(MapDef {
+        title: base.title,
+        tileset: base.tileset,
+        map_size: base.map_size,
+        bounds: base.bounds,
+        tiles: base.tiles,
+        agent_faction: scenario.agent_faction,
+        enemy_faction: scenario.enemy_faction,
+        actors,
+    })
+}
+
+/// Internal: minimal in-memory representation of the discovery-style
+/// scenario YAML. We don't try to handle every PyYAML feature — only what
+/// the rush-hour scenarios use.
+#[derive(Debug, Default)]
+struct ScenarioYaml {
+    base_map_ref: Option<String>,
+    agent_faction: String,
+    enemy_faction: String,
+    actors: Vec<RawScenarioActor>,
+}
+
+#[derive(Debug, Clone)]
+struct RawScenarioActor {
+    actor_type: String,
+    owner: String,
+    position: (i32, i32),
+    count: i32,
+    spawn_point: Option<i32>,
+}
+
+/// Parse the discovery-style scenario YAML.
+///
+/// This is *not* the OpenRA MiniYaml dialect — it's PyYAML output, with
+/// list-of-dicts under `actors:`. We hand-roll a tiny parser for the
+/// subset we need (string scalars, int scalars, 2-element int lists, and
+/// list-of-dict).
+///
+/// Note: PyYAML emits list items at the *same* indent level as the
+/// containing key (e.g. `actors:` at col 0, then `- type: foo` also at col
+/// 0). The parser detects list items by their `- ` prefix rather than by
+/// indent depth, and consumes them until a non-list, non-blank line at
+/// indent 0 appears.
+fn parse_scenario_yaml(text: &str) -> io::Result<ScenarioYaml> {
+    let mut out = ScenarioYaml::default();
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let raw = lines[i];
+        let trimmed = strip_yaml_comment(raw).trim_end();
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+        let indent = leading_spaces(raw);
+        let trim_lead = trimmed.trim_start();
+
+        // List items at top level belong to whatever key opened the most
+        // recent list — but for our schema only `actors:` opens a list at
+        // top-level, and we already consume the entire actors block when
+        // we see the `actors:` line. Stray top-level list items here are
+        // leftover `tags:` items, which we just skip.
+        if trim_lead.starts_with("- ") && indent == 0 {
+            i += 1;
+            continue;
+        }
+
+        if indent == 0
+            && let Some((k, v)) = split_key_value(trimmed)
+        {
+            match k {
+                "base_map" => {
+                    out.base_map_ref = Some(v.to_string());
+                    i += 1;
+                    continue;
+                }
+                "agent" => {
+                    let (faction, ni) = read_block_faction(&lines, i + 1);
+                    out.agent_faction = faction;
+                    i = ni;
+                    continue;
+                }
+                "enemy" => {
+                    let (faction, ni) = read_block_faction(&lines, i + 1);
+                    out.enemy_faction = faction;
+                    i = ni;
+                    continue;
+                }
+                "actors" => {
+                    // The `actors:` line itself; the list items begin on
+                    // the next line at indent 0 (PyYAML compact form).
+                    let (actors, ni) = read_actors_list(&lines, i + 1, 0);
+                    out.actors = actors;
+                    i = ni;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+
+    if out.actors.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "scenario yaml has no actors: block (or it is empty)",
+        ));
+    }
+    Ok(out)
+}
+
+/// Read a `key: value` line. Returns the trimmed key and value, or `None`.
+fn split_key_value(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim();
+    let colon = line.find(':')?;
+    let key = line[..colon].trim();
+    let value = line[colon + 1..].trim();
+    Some((key, value))
+}
+
+/// Strip everything after the first `#` not preceded by `\`.
+fn strip_yaml_comment(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b'#' && (i == 0 || bytes[i - 1] != b'\\') {
+            return &s[..i];
+        }
+    }
+    s
+}
+
+fn leading_spaces(line: &str) -> usize {
+    line.bytes().take_while(|&b| b == b' ').count()
+}
+
+/// Inside a `agent:` or `enemy:` top-level block, read indented `faction:` line.
+/// Returns `(faction_string, next_line_index)`.
+fn read_block_faction(lines: &[&str], start: usize) -> (String, usize) {
+    let mut i = start;
+    let mut faction = String::new();
+    while i < lines.len() {
+        let raw = lines[i];
+        let trimmed = strip_yaml_comment(raw).trim_end();
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+        if leading_spaces(raw) == 0 {
+            break;
+        }
+        if let Some((k, v)) = split_key_value(trimmed)
+            && k == "faction"
+        {
+            faction = v.to_string();
+        }
+        i += 1;
+    }
+    (faction, i)
+}
+
+/// Parse the `actors:` list. Each list item starts with `- type: NAME` at
+/// `list_indent`. Within an item, lines indented further are properties
+/// (`owner`, `position`, `count`, `spawn_point`). `position:` is a
+/// 2-element list like `position:\n  - 5\n  - 6`. `randomize:` blocks are
+/// skipped. The block ends at the first non-empty line at indent
+/// `<list_indent` that is *not* a `- ` continuation, or when a top-level
+/// scalar key appears.
+fn read_actors_list(
+    lines: &[&str],
+    start: usize,
+    list_indent: usize,
+) -> (Vec<RawScenarioActor>, usize) {
+    let mut actors = Vec::new();
+    let mut i = start;
+
+    while i < lines.len() {
+        let raw = lines[i];
+        let trimmed = strip_yaml_comment(raw).trim_end();
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+        let indent = leading_spaces(raw);
+        let trim_lead = trimmed.trim_start();
+
+        if indent < list_indent {
+            // Indent decreased below the list — block is over.
+            break;
+        }
+
+        if indent == list_indent && !trim_lead.starts_with("- ") {
+            // A non-list line at the list's indent ends the block. This is
+            // how we leave `actors:` and reach the next top-level key
+            // (e.g. `reward:`).
+            break;
+        }
+
+        // List items begin with `- type: X` at the actors-block indent.
+        if let Some(rest) = trim_lead.strip_prefix("- ") {
+            // Start a new actor. The first key on this line is `type:`.
+            let mut actor = RawScenarioActor {
+                actor_type: String::new(),
+                owner: String::new(),
+                position: (0, 0),
+                count: 1,
+                spawn_point: None,
+            };
+            if let Some((k, v)) = split_key_value(rest)
+                && k == "type"
+            {
+                actor.actor_type = v.to_string();
+            }
+            i += 1;
+            // Properties of this list item are lines indented STRICTLY
+            // more than `list_indent` (PyYAML uses indent + 2 for the
+            // item body when the `- ` prefix is at column `list_indent`).
+            while i < lines.len() {
+                let sub = lines[i];
+                let sub_trim = strip_yaml_comment(sub).trim_end();
+                if sub_trim.is_empty() {
+                    i += 1;
+                    continue;
+                }
+                let sub_indent = leading_spaces(sub);
+                let sub_lead = sub_trim.trim_start();
+
+                if sub_indent <= list_indent {
+                    // Sibling list item (`- type:`) or block end.
+                    break;
+                }
+                let sub_kv = split_key_value(sub_lead);
+                match sub_kv {
+                    Some(("owner", v)) => actor.owner = v.to_string(),
+                    Some(("count", v)) => {
+                        actor.count = v.parse().unwrap_or(1);
+                    }
+                    Some(("spawn_point", v)) => {
+                        actor.spawn_point = v.parse().ok();
+                    }
+                    Some(("stance", _)) => { /* sim doesn't use this yet */ }
+                    Some(("position", "")) => {
+                        // 2-element list on the next two lines, at indent
+                        // sub_indent (sibling lines that start with `- N`).
+                        let (xy, ni) = read_xy_list(lines, i + 1, sub_indent);
+                        actor.position = xy;
+                        i = ni;
+                        continue;
+                    }
+                    Some(("randomize", "")) => {
+                        // Skip the entire block (we want deterministic
+                        // counts; sim adds jitter via its own rng).
+                        let block_indent = sub_indent;
+                        i += 1;
+                        while i < lines.len() {
+                            let inner = lines[i];
+                            let inner_trim = strip_yaml_comment(inner).trim_end();
+                            if !inner_trim.is_empty()
+                                && leading_spaces(inner) <= block_indent
+                            {
+                                break;
+                            }
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            actors.push(actor);
+            continue;
+        }
+        // Unrecognized content — skip.
+        i += 1;
+    }
+    (actors, i)
+}
+
+/// Read a 2-element scalar list. Items must be at indent
+/// `>= expected_indent` and begin with `- `. Returns the `(x, y)` pair and
+/// the next-line index.
+fn read_xy_list(lines: &[&str], start: usize, expected_indent: usize) -> ((i32, i32), usize) {
+    let mut vals: Vec<i32> = Vec::new();
+    let mut i = start;
+    while i < lines.len() && vals.len() < 2 {
+        let raw = lines[i];
+        let trimmed = strip_yaml_comment(raw).trim_end();
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+        let indent = leading_spaces(raw);
+        if indent < expected_indent {
+            break;
+        }
+        let trimmed_lead = trimmed.trim_start();
+        if let Some(rest) = trimmed_lead.strip_prefix("- ")
+            && let Ok(v) = rest.trim().parse::<i32>()
+        {
+            vals.push(v);
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    let xy = (
+        *vals.first().unwrap_or(&0),
+        *vals.get(1).unwrap_or(&0),
+    );
+    (xy, i)
+}
+
+/// Expand `count: N` into N copies and apply spawn_point filter for agent
+/// actors. Enemy actors are kept regardless of spawn_point.
+fn expand_scenario_actors(raw: &[RawScenarioActor], spawn_point: i32) -> Vec<ScenarioActor> {
+    let mut out = Vec::new();
+    for r in raw {
+        // Filter agent actors by spawn_point selection. Enemy actors don't
+        // have spawn_point set (None) and pass through unconditionally.
+        if r.owner == "agent" {
+            if r.spawn_point != Some(spawn_point) {
+                continue;
+            }
+        }
+        let n = r.count.max(1);
+        for _ in 0..n {
+            out.push(ScenarioActor {
+                actor_type: r.actor_type.clone(),
+                owner: r.owner.clone(),
+                position: r.position,
+            });
+        }
+    }
+    out
+}
+
+// Suppress an unused-import warning when miniyaml isn't referenced from
+// scenario parsing (we kept the import for future use).
+#[allow(unused_imports)]
+use miniyaml as _miniyaml;
 
 /// Parse an .oramap file (ZIP archive) from bytes.
 pub fn parse(data: &[u8]) -> io::Result<OraMap> {
