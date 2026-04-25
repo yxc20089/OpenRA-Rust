@@ -2837,6 +2837,32 @@ fn apply_temperat_passability(
     }
 }
 
+/// Test-only: insert a pre-built actor into the world's actor map and
+/// register its terrain occupant. Used by Phase-2 unit/integration tests
+/// that build hand-crafted scenarios without going through the map
+/// loader.
+#[doc(hidden)]
+pub fn insert_test_actor(world: &mut World, actor: Actor) {
+    let id = actor.id;
+    if let Some(loc) = actor.location {
+        world.terrain.set_occupant(loc.0, loc.1, id);
+    }
+    world.actors.insert(id, actor);
+    if id >= world.next_actor_id {
+        world.next_actor_id = id + 1;
+    }
+}
+
+/// Test-only: lift the world's "paused" flag so subsequent
+/// `process_frame` calls advance the tick counter without waiting for
+/// the order-latency buffer.
+#[doc(hidden)]
+pub fn set_test_unpaused(world: &mut World) {
+    world.paused = false;
+    world.frame_number = world.order_latency.saturating_add(1);
+    world.update_debug_pause_state();
+}
+
 /// Build a World from parsed map data, game seed, and lobby info.
 /// If `rules` is Some, uses the provided GameRules; otherwise uses hardcoded defaults.
 pub fn build_world(
