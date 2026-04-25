@@ -101,6 +101,7 @@ fn m1carbine() -> WeaponStats {
         range: WDist::from_cells(5),
         reload_delay: 20,
         damage: 1000,
+        ..Default::default()
     }
 }
 

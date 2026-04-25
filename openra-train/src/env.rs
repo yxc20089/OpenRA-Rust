@@ -14,7 +14,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use openra_data::oramap::{self, MapActor, MapDef, OraMap, PlayerDef, ScenarioActor};
+use openra_data::rules as data_rules;
 use openra_sim::actor::{Actor, ActorKind};
+use openra_sim::gamerules::GameRules;
 use openra_sim::math::{CPos, WAngle};
 use openra_sim::traits::TraitState;
 use openra_sim::world::{
@@ -23,7 +25,7 @@ use openra_sim::world::{
 };
 
 use crate::command::Command;
-use crate::observation::{EnemyPos, Observation, UnitPos};
+use crate::observation::{EnemyBuilding, EnemyPos, Observation, UnitPos};
 
 /// Default ticks-per-step (~ one game-second at NetFrameInterval=3
 /// and the engine's 25 ticks / second cadence; we use 30 for a round
@@ -340,7 +342,14 @@ impl Env {
         // Use the per-episode seed verbatim. `build_world` takes i32
         // for the seed — clamp the high bits.
         let seed_i32 = self.seed as u32 as i32;
-        let mut world = build_world(&ora, seed_i32, &lobby, None, 0);
+        // Phase 7 — load the vendored RA ruleset so building weapons
+        // (TurretGun, TeslaZap, …) and proper footprints (pbox=1×1,
+        // fact=3×2, proc=3×2) resolve correctly. Phase 8 also pulls a
+        // typed `data_rules::Rules` view so we can attach Vehicle /
+        // Turret typed components per actor below. Falls back to
+        // `GameRules::defaults` when the vendor dir is missing.
+        let (rules, typed_rules) = load_rules_with_fallback();
+        let mut world = build_world(&ora, seed_i32, &lobby, Some(rules), 0);
 
         // Resolve player ids: `build_world` allocates the World actor
         // (id 0), then non-playable players, then playable players, then
@@ -387,6 +396,12 @@ impl Env {
             };
             let actor = build_scenario_actor(next_id, sa, owner, &world);
             world::insert_test_actor(&mut world, actor);
+            // Phase 8 — attach Vehicle + Turret typed components for
+            // vehicle actors (2tnk, 1tnk, 3tnk, jeep, apc, harv, mcv).
+            // Static defenses with turrets (gun) carry their own
+            // armament path via classify_defense; we only need the
+            // typed component for query-by-tests / future visual aim.
+            attach_typed_components(&mut world, next_id, &sa.actor_type, &typed_rules);
             next_id += 1;
         }
 
@@ -521,6 +536,7 @@ impl Env {
                     unit_hp: Vec::new(),
                     enemy_positions: Vec::new(),
                     enemy_hp: Vec::new(),
+                    enemy_buildings: Vec::new(),
                     units_killed: 0,
                     game_tick: 0,
                     explored_percent: 0.0,
@@ -534,6 +550,7 @@ impl Env {
         let mut unit_hp: Vec<(String, f32)> = Vec::new();
         let mut enemy_positions: Vec<EnemyPos> = Vec::new();
         let mut enemy_hp: Vec<(String, f32)> = Vec::new();
+        let mut enemy_buildings: Vec<EnemyBuilding> = Vec::new();
 
         // ActorSnapshot list is ordered by actor.id (BTreeMap iteration
         // in `World::snapshot`), so output ordering is deterministic.
@@ -555,6 +572,14 @@ impl Env {
                 1.0
             };
             if a.owner == self.agent_player_id {
+                if matches!(a.kind, ActorKind::Building) {
+                    // Own buildings — Phase 7 surfaces them too, though
+                    // strategy scenarios don't pre-place any agent
+                    // structures yet (the rush-hour env has none either).
+                    // Still skip the unit lists since those carry combat
+                    // unit positions only.
+                    continue;
+                }
                 unit_positions.push((
                     id_str.clone(),
                     UnitPos {
@@ -567,12 +592,22 @@ impl Env {
                 if !self.is_visible_to_agent(world, a.x, a.y) {
                     continue;
                 }
-                enemy_positions.push(EnemyPos {
-                    cell_x: a.x,
-                    cell_y: a.y,
-                    id: id_str.clone(),
-                });
-                enemy_hp.push((id_str, pct));
+                if matches!(a.kind, ActorKind::Building) {
+                    enemy_buildings.push(EnemyBuilding {
+                        cell_x: a.x,
+                        cell_y: a.y,
+                        id: id_str,
+                        kind: a.actor_type.clone(),
+                        hp_pct: pct,
+                    });
+                } else {
+                    enemy_positions.push(EnemyPos {
+                        cell_x: a.x,
+                        cell_y: a.y,
+                        id: id_str.clone(),
+                    });
+                    enemy_hp.push((id_str, pct));
+                }
             }
         }
 
@@ -587,6 +622,7 @@ impl Env {
             unit_hp,
             enemy_positions,
             enemy_hp,
+            enemy_buildings,
             units_killed: self.units_killed,
             game_tick: world.world_tick as i32,
             explored_percent,
@@ -647,9 +683,15 @@ impl Env {
         if world.world_tick >= self.max_ticks {
             return true;
         }
-        // Either side at zero combat units → done.
-        let agent_alive = has_combat_units(world, self.agent_player_id);
-        let enemy_alive = has_combat_units(world, self.enemy_player_id);
+        // Either side at zero combat units AND zero buildings → done.
+        // Phase 7 — strategy scenarios place enemy buildings; the kill-
+        // all condition needs buildings cleared too. We retain the
+        // rush-hour semantics by including buildings in the alive check
+        // (rush-hour has no buildings, so the new check matches the old).
+        let agent_alive = has_combat_units(world, self.agent_player_id)
+            || has_buildings(world, self.agent_player_id);
+        let enemy_alive = has_combat_units(world, self.enemy_player_id)
+            || has_buildings(world, self.enemy_player_id);
         !agent_alive || !enemy_alive
     }
 }
@@ -687,6 +729,15 @@ fn scenario_id_seed(world: &World) -> u32 {
     max_id.max(1000) + 1
 }
 
+fn has_buildings(world: &World, player_id: u32) -> bool {
+    for aid in world.actor_ids_for_player(player_id) {
+        if matches!(world.actor_kind(aid), Some(ActorKind::Building)) {
+            return true;
+        }
+    }
+    false
+}
+
 fn has_combat_units(world: &World, player_id: u32) -> bool {
     for aid in world.actor_ids_for_player(player_id) {
         if let Some(kind) = world.actor_kind(aid) {
@@ -705,19 +756,101 @@ fn has_combat_units(world: &World, player_id: u32) -> bool {
     false
 }
 
-/// Build a freshly-spawned `Actor` from a `ScenarioActor`.
-fn build_scenario_actor(id: u32, sa: &ScenarioActor, owner: u32, world: &World) -> Actor {
-    let kind = if let Some(stats) = world.rules.actor(&sa.actor_type) {
-        stats.kind
-    } else {
-        kind_for_unit_type(&sa.actor_type)
+/// Phase 8 — look up the unit's typed `UnitInfo` and attach a
+/// `Vehicle` + (optionally) `Turret` typed component to the world's
+/// `typed_components` map.
+///
+/// We keep the attach logic conservative: only actors whose
+/// `UnitInfo.locomotor` is wheeled / tracked / heavy-tracked (i.e.
+/// classic vehicles) get a `Vehicle` component, and only those with a
+/// `Turreted.TurnSpeed` field also get a `Turret`. Infantry attaches
+/// nothing — the typed-component bundle is left empty.
+fn attach_typed_components(
+    world: &mut World,
+    actor_id: u32,
+    actor_type: &str,
+    typed_rules: &data_rules::Rules,
+) {
+    use openra_sim::math::WAngle;
+    use openra_sim::traits::{Locomotor, Turret, Vehicle};
+    use openra_sim::world::ActorTypedComponents;
+
+    // Lookup uses uppercase keys (matches the YAML actor name).
+    let unit_info = match typed_rules.unit(&actor_type.to_uppercase()) {
+        Some(u) => u,
+        None => return,
     };
-    let hp = world
-        .rules
-        .actor(&sa.actor_type)
-        .map(|s| s.hp)
-        .unwrap_or(50000);
+    if unit_info.locomotor.is_empty() {
+        return; // non-mobile — nothing to attach
+    }
+    let locomotor = Locomotor::from_yaml(&unit_info.locomotor);
+    if !locomotor.is_ground() {
+        return; // we don't yet ship aircraft / naval typed components
+    }
+    // Foot infantry (`dog`, `e1`, `e3`, `medi`) gets no Vehicle
+    // typed component — `Vehicle` is reserved for wheeled / tracked /
+    // heavy-tracked actors. Phase 8 keeps the type-safe split.
+    if matches!(locomotor, Locomotor::Foot) {
+        return;
+    }
+    let has_turret = unit_info.turret_turn_speed.is_some();
+    // Initial chassis facing matches `build_scenario_actor` (south =
+    // 512). The turret starts pointing the same way.
+    let initial_facing = WAngle::new(512);
+    let vehicle = Vehicle::new(locomotor, has_turret, initial_facing);
+    let turret = if has_turret {
+        let turn_speed = unit_info.turret_turn_speed.unwrap_or(28).max(0);
+        Some(Turret::with_tolerance(initial_facing, turn_speed, 4))
+    } else {
+        None
+    };
+    world.set_typed_components(
+        actor_id,
+        ActorTypedComponents { vehicle: Some(vehicle), turret },
+    );
+}
+
+/// Build a freshly-spawned `Actor` from a `ScenarioActor`.
+///
+/// Phase 7 changes
+/// ---------------
+/// * Buildings (`stats.kind == ActorKind::Building` or `stats.is_building`)
+///   now produce a `TraitState::Building { top_left }` + `Health` trait
+///   list and `kind = ActorKind::Building`. The world's tick loop sees
+///   them as static defenses and attaches auto-target via
+///   `traits::classify_defense` (see `tick_actors`).
+/// * Vehicles attach a `TraitState::BodyOrientation` + `Mobile` as before.
+fn build_scenario_actor(id: u32, sa: &ScenarioActor, owner: u32, world: &World) -> Actor {
+    let stats = world.rules.actor(&sa.actor_type);
+    let is_building = stats.map(|s| s.is_building).unwrap_or(false);
+    let kind = match stats {
+        Some(s) => s.kind,
+        None => kind_for_unit_type(&sa.actor_type),
+    };
+    let hp = stats.map(|s| s.hp).unwrap_or(50000);
     let cell = CPos::new(sa.position.0, sa.position.1);
+
+    if is_building || matches!(kind, ActorKind::Building) {
+        // Static structure: no Mobile trait, immobile center.
+        let center = center_of_cell(sa.position.0, sa.position.1);
+        return Actor {
+            id,
+            kind: ActorKind::Building,
+            owner_id: Some(owner),
+            location: Some(sa.position),
+            traits: vec![
+                TraitState::BodyOrientation { quantized_facings: 1 },
+                TraitState::Building { top_left: cell },
+                TraitState::Immobile { top_left: cell, center_position: center },
+                TraitState::Health { hp },
+            ],
+            activity: None,
+            actor_type: Some(sa.actor_type.clone()),
+            kills: 0,
+            rank: 0,
+        };
+    }
+
     let center = center_of_cell(sa.position.0, sa.position.1);
     let facing = WAngle::new(512).angle;
     Actor {
@@ -740,6 +873,41 @@ fn build_scenario_actor(id: u32, sa: &ScenarioActor, owner: u32, world: &World) 
         kills: 0,
         rank: 0,
     }
+}
+
+/// Resolve and load the vendored RA ruleset. Phase 7 requires the real
+/// ruleset so building weapons (TurretGun, TeslaZap, M60mg, …) can
+/// resolve damage / range / reload from `weapons.yaml`. Phase 8 also
+/// returns the typed `data_rules::Rules` view so the env loader can
+/// attach `Vehicle` / `Turret` typed components per actor.
+///
+/// Falls back to `GameRules::defaults()` (and an empty typed Rules)
+/// when the vendor dir is absent (e.g. CI without submodules).
+fn load_rules_with_fallback() -> (GameRules, data_rules::Rules) {
+    // Try common vendor locations relative to the runtime cwd, the
+    // env's manifest dir, and HOME. The first hit wins.
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(PathBuf::from(&home).join("Projects/OpenRA-Rust/vendor/OpenRA/mods/ra"));
+    }
+    candidates.push(PathBuf::from("vendor/OpenRA/mods/ra"));
+    candidates.push(PathBuf::from("../vendor/OpenRA/mods/ra"));
+    for c in &candidates {
+        if c.exists()
+            && let Ok(rs) = data_rules::load_ruleset(c)
+        {
+            let typed = data_rules::Rules::from_ruleset(&rs);
+            return (GameRules::from_ruleset(&rs), typed);
+        }
+    }
+    (
+        GameRules::defaults(),
+        data_rules::Rules {
+            units: std::collections::BTreeMap::new(),
+            weapons: std::collections::BTreeMap::new(),
+            buildings: std::collections::BTreeMap::new(),
+        },
+    )
 }
 
 fn kind_for_unit_type(t: &str) -> ActorKind {
