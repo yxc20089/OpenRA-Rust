@@ -4,6 +4,15 @@
 //! [VerifySync]-marked fields that contribute to the SyncHash computation.
 //! The `sync_hash()` method on each variant reproduces the IL-generated
 //! hash function from C# Sync.cs exactly.
+//!
+//! Phase-1 submodules (`health`, `mobile`) provide ergonomic typed
+//! components that wrap the synced `TraitState` variants.
+
+pub mod health;
+pub mod mobile;
+
+pub use health::Health;
+pub use mobile::Mobile;
 
 use crate::math::{CPos, WPos};
 
