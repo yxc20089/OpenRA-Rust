@@ -459,11 +459,43 @@ pub fn load_rush_hour_map_with_spawn(
 
     let mut base_path: Option<PathBuf> = None;
     if let Some(rel) = &scenario.base_map_ref {
+        // 1. Try scenario_dir/base_map (legacy rush-hour)
         let p = scenario_dir.join(rel);
         if p.exists() {
             base_path = Some(p);
         } else {
             tried.push(p);
+        }
+        // 2. Phase-7 layout: scenarios/strategy/scout-*.yaml references a
+        //    base_map that lives in `scenarios/maps/`. Try sibling
+        //    `../maps/<base_map>`.
+        if base_path.is_none() {
+            let p = scenario_dir.join("..").join("maps").join(rel);
+            if p.exists() {
+                base_path = Some(p);
+            } else {
+                tried.push(p);
+            }
+        }
+        // 3. Try a co-located maps/ subdir.
+        if base_path.is_none() {
+            let p = scenario_dir.join("maps").join(rel);
+            if p.exists() {
+                base_path = Some(p);
+            } else {
+                tried.push(p);
+            }
+        }
+        // 4. Walk up to grandparent / scenarios/maps for very nested layouts.
+        if base_path.is_none()
+            && let Some(parent) = scenario_dir.parent()
+        {
+            let p = parent.join("maps").join(rel);
+            if p.exists() {
+                base_path = Some(p);
+            } else {
+                tried.push(p);
+            }
         }
     }
     if base_path.is_none() {
@@ -592,8 +624,12 @@ fn parse_scenario_yaml(text: &str) -> io::Result<ScenarioYaml> {
                 }
                 "actors" => {
                     // The `actors:` line itself; the list items begin on
-                    // the next line at indent 0 (PyYAML compact form).
-                    let (actors, ni) = read_actors_list(&lines, i + 1, 0);
+                    // the next line at indent 0 (PyYAML compact form) or
+                    // at indent > 0 (block form, e.g. scout-maginot uses
+                    // 2-space indented list items). Detect the actual
+                    // indent of the first `- ` item.
+                    let detected_indent = detect_list_indent(&lines, i + 1).unwrap_or(0);
+                    let (actors, ni) = read_actors_list(&lines, i + 1, detected_indent);
                     out.actors = actors;
                     i = ni;
                     continue;
@@ -712,7 +748,9 @@ fn read_actors_list(
             if let Some((k, v)) = split_key_value(rest)
                 && k == "type"
             {
-                actor.actor_type = v.to_string();
+                // Strip surrounding quotes if present (PyYAML may emit
+                // them for actor types like `"2tnk"`).
+                actor.actor_type = strip_quotes(v).to_string();
             }
             i += 1;
             // Properties of this list item are lines indented STRICTLY
@@ -750,6 +788,12 @@ fn read_actors_list(
                         i = ni;
                         continue;
                     }
+                    // Phase-7: inline flow form `position: [18, 25]`.
+                    Some(("position", v)) if v.starts_with('[') => {
+                        if let Some(xy) = parse_inline_xy(v) {
+                            actor.position = xy;
+                        }
+                    }
                     Some(("randomize", "")) => {
                         // Skip the entire block (we want deterministic
                         // counts; sim adds jitter via its own rng).
@@ -778,6 +822,52 @@ fn read_actors_list(
         i += 1;
     }
     (actors, i)
+}
+
+/// Strip surrounding ASCII double or single quotes from a YAML scalar.
+fn strip_quotes(s: &str) -> &str {
+    let s = s.trim();
+    if s.len() >= 2 {
+        let bytes = s.as_bytes();
+        let first = bytes[0];
+        let last = bytes[s.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
+}
+
+/// Find the indent of the first `- ` item in `lines[start..]`.
+/// Used to support both PyYAML compact form (list at column 0) and
+/// block form (list at indent > 0).
+fn detect_list_indent(lines: &[&str], start: usize) -> Option<usize> {
+    for i in start..lines.len() {
+        let raw = lines[i];
+        let trimmed = strip_yaml_comment(raw).trim_end();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let trim_lead = trimmed.trim_start();
+        if trim_lead.starts_with("- ") {
+            return Some(leading_spaces(raw));
+        }
+        // Stop scanning at the next non-list, non-blank line — the
+        // actors block hasn't started yet, so we shouldn't be here.
+        return None;
+    }
+    None
+}
+
+/// Parse `[X, Y]` flow-list, e.g. `[18, 25]`. Returns `None` on malformed
+/// input. Used by Phase-7 strategy scenarios which inline positions.
+fn parse_inline_xy(s: &str) -> Option<(i32, i32)> {
+    let trim = s.trim();
+    let inner = trim.strip_prefix('[')?.strip_suffix(']')?;
+    let mut parts = inner.split(',');
+    let x: i32 = parts.next()?.trim().parse().ok()?;
+    let y: i32 = parts.next()?.trim().parse().ok()?;
+    Some((x, y))
 }
 
 /// Read a 2-element scalar list. Items must be at indent
@@ -816,15 +906,23 @@ fn read_xy_list(lines: &[&str], start: usize, expected_indent: usize) -> ((i32, 
 
 /// Expand `count: N` into N copies and apply spawn_point filter for agent
 /// actors. Enemy actors are kept regardless of spawn_point.
+///
+/// Phase 7: when *no* agent actor has a spawn_point set (i.e. the
+/// scenario doesn't use the multi-spawn pattern at all — e.g. the
+/// scout-* strategy scenarios), we keep every agent actor without
+/// filtering. This preserves the rush-hour multi-spawn semantics while
+/// allowing simpler scenarios to omit the `spawn_point:` field.
 fn expand_scenario_actors(raw: &[RawScenarioActor], spawn_point: i32) -> Vec<ScenarioActor> {
+    let any_agent_has_spawn = raw
+        .iter()
+        .any(|r| r.owner == "agent" && r.spawn_point.is_some());
     let mut out = Vec::new();
     for r in raw {
-        // Filter agent actors by spawn_point selection. Enemy actors don't
-        // have spawn_point set (None) and pass through unconditionally.
-        if r.owner == "agent" {
-            if r.spawn_point != Some(spawn_point) {
-                continue;
-            }
+        // Filter agent actors by spawn_point selection ONLY if the
+        // scenario actually uses spawn points. Enemy actors don't have
+        // spawn_point set (None) and pass through unconditionally.
+        if r.owner == "agent" && any_agent_has_spawn && r.spawn_point != Some(spawn_point) {
+            continue;
         }
         let n = r.count.max(1);
         for _ in 0..n {

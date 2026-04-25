@@ -46,13 +46,21 @@ pub struct ActorStats {
 }
 
 /// Compiled stats for one weapon type.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct WeaponStats {
     pub damage: i32,
     pub range: i32,
     pub reload_delay: i32,
     pub burst: i32,
     pub versus: BTreeMap<ArmorType, i32>,
+    /// Phase 8: `Projectile.Speed` in world units per tick. Zero means
+    /// `Projectile: InstantHit` — apply damage immediately at fire
+    /// time. Non-zero means spawn a `Projectile` entity that flies to
+    /// the target over multiple ticks and applies damage on impact.
+    pub projectile_speed: i32,
+    /// Phase 8: `Warhead@*: SpreadDamage -> Spread` in world units.
+    /// Zero for single-target weapons; ~128 for RedEye.
+    pub splash_radius: i32,
 }
 
 /// All game rules compiled for fast simulation lookups.
@@ -164,7 +172,13 @@ impl GameRules {
         }
 
         for (name, info) in &ruleset.weapons {
-            let damage = info.get_i32("Damage").unwrap_or(0);
+            // C# OpenRA stores `Damage` inside `Warhead@<n>: SpreadDamage` —
+            // walk the warhead children rather than the top-level `Damage:`
+            // field (which is empty for almost every weapon). Phase 8 also
+            // accepts `Warhead@*: TargetDamage` (e.g. DogJaw).
+            let damage = parse_damage_from_warheads(info)
+                .or_else(|| info.get_i32("Damage"))
+                .unwrap_or(0);
             let range = info.get("Range")
                 .map(|s| parse_range(s))
                 .unwrap_or(5 * 1024);
@@ -174,12 +188,18 @@ impl GameRules {
             // Parse Versus block from warhead children
             let versus = parse_versus(info);
 
+            // Phase 8 — projectile speed & splash radius.
+            let projectile_speed = parse_projectile_speed(info);
+            let splash_radius = parse_splash_radius(info);
+
             weapons.insert(name.clone(), WeaponStats {
                 damage,
                 range,
                 reload_delay,
                 burst,
                 versus,
+                projectile_speed,
+                splash_radius,
             });
         }
 
@@ -361,6 +381,8 @@ impl GameRules {
             reload_delay: 1,
             burst: 1,
             versus: BTreeMap::new(),
+            projectile_speed: 0,
+            splash_radius: 0,
         });
 
         GameRules { actors, weapons }
@@ -448,6 +470,106 @@ fn classify_actor(info: &openra_data::rules::ActorInfo) -> ActorKind {
     }
 }
 
+/// Walk a weapon's warhead children for the first damaging warhead
+/// (`Warhead@*: SpreadDamage` or `Warhead@*: TargetDamage`) carrying a
+/// `Damage:` field. Returns `None` if no warhead has a damage value
+/// (e.g. CreateEffect / LeaveSmudge warheads).
+///
+/// Reference: `OpenRA.Mods.Common/Warheads/SpreadDamageWarhead.cs` and
+/// `TargetDamageWarhead.cs` (used by DogJaw for melee).
+fn parse_damage_from_warheads(info: &openra_data::rules::WeaponInfo) -> Option<i32> {
+    for child in &info.children {
+        if !child.key.starts_with("Warhead") {
+            continue;
+        }
+        // The MiniYAML inheritance resolver leaves `Warhead@1Dam: SpreadDamage`
+        // as a node whose `value == "SpreadDamage"`. Other warhead types
+        // (CreateEffect, LeaveSmudge, ...) carry no Damage field; skip
+        // them by checking the value before peeking at children.
+        if child.value != "SpreadDamage" && child.value != "TargetDamage" {
+            continue;
+        }
+        for gc in &child.children {
+            if gc.key == "Damage" {
+                if let Ok(d) = gc.value.parse::<i32>() {
+                    return Some(d);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Phase 8 — parse `Projectile.Speed` (in world units per tick).
+///
+/// `Projectile: InstantHit` returns 0; `Projectile: Missile / Bullet`
+/// returns the parsed `Speed:` if present. Anything else (e.g.
+/// `Projectile: TeslaZap`) returns 0 — those are visual-effect-only
+/// projectile classes treated as instant in the sim.
+///
+/// Speed values use the C# WDist text format. Plain integers (`853`)
+/// are raw fixed-point units; `1c682` is `1*1024+682 = 1706` units.
+fn parse_projectile_speed(info: &openra_data::rules::WeaponInfo) -> i32 {
+    for child in &info.children {
+        if child.key != "Projectile" {
+            continue;
+        }
+        let class = child.value.trim();
+        if class != "Missile" && class != "Bullet" {
+            return 0;
+        }
+        for gc in &child.children {
+            if gc.key == "Speed" {
+                return parse_wdist_text(&gc.value);
+            }
+        }
+        return 0;
+    }
+    0
+}
+
+/// Phase 8 — parse splash radius from `Warhead@*: SpreadDamage -> Spread`.
+///
+/// Returned in world units (1024 = 1 cell). Zero when not specified
+/// (single-target weapons). Inheritance is already resolved by the
+/// upstream MiniYAML loader. Plain numbers are raw fixed-point units;
+/// `Spread: 128` returns `128`, not `128 * 1024`.
+fn parse_splash_radius(info: &openra_data::rules::WeaponInfo) -> i32 {
+    for child in &info.children {
+        if !child.key.starts_with("Warhead") {
+            continue;
+        }
+        if child.value != "SpreadDamage" {
+            continue;
+        }
+        for gc in &child.children {
+            if gc.key == "Spread" {
+                return parse_wdist_text(&gc.value);
+            }
+        }
+    }
+    0
+}
+
+/// Parse a C# `WDist` text literal correctly: plain integer = raw
+/// fixed-point units (NOT cells), `Xc<sub>` = X*1024+sub. This
+/// matches `OpenRA.Game/WDist.cs::TryParse` and the openra-data
+/// `parse_wdist` helper. Unlike the Phase-3 `parse_range` helper
+/// (which incorrectly multiplies plain integers by 1024 — preserved
+/// for backward compatibility), this helper is used for fields that
+/// always carry raw wdist values (`Speed`, `Spread`).
+fn parse_wdist_text(s: &str) -> i32 {
+    let s = s.trim();
+    if let Some(idx) = s.find('c') {
+        let cells: i32 = s[..idx].trim().parse().unwrap_or(0);
+        let sub: i32 = s[idx + 1..].trim().parse().unwrap_or(0);
+        let sign = if cells < 0 { -1 } else { 1 };
+        cells * 1024 + sign * sub
+    } else {
+        s.parse::<i32>().unwrap_or(0)
+    }
+}
+
 /// Parse Versus block from weapon warhead children.
 fn parse_versus(info: &openra_data::rules::WeaponInfo) -> BTreeMap<ArmorType, i32> {
     let mut versus = BTreeMap::new();
@@ -520,5 +642,35 @@ mod tests {
         assert_eq!(parse_range("5c512"), 5632);
         assert_eq!(parse_range("3c0"), 3072);
         assert_eq!(parse_range("10"), 10240);
+    }
+
+    #[test]
+    fn weapon_damage_from_warhead_for_real_yaml() {
+        // Load the vendored RA ruleset and check Phase 6's representative
+        // weapons end up with the right damage values. Skips silently
+        // if the vendor dir is missing (CI without submodules).
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let mod_dir =
+            std::path::PathBuf::from(format!("{}/../vendor/OpenRA/mods/ra", manifest));
+        if !mod_dir.exists() {
+            eprintln!("skipping: vendored OpenRA mod dir not found");
+            return;
+        }
+        let ruleset = openra_data::rules::load_ruleset(&mod_dir).unwrap();
+        let rules = GameRules::from_ruleset(&ruleset);
+
+        // 25mm cannon (1tnk): SpreadDamage Damage = 2500
+        let w = rules.weapon("25mm").expect("25mm not parsed");
+        assert_eq!(w.damage, 2500, "25mm damage");
+        // 90mm (2tnk): inherits from ^Cannon Damage = 4000
+        let w = rules.weapon("90mm").expect("90mm not parsed");
+        assert_eq!(w.damage, 4000, "90mm damage");
+        // 105mm (3tnk): inherits 4000, burst 2
+        let w = rules.weapon("105mm").expect("105mm not parsed");
+        assert_eq!(w.damage, 4000, "105mm damage");
+        assert_eq!(w.burst, 2, "105mm burst");
+        // TurretGun (gun building): explicit Damage 6000
+        let w = rules.weapon("TurretGun").expect("TurretGun not parsed");
+        assert_eq!(w.damage, 6000, "TurretGun damage");
     }
 }

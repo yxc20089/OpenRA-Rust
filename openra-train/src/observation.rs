@@ -9,6 +9,8 @@
 //!   "unit_hp":          {actor_id_str: hp_pct_float},     # 0.0..1.0
 //!   "enemy_positions":  [{"cell_x": int, "cell_y": int, "id": str}, ...],
 //!   "enemy_hp":         {actor_id_str: hp_pct_float},     # 0.0..1.0
+//!   "enemy_buildings_summary": [{"cell_x": int, "cell_y": int,
+//!                                "type": str, "hp_pct": float, "id": str}, ...],
 //!   "units_killed":     int,                              # cumulative
 //!   "game_tick":        int,
 //!   "explored_percent": float,                            # 0..100
@@ -36,6 +38,19 @@ pub struct EnemyPos {
     pub id: String,
 }
 
+/// Phase-7 enemy-building entry surfaced through `enemy_buildings_summary`.
+/// Buildings are visible to the agent only after their footprint (or
+/// neighbouring cells) has entered the typed shroud.
+#[derive(Debug, Clone)]
+pub struct EnemyBuilding {
+    pub cell_x: i32,
+    pub cell_y: i32,
+    pub id: String,
+    pub kind: String,
+    /// HP fraction in [0, 1].
+    pub hp_pct: f32,
+}
+
 /// All fields the Python rollout pipeline reads off an observation.
 ///
 /// Stored with native Rust types; the PyO3 boundary layer (in
@@ -53,6 +68,9 @@ pub struct Observation {
     pub enemy_positions: Vec<EnemyPos>,
     /// Visible enemies. HP fraction in [0, 1].
     pub enemy_hp: Vec<(String, f32)>,
+    /// Phase-7 visible enemy buildings, fog-filtered the same way as
+    /// `enemy_positions`. Empty for scenarios with no enemy structures.
+    pub enemy_buildings: Vec<EnemyBuilding>,
     /// Cumulative own-team kills.
     pub units_killed: i32,
     /// Current world tick.
@@ -115,6 +133,14 @@ impl Observation {
             bytes_of_f32(*hp, &mut h);
         }
         mix(&mut h, b'|');
+        for eb in &self.enemy_buildings {
+            bytes_of_str(&eb.id, &mut h);
+            bytes_of_str(&eb.kind, &mut h);
+            bytes_of_i32(eb.cell_x, &mut h);
+            bytes_of_i32(eb.cell_y, &mut h);
+            bytes_of_f32(eb.hp_pct, &mut h);
+        }
+        mix(&mut h, b'|');
         bytes_of_i32(self.units_killed, &mut h);
         bytes_of_i32(self.game_tick, &mut h);
         bytes_of_f32(self.explored_percent, &mut h);
@@ -168,6 +194,22 @@ mod py {
                 enemy_hp.set_item(id, *hp)?;
             }
             d.set_item("enemy_hp", enemy_hp)?;
+
+            // enemy_buildings_summary: [{cell_x, cell_y, id, type, hp_pct}]
+            // Phase 7 — Python rollout pipeline reads this list to track
+            // building discovery, `must_be_destroyed` win-condition state,
+            // and per-building HP for combat/disruption rewards.
+            let enemy_buildings = PyList::empty_bound(py);
+            for eb in &self.enemy_buildings {
+                let entry = PyDict::new_bound(py);
+                entry.set_item("cell_x", eb.cell_x)?;
+                entry.set_item("cell_y", eb.cell_y)?;
+                entry.set_item("id", &eb.id)?;
+                entry.set_item("type", &eb.kind)?;
+                entry.set_item("hp_pct", eb.hp_pct)?;
+                enemy_buildings.append(entry)?;
+            }
+            d.set_item("enemy_buildings_summary", enemy_buildings)?;
 
             d.set_item("units_killed", self.units_killed)?;
             d.set_item("game_tick", self.game_tick)?;
