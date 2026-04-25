@@ -1,0 +1,6 @@
+# Cross-impl rules diff
+# Python source: local:/Users/berta/Projects/OpenRA-Rust/vendor/OpenRA/mods/ra
+# Rust source:   rust:vendor/OpenRA/mods/ra
+
+
+# 0 mismatch(es)
