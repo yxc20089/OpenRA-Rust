@@ -8,6 +8,7 @@ pub mod actor;
 pub mod ai;
 pub mod gamerules;
 pub mod math;
+pub mod order;
 pub mod pathfinder;
 pub mod rng;
 pub mod sync;
