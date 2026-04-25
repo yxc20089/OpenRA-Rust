@@ -276,6 +276,16 @@ pub struct World {
     invulnerable: HashMap<u32, i32>,
     /// Player faction mapping: player_actor_id → faction name.
     player_factions: HashMap<u32, String>,
+    /// Phase-3 typed per-player shroud (visible + explored bool grids).
+    /// Refreshed by `update_typed_shroud_all_players` (called from
+    /// `World::tick`). The legacy `shroud: Vec<CellLayer<u8>>` above
+    /// is kept untouched for the existing 0/1/2-state observation
+    /// pipeline.
+    typed_shroud: BTreeMap<u32, crate::traits::Shroud>,
+    /// Combat-tally counter: per-player count of enemy actors killed.
+    /// Incremented in `tick_actors` whenever a player's attack reduces
+    /// a target's HP ≤ 0. Read via `kills_for_player`.
+    kills_per_player: BTreeMap<u32, u32>,
 }
 
 impl World {
@@ -1789,8 +1799,11 @@ impl World {
             }
         }
         // Apply damage (skip invulnerable actors)
+        // Track which attacker scored each kill so we can credit
+        // `kills_per_player` and bump the attacker's `kills` field.
         let mut dead_actors: Vec<u32> = Vec::new();
-        for (_attacker, target_id, damage) in &attacks {
+        let mut kill_credits: Vec<(u32, u32)> = Vec::new(); // (attacker_id, victim_id)
+        for (attacker_id, target_id, damage) in &attacks {
             if self.invulnerable.contains_key(target_id) { continue; }
             if let Some(target) = self.actors.get_mut(target_id) {
                 for t in &mut target.traits {
@@ -1798,10 +1811,24 @@ impl World {
                         *hp -= damage;
                         if *hp <= 0 {
                             dead_actors.push(*target_id);
+                            kill_credits.push((*attacker_id, *target_id));
                         }
                         break;
                     }
                 }
+            }
+        }
+        // Credit each kill to the attacker (Actor.kills) and the
+        // attacker's owning player (kills_per_player). Done in
+        // attacker-id order to keep credit assignment deterministic.
+        kill_credits.sort_by_key(|(aid, vid)| (*aid, *vid));
+        for (attacker_id, _victim) in &kill_credits {
+            let owner = self.actors.get(attacker_id).and_then(|a| a.owner_id);
+            if let Some(att) = self.actors.get_mut(attacker_id) {
+                att.kills = att.kills.saturating_add(1);
+            }
+            if let Some(pid) = owner {
+                *self.kills_per_player.entry(pid).or_insert(0) += 1;
             }
         }
         // Remove dead actors
@@ -2588,6 +2615,151 @@ impl World {
             }
         })
     }
+
+    // ----- Phase 3: combat + shroud accessors -----------------------------
+
+    /// Read-only actor lookup (Phase-3 typed combat code paths).
+    pub fn actor(&self, actor_id: u32) -> Option<&Actor> {
+        self.actors.get(&actor_id)
+    }
+
+    /// Mutable actor lookup (Phase-3 typed combat code paths).
+    pub fn actor_mut(&mut self, actor_id: u32) -> Option<&mut Actor> {
+        self.actors.get_mut(&actor_id)
+    }
+
+    /// Compact summary used by Phase-3 activities (cell + alive flag).
+    pub fn actor_summary(&self, actor_id: u32) -> Option<crate::traits::ActorSummary> {
+        let a = self.actors.get(&actor_id)?;
+        let cell = a.location.map(|(x, y)| crate::math::CPos::new(x, y))?;
+        // Alive iff no Health trait OR Health.hp > 0.
+        let mut hp_seen = false;
+        let mut alive = true;
+        for t in &a.traits {
+            if let TraitState::Health { hp } = t {
+                hp_seen = true;
+                if *hp <= 0 { alive = false; }
+                break;
+            }
+        }
+        let _ = hp_seen;
+        Some(crate::traits::ActorSummary { cell, is_dead: !alive })
+    }
+
+    /// Map width in cells.
+    pub fn map_width(&self) -> i32 {
+        self.map_width
+    }
+
+    /// Map height in cells.
+    pub fn map_height(&self) -> i32 {
+        self.map_height
+    }
+
+    /// Per-player typed shroud table. Lazily built — call
+    /// `update_typed_shroud_all_players` to refresh.
+    pub fn typed_shroud(&self, player_id: u32) -> Option<&crate::traits::Shroud> {
+        self.typed_shroud.get(&player_id)
+    }
+
+    /// Total kills credited to `player_id` across all combat paths
+    /// (data-driven `tick_actors` + trait-based `AttackActivity`).
+    /// Updated whenever a target's HP reaches zero from one of that
+    /// player's actors' attacks.
+    pub fn kills_for_player(&self, player_id: u32) -> u32 {
+        self.kills_per_player.get(&player_id).copied().unwrap_or(0)
+    }
+
+    /// Increment the kills-tally for `player_id`. Used by the typed
+    /// `AttackActivity` path; callers credit the kill exactly once per
+    /// fatal hit.
+    #[doc(hidden)]
+    pub fn credit_kill(&mut self, player_id: u32) {
+        *self.kills_per_player.entry(player_id).or_insert(0) += 1;
+    }
+
+    /// Recompute the typed `Shroud` for every player from current
+    /// actor positions. Reveal range is taken from
+    /// `RevealsShroud.Range` in the rules; absent units fall back
+    /// to a kind-based default sight (matching `update_shroud`).
+    pub fn update_typed_shroud_all_players(&mut self) {
+        // Snapshot every relevant actor (owner, kind, cell, reveal range).
+        let mut entries: Vec<(u32, crate::actor::ActorKind, crate::math::CPos, Option<openra_data::rules::WDist>)> = Vec::new();
+        for a in self.actors.values() {
+            let Some(owner) = a.owner_id else { continue };
+            let Some((x, y)) = a.location else { continue };
+            // Try sight_range from the existing GameRules (already
+            // populated from RevealsShroud.Range during load).
+            let reveal = a.actor_type.as_deref()
+                .and_then(|t| self.rules.actor(t))
+                .map(|s| openra_data::rules::WDist::from_cells(s.sight_range));
+            entries.push((owner, a.kind, crate::math::CPos::new(x, y), reveal));
+        }
+        for &pid in &self.player_actor_ids.clone() {
+            let entry = self.typed_shroud.entry(pid)
+                .or_insert_with(|| crate::traits::Shroud::new(self.map_width, self.map_height));
+            crate::traits::update_from_actors(entry, entries.iter().copied(), pid);
+        }
+    }
+
+    /// Phase-3 win condition: returns the player ids whose
+    /// `MustBeDestroyed` opponents are all dead.
+    ///
+    /// `MustBeDestroyed` is an actor-level trait flag in the rules
+    /// (Phase-4 typed it as `UnitInfo.must_be_destroyed`); we check
+    /// for its presence via the `GameRules` actor classification —
+    /// in this minimal sprint, a player is the "winner" against any
+    /// opponent that has zero alive infantry/vehicle/MCV/building
+    /// actors. Returns players sorted by id.
+    pub fn winners(&self) -> Vec<u32> {
+        // Determine which players still have any "destroyable" actors.
+        let mut alive_players: std::collections::BTreeSet<u32> = Default::default();
+        for a in self.actors.values() {
+            let Some(owner) = a.owner_id else { continue };
+            if !matches!(a.kind, crate::actor::ActorKind::Building
+                | crate::actor::ActorKind::Infantry
+                | crate::actor::ActorKind::Vehicle
+                | crate::actor::ActorKind::Mcv
+                | crate::actor::ActorKind::Aircraft
+                | crate::actor::ActorKind::Ship) {
+                continue;
+            }
+            // Skip dead bodies (hp<=0) — they're typically removed
+            // by tick_actors but be defensive in case Phase-3 tests
+            // hold them around longer.
+            let alive = a.traits.iter().all(|t| match t {
+                TraitState::Health { hp } => *hp > 0,
+                _ => true,
+            });
+            if alive { alive_players.insert(owner); }
+        }
+        // Winners = playable players who are alive AND every other
+        // playable player has zero alive destroyable actors.
+        let mut out: Vec<u32> = Vec::new();
+        for &pid in &self.player_actor_ids {
+            if pid == self.everyone_player_id { continue; }
+            if !alive_players.contains(&pid) { continue; }
+            // Check that all OTHER players are gone.
+            let any_other_alive = self.player_actor_ids.iter().any(|&q| {
+                q != pid && q != self.everyone_player_id && alive_players.contains(&q)
+            });
+            if !any_other_alive {
+                out.push(pid);
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Phase-3 tick wrapper. Equivalent to `process_frame(orders)`
+    /// but additionally refreshes the typed shroud table after the
+    /// actor activities finish — the contract Phase-5 PyO3 callers
+    /// expect.
+    pub fn tick(&mut self, orders: &[GameOrder]) -> i32 {
+        let hash = self.process_frame(orders);
+        self.update_typed_shroud_all_players();
+        hash
+    }
 }
 
 /// Tick facing toward target by step, matching C#'s Util.TickFacing(WAngle).
@@ -2835,6 +3007,51 @@ fn apply_temperat_passability(
             }
         }
     }
+}
+
+/// Test-only: insert a pre-built actor into the world's actor map and
+/// register its terrain occupant. Used by Phase-2 unit/integration tests
+/// that build hand-crafted scenarios without going through the map
+/// loader.
+#[doc(hidden)]
+pub fn insert_test_actor(world: &mut World, actor: Actor) {
+    let id = actor.id;
+    if let Some(loc) = actor.location {
+        world.terrain.set_occupant(loc.0, loc.1, id);
+    }
+    world.actors.insert(id, actor);
+    if id >= world.next_actor_id {
+        world.next_actor_id = id + 1;
+    }
+}
+
+/// Test-only: remove an actor by id. Used by Phase-5 tests that need
+/// to strip auto-spawned MCVs/spawn beacons from a freshly built
+/// world before injecting their own scenario actors.
+#[doc(hidden)]
+pub fn remove_test_actor(world: &mut World, id: u32) -> Option<Actor> {
+    let actor = world.actors.remove(&id)?;
+    if let Some(loc) = actor.location {
+        world.terrain.clear_occupant(loc.0, loc.1);
+    }
+    Some(actor)
+}
+
+/// Test-only: enumerate every actor id currently registered. Used by
+/// Phase-5 to find auto-spawned MCVs.
+#[doc(hidden)]
+pub fn all_actor_ids(world: &World) -> Vec<u32> {
+    world.actors.keys().copied().collect()
+}
+
+/// Test-only: lift the world's "paused" flag so subsequent
+/// `process_frame` calls advance the tick counter without waiting for
+/// the order-latency buffer.
+#[doc(hidden)]
+pub fn set_test_unpaused(world: &mut World) {
+    world.paused = false;
+    world.frame_number = world.order_latency.saturating_add(1);
+    world.update_debug_pause_state();
 }
 
 /// Build a World from parsed map data, game seed, and lobby info.
@@ -3086,10 +3303,13 @@ pub fn build_world(
         superweapon_timers: HashMap::new(),
         invulnerable: HashMap::new(),
         player_factions,
+        typed_shroud: BTreeMap::new(),
+        kills_per_player: BTreeMap::new(),
     };
 
     // Initial shroud reveal around starting units
     world.update_shroud();
+    world.update_typed_shroud_all_players();
     world
 }
 

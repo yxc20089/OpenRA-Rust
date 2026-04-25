@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "openra_train"
+version = "0.1.0"
+description = "OpenRA-Rust training runtime — gym-like env for RL agents"
+requires-python = ">=3.9"
+license = { text = "GPL-3.0" }
+readme = "README_PY.md"
+
+# `maturin develop --release` builds the `openra-train` crate (cdylib +
+# rlib) with the `python` feature on, drops the resulting extension
+# module into the active virtualenv, and registers the package as
+# `openra_train`.
+[tool.maturin]
+manifest-path = "openra-train/Cargo.toml"
+features = ["openra-train/python"]
+module-name = "openra_train"
+strip = true
