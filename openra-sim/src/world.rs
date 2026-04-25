@@ -2988,6 +2988,25 @@ pub fn insert_test_actor(world: &mut World, actor: Actor) {
     }
 }
 
+/// Test-only: remove an actor by id. Used by Phase-5 tests that need
+/// to strip auto-spawned MCVs/spawn beacons from a freshly built
+/// world before injecting their own scenario actors.
+#[doc(hidden)]
+pub fn remove_test_actor(world: &mut World, id: u32) -> Option<Actor> {
+    let actor = world.actors.remove(&id)?;
+    if let Some(loc) = actor.location {
+        world.terrain.clear_occupant(loc.0, loc.1);
+    }
+    Some(actor)
+}
+
+/// Test-only: enumerate every actor id currently registered. Used by
+/// Phase-5 to find auto-spawned MCVs.
+#[doc(hidden)]
+pub fn all_actor_ids(world: &World) -> Vec<u32> {
+    world.actors.keys().copied().collect()
+}
+
 /// Test-only: lift the world's "paused" flag so subsequent
 /// `process_frame` calls advance the tick counter without waiting for
 /// the order-latency buffer.
