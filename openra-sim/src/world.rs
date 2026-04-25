@@ -282,6 +282,10 @@ pub struct World {
     /// is kept untouched for the existing 0/1/2-state observation
     /// pipeline.
     typed_shroud: BTreeMap<u32, crate::traits::Shroud>,
+    /// Combat-tally counter: per-player count of enemy actors killed.
+    /// Incremented in `tick_actors` whenever a player's attack reduces
+    /// a target's HP ≤ 0. Read via `kills_for_player`.
+    kills_per_player: BTreeMap<u32, u32>,
 }
 
 impl World {
@@ -1795,8 +1799,11 @@ impl World {
             }
         }
         // Apply damage (skip invulnerable actors)
+        // Track which attacker scored each kill so we can credit
+        // `kills_per_player` and bump the attacker's `kills` field.
         let mut dead_actors: Vec<u32> = Vec::new();
-        for (_attacker, target_id, damage) in &attacks {
+        let mut kill_credits: Vec<(u32, u32)> = Vec::new(); // (attacker_id, victim_id)
+        for (attacker_id, target_id, damage) in &attacks {
             if self.invulnerable.contains_key(target_id) { continue; }
             if let Some(target) = self.actors.get_mut(target_id) {
                 for t in &mut target.traits {
@@ -1804,10 +1811,24 @@ impl World {
                         *hp -= damage;
                         if *hp <= 0 {
                             dead_actors.push(*target_id);
+                            kill_credits.push((*attacker_id, *target_id));
                         }
                         break;
                     }
                 }
+            }
+        }
+        // Credit each kill to the attacker (Actor.kills) and the
+        // attacker's owning player (kills_per_player). Done in
+        // attacker-id order to keep credit assignment deterministic.
+        kill_credits.sort_by_key(|(aid, vid)| (*aid, *vid));
+        for (attacker_id, _victim) in &kill_credits {
+            let owner = self.actors.get(attacker_id).and_then(|a| a.owner_id);
+            if let Some(att) = self.actors.get_mut(attacker_id) {
+                att.kills = att.kills.saturating_add(1);
+            }
+            if let Some(pid) = owner {
+                *self.kills_per_player.entry(pid).or_insert(0) += 1;
             }
         }
         // Remove dead actors
@@ -2641,6 +2662,22 @@ impl World {
         self.typed_shroud.get(&player_id)
     }
 
+    /// Total kills credited to `player_id` across all combat paths
+    /// (data-driven `tick_actors` + trait-based `AttackActivity`).
+    /// Updated whenever a target's HP reaches zero from one of that
+    /// player's actors' attacks.
+    pub fn kills_for_player(&self, player_id: u32) -> u32 {
+        self.kills_per_player.get(&player_id).copied().unwrap_or(0)
+    }
+
+    /// Increment the kills-tally for `player_id`. Used by the typed
+    /// `AttackActivity` path; callers credit the kill exactly once per
+    /// fatal hit.
+    #[doc(hidden)]
+    pub fn credit_kill(&mut self, player_id: u32) {
+        *self.kills_per_player.entry(player_id).or_insert(0) += 1;
+    }
+
     /// Recompute the typed `Shroud` for every player from current
     /// actor positions. Reveal range is taken from
     /// `RevealsShroud.Range` in the rules; absent units fall back
@@ -3267,6 +3304,7 @@ pub fn build_world(
         invulnerable: HashMap::new(),
         player_factions,
         typed_shroud: BTreeMap::new(),
+        kills_per_player: BTreeMap::new(),
     };
 
     // Initial shroud reveal around starting units

@@ -485,6 +485,28 @@ impl Env {
     fn tick_world_with_orders(&mut self, orders: &[GameOrder]) {
         if let Some(world) = self.world.as_mut() {
             world.process_frame(orders);
+            // Refresh the typed shroud so observation/visibility reads
+            // use the post-tick state.
+            world.update_typed_shroud_all_players();
+        }
+    }
+
+    /// Return the most recent observation snapshot. Useful for tests
+    /// that want to peek at visible enemies between step calls
+    /// without re-stepping.
+    pub fn last_observation(&self) -> Observation {
+        self.observation()
+    }
+
+    /// World-level sync hash (sum of trait sync hashes + RNG state +
+    /// effects). Identical to `World::sync_hash`. Used by determinism
+    /// tests to detect divergence on RNG-dependent state that doesn't
+    /// surface through the public observation (e.g. the seeds-resource
+    /// timer, untouched MCV facing, internal pathfinder counters).
+    pub fn world_sync_hash(&self) -> i32 {
+        match &self.world {
+            Some(w) => w.sync_hash(),
+            None => 0,
         }
     }
 
@@ -571,105 +593,49 @@ impl Env {
         }
     }
 
-    /// Walk every agent unit and union sight-range cells into
-    /// `explored_cells`. The shroud layer is private inside
-    /// `World`, so we replay the same definition `update_shroud`
-    /// uses internally.
-    /// TODO(B): once Agent B exposes a `World::shroud(player)`
-    /// accessor, replace this with a direct read.
+    /// Refresh `explored_cells` from the agent's typed shroud
+    /// (`World::typed_shroud(player)`). The shroud's `is_explored`
+    /// flag is sticky — once a cell has been seen by any agent unit
+    /// it stays explored, matching OpenRA's `Shroud.IsExplored`.
     fn refresh_explored_cells(&mut self) {
         let world = match &self.world {
             Some(w) => w,
             None => return,
         };
-        let pids: Vec<u32> = world.actor_ids_for_player(self.agent_player_id);
+        let shroud = match world.typed_shroud(self.agent_player_id) {
+            Some(s) => s,
+            None => return,
+        };
         let (mw, mh) = self.map_def.map_size;
-        for pid in pids {
-            let kind = match world.actor_kind(pid) {
-                Some(k) => k,
-                None => continue,
-            };
-            let (cx, cy) = match world.actor_location(pid) {
-                Some(loc) => loc,
-                None => continue,
-            };
-            let sight = match kind {
-                ActorKind::Building => 5,
-                ActorKind::Infantry => 4,
-                ActorKind::Vehicle => 6,
-                ActorKind::Mcv => 5,
-                _ => continue,
-            };
-            for dy in -sight..=sight {
-                for dx in -sight..=sight {
-                    if dx * dx + dy * dy > sight * sight {
-                        continue;
-                    }
-                    let x = cx + dx;
-                    let y = cy + dy;
-                    if x < 0 || y < 0 || x >= mw || y >= mh {
-                        continue;
-                    }
+        for y in 0..mh {
+            for x in 0..mw {
+                if shroud.is_explored(x, y) {
                     self.explored_cells.insert((x, y));
                 }
             }
         }
     }
 
-    /// Cell visibility: same definition as `refresh_explored_cells`,
-    /// but only counts *currently* visible cells (i.e. within sight
-    /// range of any live agent unit).
+    /// Cell visibility via the typed shroud's `is_visible` flag —
+    /// only counts cells currently in sight of any agent unit.
     fn is_visible_to_agent(&self, world: &World, cx: i32, cy: i32) -> bool {
-        for pid in world.actor_ids_for_player(self.agent_player_id) {
-            let kind = match world.actor_kind(pid) {
-                Some(k) => k,
-                None => continue,
-            };
-            let (ax, ay) = match world.actor_location(pid) {
-                Some(p) => p,
-                None => continue,
-            };
-            let sight = match kind {
-                ActorKind::Building => 5,
-                ActorKind::Infantry => 4,
-                ActorKind::Vehicle => 6,
-                ActorKind::Mcv => 5,
-                _ => continue,
-            };
-            let dx = cx - ax;
-            let dy = cy - ay;
-            if dx * dx + dy * dy <= sight * sight {
-                return true;
-            }
+        match world.typed_shroud(self.agent_player_id) {
+            Some(s) => s.is_visible(cx, cy),
+            None => false,
         }
-        false
     }
 
-    /// Approximate kill count via "snapshot enemy population diff".
-    /// TODO(B): wire `Health::on_killed` once Agent B's combat
-    /// damage path lands and the World exposes a kill counter.
+    /// Read the agent's kill tally directly from the World combat
+    /// counter. `kills_for_player` is incremented by both the
+    /// data-driven `tick_actors` attack loop and the typed
+    /// `AttackActivity` path whenever an attack reduces a target's
+    /// HP to zero. Monotonically non-decreasing.
     fn update_kill_counter(&mut self) {
-        // For now: don't touch — we count own-unit deaths the agent
-        // is responsible for via the world snapshot. When Agent B's
-        // combat path emits `Actor.kills` increments via
-        // `tick_actors` resolving an Attack, the value will already
-        // be in the snapshot.
         let world = match &self.world {
             Some(w) => w,
             None => return,
         };
-        // Sum kills across agent-owned actors as a tally proxy.
-        let snap = world.snapshot();
-        let mut total: i32 = 0;
-        for a in &snap.actors {
-            if a.owner == self.agent_player_id {
-                total = total.saturating_add(a.rank as i32);
-                // ActorSnapshot doesn't currently expose `kills`; we
-                // approximate via rank for now (rank rises with
-                // kills). When Agent B lands `Actor.kills` in
-                // ActorSnapshot, swap to that field.
-            }
-        }
+        let total = world.kills_for_player(self.agent_player_id) as i32;
         self.units_killed = self.units_killed.max(total);
     }
 

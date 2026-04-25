@@ -109,6 +109,7 @@ impl Activity for AttackActivity {
 
         // 5. Fire. Apply damage immediately (no projectile flight).
         let damage = self.armament.weapon.damage;
+        let mut victim_died = false;
         if let Some(target) = world.actor_mut(self.target_actor_id) {
             // Update both the typed Health (if anyone is reading it)
             // and the existing TraitState::Health (which the rest of
@@ -121,8 +122,21 @@ impl Activity for AttackActivity {
                     let mut h = Health { hp: *hp, max_hp: *hp };
                     h.take_damage(damage);
                     *hp = h.hp;
+                    if h.hp <= 0 {
+                        victim_died = true;
+                    }
                     break;
                 }
+            }
+        }
+        if victim_died {
+            // Credit kill to attacker (Actor.kills) and the player
+            // (World.kills_per_player). Mirrors the data-driven path.
+            let attacker_id = actor.id;
+            actor.kills = actor.kills.saturating_add(1);
+            let owner = world.actor(attacker_id).and_then(|a| a.owner_id);
+            if let Some(pid) = owner {
+                world.credit_kill(pid);
             }
         }
         self.armament.mark_fired();
