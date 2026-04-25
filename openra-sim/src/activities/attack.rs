@@ -147,7 +147,6 @@ impl Activity for AttackActivity {
 mod tests {
     use super::*;
     use crate::actor::ActorKind;
-    use crate::math::CPos;
     use crate::traits::TraitState;
     use crate::world::{self, insert_test_actor, set_test_unpaused, LobbyInfo};
     use openra_data::oramap::{OraMap, PlayerDef};
