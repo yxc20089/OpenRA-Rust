@@ -307,10 +307,24 @@ pub struct UnitInfo {
     /// Whether this actor has the `MustBeDestroyed` trait (counts toward the
     /// kill-all win condition).
     pub must_be_destroyed: bool,
+    /// `Armor.Type` string lower-cased (`"none"`, `"light"`, `"heavy"`,
+    /// `"wood"`, `"concrete"`). Used by `Versus` damage multipliers.
+    /// Defaults to `"none"` when the actor has no `Armor` trait.
+    pub armor_class: String,
+    /// `Mobile.Locomotor` lower-cased (`"foot"`, `"wheeled"`, `"tracked"`,
+    /// `"heavytracked"`). Empty when the unit has no Mobile trait.
+    pub locomotor: String,
+    /// `Turreted.TurnSpeed` (WAngle units / tick). `None` if the actor
+    /// has no turret. Phase 8: surfaced for env loader's typed-component
+    /// attachment.
+    pub turret_turn_speed: Option<i32>,
 }
 
 /// Per-weapon stats consumed by the simulator's combat loop.
-#[derive(Debug, Clone)]
+///
+/// Phase 8 extends Phase 6's view to include projectile-flight metadata
+/// and per-armor-class damage multipliers (`Versus`).
+#[derive(Debug, Clone, Default)]
 pub struct WeaponStats {
     /// Weapon name (e.g. `"M1Carbine"`).
     pub name: String,
@@ -318,9 +332,26 @@ pub struct WeaponStats {
     pub range: WDist,
     /// `ReloadDelay` in ticks (cooldown between shots). For M1Carbine = 20.
     pub reload_delay: i32,
-    /// Damage from `Warhead@1Dam: SpreadDamage` -> `Damage`. Inherited from
-    /// `^LightMG` for M1Carbine = 1000.
+    /// Damage from `Warhead@*: SpreadDamage` (or `TargetDamage`) -> `Damage`.
+    /// Inherited from `^LightMG` for M1Carbine = 1000.
     pub damage: i32,
+    /// `Projectile.Speed` (world units / tick). Zero for weapons with
+    /// `Projectile: InstantHit` (M1Carbine, DogJaw, TurretGun, TeslaZap)
+    /// — the world's combat tick still applies damage instantly for
+    /// these. Non-zero for `Projectile: Missile` / `Projectile: Bullet`
+    /// (RedEye, Dragon, Hellfire, Maverick, Stinger), which spawn a
+    /// `Projectile` entity that flies to the target over multiple ticks.
+    pub projectile_speed: WDist,
+    /// `Warhead@*: SpreadDamage -> Spread`. Radius in world units across
+    /// which damage is applied at impact. For non-splash weapons this is
+    /// `0` (single-target hit). For RedEye/Dragon (`Spread: 128`) this
+    /// becomes 128 units (~1/8 cell) — small but non-zero.
+    pub splash_radius: WDist,
+    /// `Warhead@*: SpreadDamage -> Versus: <Class>: <pct>`. Per-armor-class
+    /// damage multiplier in percent. Missing classes default to 100% (no
+    /// modifier). Keys are lower-cased armor-class names (`"heavy"`,
+    /// `"light"`, `"wood"`, `"concrete"`, `"none"`).
+    pub versus: BTreeMap<String, i32>,
 }
 
 /// Phase-7 building info — typed view onto the subset of `ActorInfo`
@@ -469,6 +500,22 @@ fn unit_info_from_actor(actor: &ActorInfo) -> Option<UnitInfo> {
 
     let must_be_destroyed = actor.has_trait("MustBeDestroyed");
 
+    // Phase 8 — armor class, locomotor, turret turn-speed for Versus
+    // multipliers and typed-component attachment in the env loader.
+    let armor_class = actor
+        .trait_info("Armor")
+        .and_then(|t| t.get("Type"))
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "none".to_string());
+    let locomotor = actor
+        .trait_info("Mobile")
+        .and_then(|t| t.get("Locomotor"))
+        .map(|s| s.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    let turret_turn_speed = actor
+        .trait_info("Turreted")
+        .and_then(|t| t.get_i32("TurnSpeed"));
+
     Some(UnitInfo {
         name: actor.name.clone(),
         hp,
@@ -476,42 +523,95 @@ fn unit_info_from_actor(actor: &ActorInfo) -> Option<UnitInfo> {
         reveal_range,
         primary_weapon,
         must_be_destroyed,
+        armor_class,
+        locomotor,
+        turret_turn_speed,
     })
 }
 
 /// Build a `WeaponStats` from a resolved `WeaponInfo`. Walks the children
-/// list (not `params`) for the `Warhead@*: SpreadDamage` block. Returns
-/// `None` if `Range`, `ReloadDelay`, or a damaging warhead is missing.
+/// list (not `params`) for the `Warhead@*: SpreadDamage` (or
+/// `TargetDamage`) block. Returns `None` if `Range`, `ReloadDelay`, or a
+/// damaging warhead is missing.
+///
+/// Phase 8 also pulls:
+/// * `Projectile.Speed`     → `projectile_speed` (zero for InstantHit).
+/// * `Warhead@*.Spread`     → `splash_radius`    (zero when absent).
+/// * `Warhead@*.Versus.*`   → `versus` per-armor-class multipliers.
 fn weapon_stats_from_weapon(weapon: &WeaponInfo) -> Option<WeaponStats> {
     let range = weapon.get("Range").and_then(parse_wdist)?;
     let reload_delay = weapon.get_i32("ReloadDelay")?;
 
     // Warheads live in `weapon.children`, not in `params` (because they have
-    // their own children block). Find the first SpreadDamage warhead with a
-    // Damage value.
+    // their own children block). Find the first damaging warhead — both
+    // `SpreadDamage` (e1, tank cannons, missiles) and `TargetDamage` (dog
+    // melee) carry `Damage`.
     let mut damage = None;
+    let mut splash_radius = WDist::ZERO;
+    let mut versus: BTreeMap<String, i32> = BTreeMap::new();
     for child in &weapon.children {
         if !child.key.starts_with("Warhead") {
             continue;
         }
-        // Warhead@FOO: SpreadDamage  →  child.value == "SpreadDamage"
-        if child.value != "SpreadDamage" {
+        let is_damaging = matches!(child.value.as_str(), "SpreadDamage" | "TargetDamage");
+        if !is_damaging {
             continue;
         }
-        if let Some(d_node) = child.child("Damage")
+        // First damaging warhead wins.
+        if damage.is_none()
+            && let Some(d_node) = child.child("Damage")
             && let Ok(d) = d_node.value.parse::<i32>()
         {
             damage = Some(d);
+            // Splash spread is per-warhead — accept zero for `TargetDamage`.
+            if let Some(s_node) = child.child("Spread")
+                && let Some(wd) = parse_wdist(&s_node.value)
+            {
+                splash_radius = wd;
+            }
+            // Versus multipliers live as a child block under the warhead.
+            if let Some(v_node) = child.child("Versus") {
+                for entry in &v_node.children {
+                    if let Ok(pct) = entry.value.parse::<i32>() {
+                        versus.insert(entry.key.trim().to_ascii_lowercase(), pct);
+                    }
+                }
+            }
             break;
         }
     }
     let damage = damage?;
+
+    // Projectile speed — only meaningful for `Projectile: Missile` /
+    // `Projectile: Bullet`. `Projectile: InstantHit` carries no Speed
+    // (or a meaningless one). Treat anything missing as instant hit.
+    let mut projectile_speed = WDist::ZERO;
+    for child in &weapon.children {
+        if child.key != "Projectile" {
+            continue;
+        }
+        // value is the projectile-class name: "Missile", "Bullet",
+        // "InstantHit", "TeslaZap". Only Missile/Bullet fly.
+        let class = child.value.trim();
+        if class != "Missile" && class != "Bullet" {
+            break;
+        }
+        if let Some(s_node) = child.child("Speed")
+            && let Some(wd) = parse_wdist(&s_node.value)
+        {
+            projectile_speed = wd;
+        }
+        break;
+    }
 
     Some(WeaponStats {
         name: weapon.name.clone(),
         range,
         reload_delay,
         damage,
+        projectile_speed,
+        splash_radius,
+        versus,
     })
 }
 

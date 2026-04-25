@@ -344,9 +344,11 @@ impl Env {
         let seed_i32 = self.seed as u32 as i32;
         // Phase 7 — load the vendored RA ruleset so building weapons
         // (TurretGun, TeslaZap, …) and proper footprints (pbox=1×1,
-        // fact=3×2, proc=3×2) resolve correctly. Falls back to
+        // fact=3×2, proc=3×2) resolve correctly. Phase 8 also pulls a
+        // typed `data_rules::Rules` view so we can attach Vehicle /
+        // Turret typed components per actor below. Falls back to
         // `GameRules::defaults` when the vendor dir is missing.
-        let rules = load_rules_with_fallback();
+        let (rules, typed_rules) = load_rules_with_fallback();
         let mut world = build_world(&ora, seed_i32, &lobby, Some(rules), 0);
 
         // Resolve player ids: `build_world` allocates the World actor
@@ -394,6 +396,12 @@ impl Env {
             };
             let actor = build_scenario_actor(next_id, sa, owner, &world);
             world::insert_test_actor(&mut world, actor);
+            // Phase 8 — attach Vehicle + Turret typed components for
+            // vehicle actors (2tnk, 1tnk, 3tnk, jeep, apc, harv, mcv).
+            // Static defenses with turrets (gun) carry their own
+            // armament path via classify_defense; we only need the
+            // typed component for query-by-tests / future visual aim.
+            attach_typed_components(&mut world, next_id, &sa.actor_type, &typed_rules);
             next_id += 1;
         }
 
@@ -748,6 +756,60 @@ fn has_combat_units(world: &World, player_id: u32) -> bool {
     false
 }
 
+/// Phase 8 — look up the unit's typed `UnitInfo` and attach a
+/// `Vehicle` + (optionally) `Turret` typed component to the world's
+/// `typed_components` map.
+///
+/// We keep the attach logic conservative: only actors whose
+/// `UnitInfo.locomotor` is wheeled / tracked / heavy-tracked (i.e.
+/// classic vehicles) get a `Vehicle` component, and only those with a
+/// `Turreted.TurnSpeed` field also get a `Turret`. Infantry attaches
+/// nothing — the typed-component bundle is left empty.
+fn attach_typed_components(
+    world: &mut World,
+    actor_id: u32,
+    actor_type: &str,
+    typed_rules: &data_rules::Rules,
+) {
+    use openra_sim::math::WAngle;
+    use openra_sim::traits::{Locomotor, Turret, Vehicle};
+    use openra_sim::world::ActorTypedComponents;
+
+    // Lookup uses uppercase keys (matches the YAML actor name).
+    let unit_info = match typed_rules.unit(&actor_type.to_uppercase()) {
+        Some(u) => u,
+        None => return,
+    };
+    if unit_info.locomotor.is_empty() {
+        return; // non-mobile — nothing to attach
+    }
+    let locomotor = Locomotor::from_yaml(&unit_info.locomotor);
+    if !locomotor.is_ground() {
+        return; // we don't yet ship aircraft / naval typed components
+    }
+    // Foot infantry (`dog`, `e1`, `e3`, `medi`) gets no Vehicle
+    // typed component — `Vehicle` is reserved for wheeled / tracked /
+    // heavy-tracked actors. Phase 8 keeps the type-safe split.
+    if matches!(locomotor, Locomotor::Foot) {
+        return;
+    }
+    let has_turret = unit_info.turret_turn_speed.is_some();
+    // Initial chassis facing matches `build_scenario_actor` (south =
+    // 512). The turret starts pointing the same way.
+    let initial_facing = WAngle::new(512);
+    let vehicle = Vehicle::new(locomotor, has_turret, initial_facing);
+    let turret = if has_turret {
+        let turn_speed = unit_info.turret_turn_speed.unwrap_or(28).max(0);
+        Some(Turret::with_tolerance(initial_facing, turn_speed, 4))
+    } else {
+        None
+    };
+    world.set_typed_components(
+        actor_id,
+        ActorTypedComponents { vehicle: Some(vehicle), turret },
+    );
+}
+
 /// Build a freshly-spawned `Actor` from a `ScenarioActor`.
 ///
 /// Phase 7 changes
@@ -815,11 +877,13 @@ fn build_scenario_actor(id: u32, sa: &ScenarioActor, owner: u32, world: &World) 
 
 /// Resolve and load the vendored RA ruleset. Phase 7 requires the real
 /// ruleset so building weapons (TurretGun, TeslaZap, M60mg, …) can
-/// resolve damage / range / reload from `weapons.yaml`.
+/// resolve damage / range / reload from `weapons.yaml`. Phase 8 also
+/// returns the typed `data_rules::Rules` view so the env loader can
+/// attach `Vehicle` / `Turret` typed components per actor.
 ///
-/// Falls back to `GameRules::defaults()` when the vendor dir is absent
-/// (e.g. CI without submodules).
-fn load_rules_with_fallback() -> GameRules {
+/// Falls back to `GameRules::defaults()` (and an empty typed Rules)
+/// when the vendor dir is absent (e.g. CI without submodules).
+fn load_rules_with_fallback() -> (GameRules, data_rules::Rules) {
     // Try common vendor locations relative to the runtime cwd, the
     // env's manifest dir, and HOME. The first hit wins.
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -832,10 +896,18 @@ fn load_rules_with_fallback() -> GameRules {
         if c.exists()
             && let Ok(rs) = data_rules::load_ruleset(c)
         {
-            return GameRules::from_ruleset(&rs);
+            let typed = data_rules::Rules::from_ruleset(&rs);
+            return (GameRules::from_ruleset(&rs), typed);
         }
     }
-    GameRules::defaults()
+    (
+        GameRules::defaults(),
+        data_rules::Rules {
+            units: std::collections::BTreeMap::new(),
+            weapons: std::collections::BTreeMap::new(),
+            buildings: std::collections::BTreeMap::new(),
+        },
+    )
 }
 
 fn kind_for_unit_type(t: &str) -> ActorKind {

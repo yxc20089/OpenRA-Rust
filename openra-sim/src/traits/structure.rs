@@ -141,6 +141,7 @@ mod tests {
             range: WDist::from_cells(6),
             reload_delay: 30,
             damage: 6000,
+            ..Default::default()
         }
     }
 

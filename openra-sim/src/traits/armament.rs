@@ -200,6 +200,7 @@ mod tests {
             range: WDist::from_cells(5),
             reload_delay: 20,
             damage: 1000,
+            ..Default::default()
         }
     }
 
@@ -253,6 +254,7 @@ mod tests {
             range: WDist::from_cells(8),
             reload_delay: 60,
             damage: 4500,
+            ..Default::default()
         }
     }
 
@@ -262,6 +264,7 @@ mod tests {
             range: WDist::from_cells(6),
             reload_delay: 45,
             damage: 2000,
+            ..Default::default()
         }
     }
 

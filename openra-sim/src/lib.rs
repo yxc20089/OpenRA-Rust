@@ -12,6 +12,7 @@ pub mod gamerules;
 pub mod math;
 pub mod order;
 pub mod pathfinder;
+pub mod projectile;
 pub mod rng;
 pub mod sync;
 pub mod terrain;

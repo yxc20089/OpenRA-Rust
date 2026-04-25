@@ -15,10 +15,11 @@ use crate::ai::Bot;
 use crate::gamerules::GameRules;
 use crate::math::{CPos, WPos};
 use crate::pathfinder;
+use crate::projectile::{apply_versus, Projectile};
 use crate::rng::MersenneTwister;
 use crate::sync;
 use crate::terrain::{CellLayer, ResourceType, TerrainMap, COST_IMPASSABLE};
-use crate::traits::{PqType, TraitState};
+use crate::traits::{PqType, TraitState, Turret, Vehicle};
 
 /// Lobby information extracted from the replay's SyncInfo orders.
 #[derive(Debug, Clone)]
@@ -286,6 +287,29 @@ pub struct World {
     /// Incremented in `tick_actors` whenever a player's attack reduces
     /// a target's HP ≤ 0. Read via `kills_for_player`.
     kills_per_player: BTreeMap<u32, u32>,
+    /// Phase-8: in-flight projectiles (rockets / missiles). BTreeMap so
+    /// per-tick advance and impact-resolution iterate in stable id
+    /// order. Spawned by the combat loop when an attacker fires a
+    /// weapon with `projectile_speed > 0`.
+    pending_projectiles: BTreeMap<u32, Projectile>,
+    /// Monotonic id source for `pending_projectiles`. Never reused
+    /// (a freed id stays freed).
+    next_projectile_id: u32,
+    /// Phase-8 typed components attached to actors. Parallel BTreeMap
+    /// keyed by actor id so existing serialized snapshot / sync code
+    /// is unaffected. Currently stores `Vehicle` (locomotor + has_turret
+    /// flag) and `Turret` (independent yaw, turn-speed) per actor.
+    typed_components: BTreeMap<u32, ActorTypedComponents>,
+}
+
+/// Typed components attached to a single actor. Lookup is via
+/// `World::typed_components_of(actor_id)`. Either field may be `None`
+/// for actors that don't have the corresponding typed view (a foot
+/// soldier carries neither, a 2tnk carries both).
+#[derive(Debug, Clone, Default)]
+pub struct ActorTypedComponents {
+    pub vehicle: Option<Vehicle>,
+    pub turret: Option<Turret>,
 }
 
 impl World {
@@ -606,6 +630,11 @@ impl World {
             for _ in 0..3 {
                 self.world_tick += 1;
                 self.tick_actors();
+                // Phase 8: advance in-flight projectiles after activities
+                // settle so newly-spawned projectiles wait one tick before
+                // their first travel step (matches C# behaviour where the
+                // projectile spawn frame doesn't also move it).
+                self.tick_projectiles();
                 self.execute_frame_end_tasks();
             }
             // Update fog of war after tick
@@ -1874,8 +1903,13 @@ impl World {
                 }
             }
         }
-        // Second pass: check range and fire
+        // Second pass: check range and fire. Phase 8 splits this into
+        // instant-hit damage (M1Carbine, tank cannons, DogJaw, TurretGun,
+        // TeslaZap) vs projectile spawning (RedEye, Dragon, Hellfire,
+        // Stinger). The decision is per-attacker, looked up from the
+        // attacker's primary weapon's `projectile_speed`.
         let mut attacks: Vec<(u32, u32, i32)> = Vec::new();
+        let mut spawn_projectiles: Vec<(u32, u32, i32, i32, i32, BTreeMap<crate::gamerules::ArmorType, i32>)> = Vec::new(); // (attacker, target, damage, speed, splash, versus)
         let mut chase_targets: Vec<(u32, (i32, i32))> = Vec::new();
         for (attacker_id, target_id, damage, weapon_range) in ready_attackers {
             let attacker_loc = self.actors.get(&attacker_id).and_then(|a| a.location);
@@ -1885,8 +1919,24 @@ impl World {
                 let dy = (aloc.1 - tloc.1).abs();
                 let dist = dx.max(dy);
                 if dist <= weapon_range {
-                    attacks.push((attacker_id, target_id, damage));
-                    // Update burst/reload state
+                    // Resolve attacker's primary weapon for projectile
+                    // metadata. Buildings (gun, tsla) and instant-hit
+                    // weapons fall through to the immediate-damage path.
+                    let (proj_speed, splash, versus_table) = self
+                        .actors
+                        .get(&attacker_id)
+                        .and_then(|a| a.actor_type.as_deref())
+                        .and_then(|t| self.rules.actor(t))
+                        .and_then(|stats| stats.weapons.first())
+                        .and_then(|wname| self.rules.weapon(wname))
+                        .map(|w| (w.projectile_speed, w.splash_radius, w.versus.clone()))
+                        .unwrap_or((0, 0, BTreeMap::new()));
+                    if proj_speed > 0 {
+                        spawn_projectiles.push((attacker_id, target_id, damage, proj_speed, splash, versus_table));
+                    } else {
+                        attacks.push((attacker_id, target_id, damage));
+                    }
+                    // Update burst/reload state regardless of projectile vs instant
                     if let Some(actor) = self.actors.get_mut(&attacker_id) {
                         if let Some(Activity::Attack {
                             ref mut burst_remaining, burst,
@@ -1905,17 +1955,93 @@ impl World {
                 }
             }
         }
-        // Apply damage (skip invulnerable actors)
-        // Track which attacker scored each kill so we can credit
-        // `kills_per_player` and bump the attacker's `kills` field.
+        // Phase 8 — spawn pending projectiles. These won't deal damage
+        // this tick; the post-activity tick_projectiles loop advances
+        // them and resolves impacts.
+        for (attacker_id, target_id, damage, speed, splash, versus_table) in spawn_projectiles {
+            let attacker_pos = self.actors.get(&attacker_id)
+                .and_then(|a| a.location)
+                .map(|(x, y)| center_of_cell(x, y));
+            let target_pos = self.actors.get(&target_id)
+                .and_then(|a| a.location)
+                .map(|(x, y)| center_of_cell(x, y));
+            if let (Some(origin), Some(tpos)) = (attacker_pos, target_pos) {
+                // Translate the gamerules versus map (ArmorType enum
+                // keys) into the projectile's String-keyed map so the
+                // projectile module stays free of gamerules-specific
+                // types.
+                let mut v_str: std::collections::BTreeMap<String, i32> = std::collections::BTreeMap::new();
+                for (k, pct) in versus_table {
+                    let key = match k {
+                        crate::gamerules::ArmorType::None => "none",
+                        crate::gamerules::ArmorType::Light => "light",
+                        crate::gamerules::ArmorType::Heavy => "heavy",
+                        crate::gamerules::ArmorType::Wood => "wood",
+                        crate::gamerules::ArmorType::Concrete => "concrete",
+                    };
+                    v_str.insert(key.to_string(), pct);
+                }
+                let pid = self.next_projectile_id;
+                self.next_projectile_id = self.next_projectile_id.saturating_add(1);
+                self.pending_projectiles.insert(pid, Projectile::new(
+                    pid,
+                    attacker_id,
+                    target_id,
+                    origin,
+                    tpos,
+                    speed,
+                    damage,
+                    splash,
+                    v_str,
+                ));
+            }
+        }
+        // Apply damage (skip invulnerable actors).
+        // Phase 8 — apply Versus armor multipliers using each victim's
+        // `armor_class` lookup from the rules. Track which attacker
+        // scored each kill so we can credit `kills_per_player` and bump
+        // the attacker's `kills` field.
         let mut dead_actors: Vec<u32> = Vec::new();
         let mut kill_credits: Vec<(u32, u32)> = Vec::new(); // (attacker_id, victim_id)
         for (attacker_id, target_id, damage) in &attacks {
             if self.invulnerable.contains_key(target_id) { continue; }
+            // Look up the attacker's weapon `versus` table and the
+            // target's armor class.
+            let versus_table = self.actors.get(attacker_id)
+                .and_then(|a| a.actor_type.as_deref())
+                .and_then(|t| self.rules.actor(t))
+                .and_then(|stats| stats.weapons.first())
+                .and_then(|wname| self.rules.weapon(wname))
+                .map(|w| w.versus.clone())
+                .unwrap_or_default();
+            let target_armor_str = self.actors.get(target_id)
+                .and_then(|a| a.actor_type.as_deref())
+                .and_then(|t| self.rules.actor(t))
+                .map(|stats| match stats.armor_type {
+                    crate::gamerules::ArmorType::None => "none",
+                    crate::gamerules::ArmorType::Light => "light",
+                    crate::gamerules::ArmorType::Heavy => "heavy",
+                    crate::gamerules::ArmorType::Wood => "wood",
+                    crate::gamerules::ArmorType::Concrete => "concrete",
+                })
+                .unwrap_or("none");
+            // Translate enum-keyed versus → string-keyed for apply_versus.
+            let mut versus_str: std::collections::BTreeMap<String, i32> = std::collections::BTreeMap::new();
+            for (k, pct) in versus_table {
+                let key = match k {
+                    crate::gamerules::ArmorType::None => "none",
+                    crate::gamerules::ArmorType::Light => "light",
+                    crate::gamerules::ArmorType::Heavy => "heavy",
+                    crate::gamerules::ArmorType::Wood => "wood",
+                    crate::gamerules::ArmorType::Concrete => "concrete",
+                };
+                versus_str.insert(key.to_string(), pct);
+            }
+            let scaled_damage = apply_versus(*damage, target_armor_str, &versus_str);
             if let Some(target) = self.actors.get_mut(target_id) {
                 for t in &mut target.traits {
                     if let TraitState::Health { hp } = t {
-                        *hp -= damage;
+                        *hp -= scaled_damage;
                         if *hp <= 0 {
                             dead_actors.push(*target_id);
                             kill_credits.push((*attacker_id, *target_id));
@@ -2158,6 +2284,192 @@ impl World {
                 location,
                 owner_player_id,
             });
+        }
+    }
+
+    /// Phase 8 — advance every in-flight projectile by one tick.
+    ///
+    /// For each projectile we (a) refresh its target position from the
+    /// current alive target, (b) call `Projectile::advance` which does
+    /// integer-fixed-point translation toward the target, (c) on impact
+    /// dispatch single-target or splash damage with `Versus` multiplier
+    /// applied, and (d) credit kills to the original attacker.
+    ///
+    /// Determinism contract:
+    /// * Projectiles are visited in `BTreeMap` (stable id) order.
+    /// * Splash victims are sorted by `(distance, victim_id)` and
+    ///   debited in that order so two equidistant actors always
+    ///   receive damage in the same id sequence.
+    /// * Damage application is integer-only (`apply_versus`).
+    fn tick_projectiles(&mut self) {
+        if self.pending_projectiles.is_empty() {
+            return;
+        }
+        let mut detonate: Vec<(u32, u32, WPos, i32, i32, BTreeMap<String, i32>)> = Vec::new();
+        // (proj_id, attacker_id, impact_pos, base_damage, splash_radius, versus)
+        let mut drop_no_target: Vec<u32> = Vec::new();
+        for (pid, proj) in self.pending_projectiles.iter_mut() {
+            // If the target was destroyed (or never existed), advance
+            // toward its last-known position so we still impact and
+            // potentially splash nearby actors.
+            let target_pos = self.actors.get(&proj.target_id)
+                .and_then(|a| a.location)
+                .map(|(x, y)| center_of_cell(x, y))
+                .unwrap_or(proj.target_position);
+            let arrived = proj.advance(target_pos);
+            if arrived {
+                detonate.push((
+                    *pid,
+                    proj.attacker_id,
+                    proj.position,
+                    proj.damage,
+                    proj.splash_radius,
+                    proj.versus.clone(),
+                ));
+            }
+        }
+        // Drop projectiles whose attackers are gone AND have run for
+        // an unreasonable time (defensive; not strictly needed but
+        // avoids zombie projectiles in pathological cases).
+        for (pid, proj) in self.pending_projectiles.iter() {
+            if !self.actors.contains_key(&proj.attacker_id)
+                && self.actors.contains_key(&proj.target_id) == false
+            {
+                // Only drop if it can't reasonably impact anything.
+                drop_no_target.push(*pid);
+            }
+        }
+        for pid in drop_no_target {
+            self.pending_projectiles.remove(&pid);
+        }
+
+        // Resolve impacts. Each detonation deals damage to all actors
+        // within `splash_radius` of the impact position. The list is
+        // sorted by `(distance², victim_id)` for determinism.
+        let mut dead_from_projectile: Vec<u32> = Vec::new();
+        let mut kill_credits: Vec<(u32, u32)> = Vec::new();
+        for (proj_id, attacker_id, impact, base_damage, splash, versus) in detonate {
+            // Build sorted victim list. Even with splash=0 we still
+            // need to find at least the cell the impact landed on (the
+            // direct target may have moved one cell since fire — we
+            // treat "impact cell" as ground truth).
+            let impact_cell = (impact.x.div_euclid(1024), impact.y.div_euclid(1024));
+            let mut victims: Vec<(i64, u32, WPos, &str)> = Vec::new();
+            // splash_sq compared against squared horizontal distance.
+            let splash_units = splash.max(0);
+            for a in self.actors.values() {
+                let Some(loc) = a.location else { continue };
+                if !matches!(
+                    a.kind,
+                    ActorKind::Infantry | ActorKind::Vehicle | ActorKind::Mcv | ActorKind::Building
+                ) {
+                    continue;
+                }
+                // Skip actors with no Health trait (defensive).
+                let alive = a.traits.iter().any(|t| matches!(t, TraitState::Health { hp } if *hp > 0));
+                if !alive { continue; }
+                let center = center_of_cell(loc.0, loc.1);
+                let dx = (center.x - impact.x) as i64;
+                let dy = (center.y - impact.y) as i64;
+                let d_sq = dx * dx + dy * dy;
+                // Always include the actor on the direct impact cell;
+                // otherwise require the splash radius covers the actor's
+                // center.
+                let direct_hit = loc == impact_cell;
+                let in_splash = splash_units > 0 && d_sq <= (splash_units as i64).pow(2);
+                if direct_hit || in_splash {
+                    let armor = a.actor_type.as_deref()
+                        .and_then(|t| self.rules.actor(t))
+                        .map(|stats| match stats.armor_type {
+                            crate::gamerules::ArmorType::None => "none",
+                            crate::gamerules::ArmorType::Light => "light",
+                            crate::gamerules::ArmorType::Heavy => "heavy",
+                            crate::gamerules::ArmorType::Wood => "wood",
+                            crate::gamerules::ArmorType::Concrete => "concrete",
+                        })
+                        .unwrap_or("none");
+                    victims.push((d_sq, a.id, center, armor));
+                }
+            }
+            victims.sort_by_key(|(d, id, _, _)| (*d, *id));
+            for (d_sq, victim_id, _, armor_class) in &victims {
+                if self.invulnerable.contains_key(victim_id) {
+                    continue;
+                }
+                // Falloff: full damage at center, linear falloff to
+                // 50% at splash radius. Direct impact (d_sq == 0) gets
+                // full damage. Outside splash gets 0 (filtered above).
+                let falloff_pct = if splash_units == 0 || *d_sq == 0 {
+                    100
+                } else {
+                    let d = (*d_sq as f64).sqrt() as i64;
+                    let r = splash_units as i64;
+                    // 100% at d=0 → 50% at d=r. Linear.
+                    100 - (50 * d / r.max(1)) as i32
+                };
+                let scaled = (base_damage as i64) * (falloff_pct as i64) / 100;
+                let final_damage = apply_versus(scaled.max(0) as i32, armor_class, &versus);
+                if final_damage <= 0 {
+                    continue;
+                }
+                if let Some(target) = self.actors.get_mut(victim_id) {
+                    for t in &mut target.traits {
+                        if let TraitState::Health { hp } = t {
+                            *hp -= final_damage;
+                            if *hp <= 0 {
+                                dead_from_projectile.push(*victim_id);
+                                kill_credits.push((attacker_id, *victim_id));
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            self.pending_projectiles.remove(&proj_id);
+        }
+
+        // Credit kills (deterministic order by attacker, victim id).
+        kill_credits.sort_by_key(|(a, v)| (*a, *v));
+        for (attacker_id, _victim) in &kill_credits {
+            let owner = self.actors.get(attacker_id).and_then(|a| a.owner_id);
+            if let Some(att) = self.actors.get_mut(attacker_id) {
+                att.kills = att.kills.saturating_add(1);
+            }
+            if let Some(pid) = owner {
+                *self.kills_per_player.entry(pid).or_insert(0) += 1;
+            }
+        }
+        // Remove dead victims (mirror the tick_actors path).
+        let mut dead_ids: Vec<u32> = Vec::new();
+        // Dedup — splash + multiple projectiles can hit the same victim.
+        dead_from_projectile.sort_unstable();
+        dead_from_projectile.dedup();
+        for id in dead_from_projectile {
+            if let Some(dead) = self.actors.remove(&id) {
+                dead_ids.push(id);
+                if dead.kind == ActorKind::Building {
+                    if let Some(loc) = dead.location {
+                        let (fw, fh) = dead.actor_type.as_deref()
+                            .and_then(|t| self.rules.actor(t))
+                            .map(|s| s.footprint)
+                            .unwrap_or((2, 2));
+                        self.terrain.clear_footprint(loc.0, loc.1, fw, fh);
+                    }
+                } else if let Some(loc) = dead.location {
+                    self.terrain.clear_occupant(loc.0, loc.1);
+                }
+            }
+        }
+        // Clear stale Attack activities pointing at corpses (mirrors
+        // the tick_actors clean-up).
+        if !dead_ids.is_empty() {
+            for actor in self.actors.values_mut() {
+                if let Some(Activity::Attack { target_id, .. }) = actor.activity {
+                    if dead_ids.contains(&target_id) {
+                        actor.activity = None;
+                    }
+                }
+            }
         }
     }
 
@@ -2786,6 +3098,35 @@ impl World {
         }
         let _ = hp_seen;
         Some(crate::traits::ActorSummary { cell, is_dead: !alive })
+    }
+
+    /// Phase-8: read-only access to the typed-component bundle for a
+    /// specific actor. Returns `None` for actors that have no typed
+    /// component attached (e.g. plain infantry, world / player actors,
+    /// trees).
+    pub fn typed_components_of(&self, actor_id: u32) -> Option<&ActorTypedComponents> {
+        self.typed_components.get(&actor_id)
+    }
+
+    /// Phase-8: attach (or replace) the typed-component bundle for an
+    /// actor. The env loader calls this when spawning a vehicle so the
+    /// turret component is queryable by tests and (in future) by the
+    /// combat path. Mutates in place; idempotent.
+    pub fn set_typed_components(&mut self, actor_id: u32, bundle: ActorTypedComponents) {
+        self.typed_components.insert(actor_id, bundle);
+    }
+
+    /// Phase-8: read-only iterator over all in-flight projectiles in
+    /// stable id order.
+    pub fn pending_projectiles(&self) -> impl Iterator<Item = (&u32, &Projectile)> {
+        self.pending_projectiles.iter()
+    }
+
+    /// Phase-8: count of in-flight projectiles. Used by tests that
+    /// want to check that a missile is mid-flight before asserting
+    /// final HP.
+    pub fn pending_projectile_count(&self) -> usize {
+        self.pending_projectiles.len()
     }
 
     /// Map width in cells.
@@ -3471,6 +3812,9 @@ pub fn build_world(
         player_factions,
         typed_shroud: BTreeMap::new(),
         kills_per_player: BTreeMap::new(),
+        pending_projectiles: BTreeMap::new(),
+        next_projectile_id: 1,
+        typed_components: BTreeMap::new(),
     };
 
     // Initial shroud reveal around starting units
