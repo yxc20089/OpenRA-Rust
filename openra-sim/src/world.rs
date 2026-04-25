@@ -1752,6 +1752,113 @@ impl World {
             }
         }
 
+        // Phase 7 — Auto-target for armed static buildings (gun, pbox, tsla, ftur).
+        // Idle defenses scan for the closest hostile actor in range and queue an
+        // Attack activity. AA-only stubs (sam, agun) and cosmetic buildings
+        // (powr, barr, fact, proc) are skipped via classify_defense().
+        // We collect (id, target_id, damage, range, reload, burst) up front so
+        // we don't borrow `self.actors` mutably while iterating.
+        let mut new_defense_attacks: Vec<(u32, u32, i32, i32, i32, i32)> = Vec::new();
+        for actor in self.actors.values() {
+            if actor.kind != ActorKind::Building {
+                continue;
+            }
+            if actor.activity.is_some() {
+                continue;
+            }
+            let actor_type = match actor.actor_type.as_deref() {
+                Some(t) => t,
+                None => continue,
+            };
+            let defense_kind = match crate::traits::classify_defense(actor_type) {
+                Some(crate::traits::DefenseKind::GroundTurret) => "turret",
+                Some(crate::traits::DefenseKind::Tesla) => "tesla",
+                _ => continue, // AA-only / inert / cosmetic — never auto-fire
+            };
+            let _ = defense_kind; // currently both behave identically
+            let owner = match actor.owner_id {
+                Some(o) => o,
+                None => continue,
+            };
+            let from = match actor.location {
+                Some(l) => l,
+                None => continue,
+            };
+            // Resolve weapon stats. Buildings store their weapon name in
+            // `rules.actor(type).weapons[0]`. If the weapon is missing we
+            // skip the building (rather than fall back to a default that
+            // might silently misbehave).
+            let weapon = self
+                .rules
+                .actor(actor_type)
+                .and_then(|stats| stats.weapons.first())
+                .and_then(|wname| self.rules.weapon(wname));
+            let (damage, range_cells, reload, burst) = match weapon {
+                Some(w) => (w.damage, w.range / 1024, w.reload_delay, w.burst.max(1)),
+                None => continue,
+            };
+            if damage <= 0 || range_cells <= 0 {
+                continue;
+            }
+            // Find nearest in-range hostile actor. We iterate the
+            // BTreeMap-ordered actor list so the chosen target is
+            // deterministic on ties (lowest id wins).
+            let mut best: Option<(u32, i32)> = None;
+            for cand in self.actors.values() {
+                let cand_owner = match cand.owner_id {
+                    Some(o) => o,
+                    None => continue,
+                };
+                if cand_owner == owner {
+                    continue;
+                }
+                if !matches!(
+                    cand.kind,
+                    ActorKind::Infantry
+                        | ActorKind::Vehicle
+                        | ActorKind::Mcv
+                        | ActorKind::Building
+                ) {
+                    continue;
+                }
+                // Skip dead actors (defensive).
+                let dead = cand.traits.iter().any(|t| matches!(t, TraitState::Health { hp } if *hp <= 0));
+                if dead {
+                    continue;
+                }
+                let cl = match cand.location {
+                    Some(l) => l,
+                    None => continue,
+                };
+                let dx = (from.0 - cl.0).abs();
+                let dy = (from.1 - cl.1).abs();
+                let cheb = dx.max(dy);
+                if cheb > range_cells {
+                    continue;
+                }
+                match best {
+                    Some((_, bd)) if bd <= cheb => {}
+                    _ => best = Some((cand.id, cheb)),
+                }
+            }
+            if let Some((tid, _)) = best {
+                new_defense_attacks.push((actor.id, tid, damage, range_cells, reload, burst));
+            }
+        }
+        for (aid, tid, damage, range_cells, reload, burst) in new_defense_attacks {
+            if let Some(actor) = self.actors.get_mut(&aid) {
+                actor.activity = Some(Activity::Attack {
+                    target_id: tid,
+                    weapon_range: range_cells,
+                    weapon_damage: damage,
+                    reload_delay: reload,
+                    reload_remaining: 0,
+                    burst,
+                    burst_remaining: burst,
+                });
+            }
+        }
+
         // Tick Attack activities: check range, manage reload, deal damage.
         // First pass: decrement reload timers and collect ready-to-fire attackers
         let mut ready_attackers: Vec<(u32, u32, i32, i32)> = Vec::new(); // (attacker_id, target_id, damage, weapon_range)
@@ -1832,8 +1939,10 @@ impl World {
             }
         }
         // Remove dead actors
+        let mut dead_ids: Vec<u32> = Vec::new();
         for id in dead_actors {
             if let Some(dead) = self.actors.remove(&id) {
+                dead_ids.push(id);
                 if dead.kind == ActorKind::Building {
                     // Clear full building footprint (restores passability)
                     if let Some(loc) = dead.location {
@@ -1848,9 +1957,42 @@ impl World {
                 }
             }
         }
+        // Phase 7: clear stale Attack activities pointing at corpses so
+        // armed buildings (and any other attacker) re-scan for a new target
+        // on the next tick. Without this, a static turret can deadlock on
+        // a dead target and never engage subsequent enemies.
+        if !dead_ids.is_empty() {
+            for actor in self.actors.values_mut() {
+                if let Some(Activity::Attack { target_id, .. }) = actor.activity {
+                    if dead_ids.contains(&target_id) {
+                        actor.activity = None;
+                    }
+                }
+            }
+        }
 
-        // Chase targets: pathfind toward target when out of range, preserving attack state
+        // Chase targets: pathfind toward target when out of range, preserving attack state.
+        // Static buildings cannot move — Phase 7 — they will simply hold their attack
+        // activity but never close range; the world tick keeps the activity around so
+        // that as soon as a target wanders back into range the cooldown gating fires.
         for (attacker_id, target_loc) in chase_targets {
+            // Phase 7: buildings are immobile. Skip chase, but keep the
+            // Activity::Attack alive so the next-tick range check can re-fire
+            // if the target re-enters range (or auto-target picks a new one).
+            if self
+                .actors
+                .get(&attacker_id)
+                .map(|a| a.kind == ActorKind::Building)
+                .unwrap_or(false)
+            {
+                // Drop the stale attack so auto-target can pick a fresher
+                // candidate next tick (a target out of range is no longer
+                // worth tracking on a static turret).
+                if let Some(actor) = self.actors.get_mut(&attacker_id) {
+                    actor.activity = None;
+                }
+                continue;
+            }
             let from = match self.actors.get(&attacker_id).and_then(|a| a.location) {
                 Some(loc) => loc,
                 None => continue,
@@ -3017,7 +3159,15 @@ fn apply_temperat_passability(
 pub fn insert_test_actor(world: &mut World, actor: Actor) {
     let id = actor.id;
     if let Some(loc) = actor.location {
-        world.terrain.set_occupant(loc.0, loc.1, id);
+        if actor.kind == ActorKind::Building {
+            let (fw, fh) = actor.actor_type.as_deref()
+                .and_then(|t| world.rules.actor(t))
+                .map(|s| s.footprint)
+                .unwrap_or((1, 1));
+            world.terrain.occupy_footprint(loc.0, loc.1, fw, fh, id);
+        } else {
+            world.terrain.set_occupant(loc.0, loc.1, id);
+        }
     }
     world.actors.insert(id, actor);
     if id >= world.next_actor_id {
@@ -3032,7 +3182,15 @@ pub fn insert_test_actor(world: &mut World, actor: Actor) {
 pub fn remove_test_actor(world: &mut World, id: u32) -> Option<Actor> {
     let actor = world.actors.remove(&id)?;
     if let Some(loc) = actor.location {
-        world.terrain.clear_occupant(loc.0, loc.1);
+        if actor.kind == ActorKind::Building {
+            let (fw, fh) = actor.actor_type.as_deref()
+                .and_then(|t| world.rules.actor(t))
+                .map(|s| s.footprint)
+                .unwrap_or((1, 1));
+            world.terrain.clear_footprint(loc.0, loc.1, fw, fh);
+        } else {
+            world.terrain.clear_occupant(loc.0, loc.1);
+        }
     }
     Some(actor)
 }
@@ -3224,6 +3382,11 @@ pub fn build_world(
     // Initialize terrain map and mark impassable tiles (Water, Rock/Cliffs).
     let mut terrain = TerrainMap::new(map.map_size.0, map.map_size.1);
     apply_temperat_passability(&map.tiles, &mut terrain);
+    // Resolve the rules early so initial-build building footprints can
+    // honour rules-derived dimensions (Phase 7 — pbox=1×1, fact=3×2 etc).
+    // We materialise a temporary Rules clone for this lookup; the caller
+    // either passed `Some(rules)` or we fall back to defaults below.
+    let initial_rules: GameRules = rules.clone().unwrap_or_else(GameRules::defaults);
     for actor in actors.values() {
         if let Some((x, y)) = actor.location {
             match actor.kind {
@@ -3231,8 +3394,11 @@ pub fn build_world(
                     terrain.set_occupant(x, y, actor.id);
                 }
                 ActorKind::Building => {
-                    // Default 2x2 footprint for initial buildings
-                    terrain.occupy_footprint(x, y, 2, 2, actor.id);
+                    let (fw, fh) = actor.actor_type.as_deref()
+                        .and_then(|t| initial_rules.actor(t))
+                        .map(|s| s.footprint)
+                        .unwrap_or((2, 2));
+                    terrain.occupy_footprint(x, y, fw, fh, actor.id);
                 }
                 _ => {}
             }

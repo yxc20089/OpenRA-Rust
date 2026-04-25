@@ -12,6 +12,7 @@ pub mod armament;
 pub mod health;
 pub mod mobile;
 pub mod shroud;
+pub mod structure;
 pub mod turret;
 pub mod vehicle;
 
@@ -19,6 +20,7 @@ pub use armament::{Armament, MultiArmament, NamedArmament};
 pub use health::Health;
 pub use mobile::Mobile;
 pub use shroud::{kind_default_sight, update_from_actors, wdist_to_cell_radius, Shroud, ShroudTable};
+pub use structure::{building_must_be_destroyed, classify_defense, DefenseKind, Structure};
 pub use turret::{yaw_between, Turret};
 pub use vehicle::{Locomotor, Vehicle};
 

@@ -323,12 +323,79 @@ pub struct WeaponStats {
     pub damage: i32,
 }
 
+/// Phase-7 building info — typed view onto the subset of `ActorInfo`
+/// that the simulator needs for static structures (footprint, primary
+/// weapon, MustBeDestroyed flag).
+///
+/// Buildings are also reachable via `UnitInfo::must_be_destroyed`, but
+/// `BuildingInfo` carries the additional fields the static-defense
+/// path needs (footprint, weapon name) without forcing every `unit`
+/// caller to learn about building-only fields.
+#[derive(Debug, Clone)]
+pub struct BuildingInfo {
+    /// Actor type (e.g. `"GUN"`, `"PBOX"`).
+    pub name: String,
+    /// `Health.HP`. Same units as `UnitInfo::hp`.
+    pub hp: i32,
+    /// Footprint (width, height) parsed from `Building.Dimensions:`.
+    /// Defaults to `(2, 2)` when unspecified.
+    pub footprint: (i32, i32),
+    /// Primary armament weapon name (e.g. `"TurretGun"` for `gun`,
+    /// `"TeslaZap"` for `tsla`). `None` for cosmetic buildings.
+    pub primary_weapon: Option<String>,
+    /// Whether this building counts toward the kill-all win condition.
+    pub must_be_destroyed: bool,
+}
+
+/// Build a `BuildingInfo` from a resolved `ActorInfo`.
+///
+/// Returns `None` if the actor lacks `Building` (i.e. is not a building).
+pub fn building_info_from_actor(actor: &ActorInfo) -> Option<BuildingInfo> {
+    if !actor.has_trait("Building") {
+        return None;
+    }
+    let hp = actor
+        .trait_info("Health")
+        .and_then(|t| t.get_i32("HP"))
+        .unwrap_or(0);
+    // Footprint from Building.Dimensions: "W,H" — fall back to 2,2.
+    let footprint = actor
+        .trait_info("Building")
+        .and_then(|b| b.get("Dimensions"))
+        .and_then(|s| {
+            let mut parts = s.split(',');
+            let w: i32 = parts.next()?.trim().parse().ok()?;
+            let h: i32 = parts.next()?.trim().parse().ok()?;
+            Some((w, h))
+        })
+        .unwrap_or((2, 2));
+
+    let primary_weapon = actor
+        .trait_instance("Armament", "PRIMARY")
+        .or_else(|| actor.trait_info("Armament"))
+        .and_then(|t| t.get("Weapon"))
+        .map(|s| s.to_string());
+
+    let must_be_destroyed = actor.has_trait("MustBeDestroyed");
+
+    Some(BuildingInfo {
+        name: actor.name.clone(),
+        hp,
+        footprint,
+        primary_weapon,
+        must_be_destroyed,
+    })
+}
+
 /// Sim-facing typed view over a ruleset. Built from a `Ruleset` via
 /// `Rules::from_ruleset`. Lookups are by uppercase actor/weapon name.
 #[derive(Debug, Clone)]
 pub struct Rules {
     pub units: BTreeMap<String, UnitInfo>,
     pub weapons: BTreeMap<String, WeaponStats>,
+    /// Phase-7 — typed view of static buildings keyed by their uppercase
+    /// actor name (`"GUN"`, `"PBOX"`, `"TSLA"`, `"FACT"`, …).
+    pub buildings: BTreeMap<String, BuildingInfo>,
 }
 
 impl Rules {
@@ -340,9 +407,13 @@ impl Rules {
     /// `parse_wdist`.
     pub fn from_ruleset(ruleset: &Ruleset) -> Self {
         let mut units = BTreeMap::new();
+        let mut buildings = BTreeMap::new();
         for (name, actor) in &ruleset.actors {
             if let Some(unit) = unit_info_from_actor(actor) {
                 units.insert(name.clone(), unit);
+            }
+            if let Some(b) = building_info_from_actor(actor) {
+                buildings.insert(name.clone(), b);
             }
         }
         let mut weapons = BTreeMap::new();
@@ -351,7 +422,7 @@ impl Rules {
                 weapons.insert(name.clone(), stats);
             }
         }
-        Rules { units, weapons }
+        Rules { units, weapons, buildings }
     }
 
     pub fn unit(&self, name: &str) -> Option<&UnitInfo> {
@@ -360,6 +431,11 @@ impl Rules {
 
     pub fn weapon(&self, name: &str) -> Option<&WeaponStats> {
         self.weapons.get(name)
+    }
+
+    /// Phase-7 — look up a building by uppercase actor name.
+    pub fn building(&self, name: &str) -> Option<&BuildingInfo> {
+        self.buildings.get(name)
     }
 
     /// Convenience: load a Rules from a mod directory (e.g.
