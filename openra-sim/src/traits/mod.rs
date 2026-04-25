@@ -8,11 +8,22 @@
 //! Phase-1 submodules (`health`, `mobile`) provide ergonomic typed
 //! components that wrap the synced `TraitState` variants.
 
+pub mod armament;
 pub mod health;
 pub mod mobile;
+pub mod shroud;
 
+pub use armament::Armament;
 pub use health::Health;
 pub use mobile::Mobile;
+pub use shroud::{kind_default_sight, update_from_actors, wdist_to_cell_radius, Shroud, ShroudTable};
+
+/// Compact actor view used by Phase-3 typed activities.
+#[derive(Debug, Clone, Copy)]
+pub struct ActorSummary {
+    pub cell: crate::math::CPos,
+    pub is_dead: bool,
+}
 
 use crate::math::{CPos, WPos};
 
