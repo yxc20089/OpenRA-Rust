@@ -2,10 +2,28 @@
 
 use openra_data::miniyaml;
 
-const OPENRA_MODS: &str = "/Users/berta/Projects/OpenRA/mods/ra/rules";
+/// Locate the OpenRA mod directory. Prefer the vendored copy at
+/// `vendor/OpenRA/mods/ra` (always available in the workspace), fall back to a
+/// system install if present.
+fn openra_mods_rules() -> String {
+    let manifest = env!("CARGO_MANIFEST_DIR");
+    let vendored = format!("{}/../vendor/OpenRA/mods/ra/rules", manifest);
+    if std::path::Path::new(&vendored).exists() {
+        return vendored;
+    }
+    let system = "/Users/berta/Projects/OpenRA/mods/ra/rules".to_string();
+    if std::path::Path::new(&system).exists() {
+        return system;
+    }
+    panic!(
+        "Could not find OpenRA mod rules dir. Tried: {} and {}",
+        vendored, system
+    );
+}
 
 fn read_rules(filename: &str) -> String {
-    let path = format!("{}/{}", OPENRA_MODS, filename);
+    let dir = openra_mods_rules();
+    let path = format!("{}/{}", dir, filename);
     std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("Failed to read {}: {}", path, e))
 }

@@ -9,6 +9,52 @@ use crate::miniyaml::{self, MiniYamlNode};
 use std::collections::BTreeMap;
 use std::path::Path;
 
+/// 1D world distance in OpenRA fixed-point units (1024 units = 1 cell).
+///
+/// This mirrors `openra_sim::math::WDist` exactly (same `i32` representation).
+/// We define a local copy here to keep `openra-data` free of a `openra-sim`
+/// dependency (the dep arrow already runs sim → data). The simulator's loader
+/// constructs proper `WDist` values from the raw `i32` field, no scaling
+/// required.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct WDist {
+    pub length: i32,
+}
+
+impl WDist {
+    pub const ZERO: WDist = WDist { length: 0 };
+
+    pub const fn new(length: i32) -> Self {
+        WDist { length }
+    }
+
+    pub const fn from_cells(cells: i32) -> Self {
+        WDist { length: 1024 * cells }
+    }
+}
+
+/// Parse an OpenRA range/distance literal.
+///
+/// Accepts:
+/// - `"5c0"`     → 5 cells + 0 → WDist(5120)
+/// - `"5c512"`   → 5 cells + 512 → WDist(5632)
+/// - `"2c512"`   → 2 cells + 512
+/// - `"1024"`    → raw fixed-point units (no `c`)
+///
+/// Reference: `OpenRA.Game/WDist.cs::TryParse`.
+pub fn parse_wdist(s: &str) -> Option<WDist> {
+    let s = s.trim();
+    if let Some(idx) = s.find('c') {
+        let cells: i32 = s[..idx].trim().parse().ok()?;
+        let sub: i32 = s[idx + 1..].trim().parse().ok()?;
+        // OpenRA convention: negative cells negate the sub-component too.
+        let sign = if cells < 0 { -1 } else { 1 };
+        Some(WDist::new(cells * 1024 + sign * sub))
+    } else {
+        Some(WDist::new(s.parse().ok()?))
+    }
+}
+
 /// A trait definition on an actor (e.g., Health, Mobile, Armament@PRIMARY).
 #[derive(Debug, Clone)]
 pub struct TraitInfo {
@@ -235,15 +281,175 @@ pub fn load_ruleset(mod_dir: &Path) -> std::io::Result<Ruleset> {
     Ok(load_ruleset_from_strings(&source_refs, &weapon_refs))
 }
 
+// ---------------------------------------------------------------------------
+// Typed convenience layer (sim-facing API).
+// ---------------------------------------------------------------------------
+
+/// Per-unit stats consumed by the simulator.
+///
+/// Values are pulled from the resolved (inheritance-applied) `ActorInfo`. All
+/// distance fields are stored as fixed-point `WDist` (1024 units per cell) so
+/// the sim does not need to scale on load.
+#[derive(Debug, Clone)]
+pub struct UnitInfo {
+    /// Actor type name (e.g. `"E1"`).
+    pub name: String,
+    /// `Health.HP`. C# uses raw integer HP (not WDist). For e1 this is `5000`.
+    pub hp: i32,
+    /// `Mobile.Speed` in OpenRA tick-units. For e1 (inherits ^Infantry) this
+    /// is `54`. Higher = faster. Returns `None` if the actor is immobile.
+    pub speed: Option<i32>,
+    /// `RevealsShroud.Range`. For e1 this is `4c0` = WDist(4096).
+    pub reveal_range: Option<WDist>,
+    /// Primary weapon name, e.g. `"M1Carbine"`. Pulled from
+    /// `Armament.Weapon` or `Armament@PRIMARY.Weapon` (first match wins).
+    pub primary_weapon: Option<String>,
+    /// Whether this actor has the `MustBeDestroyed` trait (counts toward the
+    /// kill-all win condition).
+    pub must_be_destroyed: bool,
+}
+
+/// Per-weapon stats consumed by the simulator's combat loop.
+#[derive(Debug, Clone)]
+pub struct WeaponStats {
+    /// Weapon name (e.g. `"M1Carbine"`).
+    pub name: String,
+    /// `Range`. For M1Carbine this is `5c0` = WDist(5120).
+    pub range: WDist,
+    /// `ReloadDelay` in ticks (cooldown between shots). For M1Carbine = 20.
+    pub reload_delay: i32,
+    /// Damage from `Warhead@1Dam: SpreadDamage` -> `Damage`. Inherited from
+    /// `^LightMG` for M1Carbine = 1000.
+    pub damage: i32,
+}
+
+/// Sim-facing typed view over a ruleset. Built from a `Ruleset` via
+/// `Rules::from_ruleset`. Lookups are by uppercase actor/weapon name.
+#[derive(Debug, Clone)]
+pub struct Rules {
+    pub units: BTreeMap<String, UnitInfo>,
+    pub weapons: BTreeMap<String, WeaponStats>,
+}
+
+impl Rules {
+    /// Build the typed `Rules` view from a parsed `Ruleset`.
+    ///
+    /// Failures during typed extraction are logged via `eprintln!` and the
+    /// affected unit/weapon is skipped (we do not want to abort the whole
+    /// load on a single missing field). All distance values pass through
+    /// `parse_wdist`.
+    pub fn from_ruleset(ruleset: &Ruleset) -> Self {
+        let mut units = BTreeMap::new();
+        for (name, actor) in &ruleset.actors {
+            if let Some(unit) = unit_info_from_actor(actor) {
+                units.insert(name.clone(), unit);
+            }
+        }
+        let mut weapons = BTreeMap::new();
+        for (name, weapon) in &ruleset.weapons {
+            if let Some(stats) = weapon_stats_from_weapon(weapon) {
+                weapons.insert(name.clone(), stats);
+            }
+        }
+        Rules { units, weapons }
+    }
+
+    pub fn unit(&self, name: &str) -> Option<&UnitInfo> {
+        self.units.get(name)
+    }
+
+    pub fn weapon(&self, name: &str) -> Option<&WeaponStats> {
+        self.weapons.get(name)
+    }
+
+    /// Convenience: load a Rules from a mod directory (e.g.
+    /// `"vendor/OpenRA/mods/ra"`).
+    pub fn load(mod_dir: &Path) -> std::io::Result<Self> {
+        let ruleset = load_ruleset(mod_dir)?;
+        Ok(Self::from_ruleset(&ruleset))
+    }
+}
+
+/// Build a `UnitInfo` from a resolved `ActorInfo`. Returns `None` if the
+/// actor lacks a `Health` block (e.g. for abstract `^...` parents that
+/// somehow leaked through, or for purely-decorative actors).
+fn unit_info_from_actor(actor: &ActorInfo) -> Option<UnitInfo> {
+    let health = actor.trait_info("Health")?;
+    let hp = health.get_i32("HP")?;
+
+    let speed = actor.trait_info("Mobile").and_then(|t| t.get_i32("Speed"));
+    let reveal_range = actor
+        .trait_info("RevealsShroud")
+        .and_then(|t| t.get("Range"))
+        .and_then(parse_wdist);
+
+    // Find the primary armament. C# uses Armament@PRIMARY when present,
+    // else falls back to a bare `Armament:` block.
+    let primary_weapon = actor
+        .trait_instance("Armament", "PRIMARY")
+        .or_else(|| actor.trait_info("Armament"))
+        .and_then(|t| t.get("Weapon"))
+        .map(|s| s.to_string());
+
+    let must_be_destroyed = actor.has_trait("MustBeDestroyed");
+
+    Some(UnitInfo {
+        name: actor.name.clone(),
+        hp,
+        speed,
+        reveal_range,
+        primary_weapon,
+        must_be_destroyed,
+    })
+}
+
+/// Build a `WeaponStats` from a resolved `WeaponInfo`. Walks the children
+/// list (not `params`) for the `Warhead@*: SpreadDamage` block. Returns
+/// `None` if `Range`, `ReloadDelay`, or a damaging warhead is missing.
+fn weapon_stats_from_weapon(weapon: &WeaponInfo) -> Option<WeaponStats> {
+    let range = weapon.get("Range").and_then(parse_wdist)?;
+    let reload_delay = weapon.get_i32("ReloadDelay")?;
+
+    // Warheads live in `weapon.children`, not in `params` (because they have
+    // their own children block). Find the first SpreadDamage warhead with a
+    // Damage value.
+    let mut damage = None;
+    for child in &weapon.children {
+        if !child.key.starts_with("Warhead") {
+            continue;
+        }
+        // Warhead@FOO: SpreadDamage  →  child.value == "SpreadDamage"
+        if child.value != "SpreadDamage" {
+            continue;
+        }
+        if let Some(d_node) = child.child("Damage")
+            && let Ok(d) = d_node.value.parse::<i32>()
+        {
+            damage = Some(d);
+            break;
+        }
+    }
+    let damage = damage?;
+
+    Some(WeaponStats {
+        name: weapon.name.clone(),
+        range,
+        reload_delay,
+        damage,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn load_ra_ruleset() {
-        let mod_dir = Path::new("/Users/berta/Projects/OpenRA/mods/ra");
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let vendored = format!("{}/../vendor/OpenRA/mods/ra", manifest);
+        let mod_dir = Path::new(&vendored);
         if !mod_dir.exists() {
-            eprintln!("Skipping: OpenRA mod dir not found");
+            eprintln!("Skipping: vendored OpenRA mod dir not found at {}", vendored);
             return;
         }
         let ruleset = load_ruleset(mod_dir).unwrap();
@@ -278,9 +484,11 @@ mod tests {
 
     #[test]
     fn load_ra_weapons() {
-        let mod_dir = Path::new("/Users/berta/Projects/OpenRA/mods/ra");
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let vendored = format!("{}/../vendor/OpenRA/mods/ra", manifest);
+        let mod_dir = Path::new(&vendored);
         if !mod_dir.exists() {
-            eprintln!("Skipping: OpenRA mod dir not found");
+            eprintln!("Skipping: vendored OpenRA mod dir not found at {}", vendored);
             return;
         }
         let ruleset = load_ruleset(mod_dir).unwrap();
