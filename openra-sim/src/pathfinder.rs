@@ -59,6 +59,72 @@ fn heuristic(x: i32, y: i32, gx: i32, gy: i32) -> i32 {
     straight * ORTHO_COST + diag * DIAG_COST
 }
 
+/// Find the nearest unoccupied walkable cell to `target`, ignoring `ignore_actor`.
+///
+/// BFS-expands outward from `target`. Returns `target` itself if it's
+/// already unoccupied (or only occupied by `ignore_actor`). Returns None
+/// if no walkable cell is found within `max_radius` cells.
+///
+/// Used by `order_move` to spread units that would otherwise stack on the
+/// same destination cell. Without this, multiple units commanded to the
+/// same target all path to the same cell because the pathfinder allows the
+/// destination to be occupied (see find_path's `to` exception).
+pub fn find_nearest_unoccupied(
+    terrain: &TerrainMap,
+    target: (i32, i32),
+    ignore_actor: Option<u32>,
+    max_radius: i32,
+) -> Option<(i32, i32)> {
+    let cell_ok = |x: i32, y: i32| -> bool {
+        if !terrain.contains(x, y) {
+            return false;
+        }
+        if !terrain.is_terrain_passable(x, y) {
+            return false;
+        }
+        let occ = terrain.occupant(x, y);
+        if occ == 0 {
+            return true;
+        }
+        if let Some(ignore) = ignore_actor {
+            if occ == ignore {
+                return true;
+            }
+        }
+        false
+    };
+
+    if cell_ok(target.0, target.1) {
+        return Some(target);
+    }
+
+    // BFS-style ring search. Each ring r contains cells at Chebyshev distance r.
+    for r in 1..=max_radius {
+        let x_min = target.0 - r;
+        let x_max = target.0 + r;
+        let y_min = target.1 - r;
+        let y_max = target.1 + r;
+        // Top + bottom rows
+        for y in [y_min, y_max] {
+            for x in x_min..=x_max {
+                if cell_ok(x, y) {
+                    return Some((x, y));
+                }
+            }
+        }
+        // Left + right columns (excluding the corners already checked above)
+        for x in [x_min, x_max] {
+            for y in (y_min + 1)..y_max {
+                if cell_ok(x, y) {
+                    return Some((x, y));
+                }
+            }
+        }
+    }
+    None
+}
+
+
 /// Find a path from `from` to `to` on the terrain map.
 ///
 /// Returns the path as a list of cells from start to goal (inclusive),

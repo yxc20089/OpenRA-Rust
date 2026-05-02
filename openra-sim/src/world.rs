@@ -300,6 +300,11 @@ pub struct World {
     /// is unaffected. Currently stores `Vehicle` (locomotor + has_turret
     /// flag) and `Turret` (independent yaw, turn-speed) per actor.
     typed_components: BTreeMap<u32, ActorTypedComponents>,
+    /// Per-frame "claimed" move destinations. Cleared at the start of
+    /// each `process_frame`, populated by `order_move` so that multiple
+    /// simultaneous Move orders to the same target spread to nearby
+    /// unoccupied cells instead of all stacking on one cell.
+    pending_move_destinations: HashSet<(i32, i32)>,
 }
 
 /// Typed components attached to a single actor. Lookup is via
@@ -609,6 +614,12 @@ impl World {
             self.update_debug_pause_state();
         }
 
+        // Reset per-frame move-destination reservations so that orders within
+        // this frame spread to distinct cells. Reservations don't persist
+        // across frames — by next frame, units have moved and occupancy is
+        // up-to-date again.
+        self.pending_move_destinations.clear();
+
         // 1. Process replay/external orders
         for order in orders {
             self.process_order(order);
@@ -836,15 +847,92 @@ impl World {
         }
     }
 
+    /// Find the nearest cell that is BOTH unoccupied on the terrain AND not
+    /// claimed by a previous Move order this frame. BFS-expands from
+    /// `target` up to `max_radius` cells. Used by `order_move` to keep
+    /// concurrent Move orders from selecting the same destination cell.
+    fn find_nearest_unclaimed_cell(
+        &self,
+        target: (i32, i32),
+        ignore_actor: Option<u32>,
+        max_radius: i32,
+    ) -> Option<(i32, i32)> {
+        let cell_ok = |x: i32, y: i32| -> bool {
+            if !self.terrain.contains(x, y) {
+                return false;
+            }
+            if !self.terrain.is_terrain_passable(x, y) {
+                return false;
+            }
+            if self.pending_move_destinations.contains(&(x, y)) {
+                return false;
+            }
+            let occ = self.terrain.occupant(x, y);
+            if occ == 0 {
+                return true;
+            }
+            if let Some(ignore) = ignore_actor {
+                if occ == ignore {
+                    return true;
+                }
+            }
+            false
+        };
+
+        if cell_ok(target.0, target.1) {
+            return Some(target);
+        }
+        for r in 1..=max_radius {
+            let x_min = target.0 - r;
+            let x_max = target.0 + r;
+            let y_min = target.1 - r;
+            let y_max = target.1 + r;
+            for y in [y_min, y_max] {
+                for x in x_min..=x_max {
+                    if cell_ok(x, y) {
+                        return Some((x, y));
+                    }
+                }
+            }
+            for x in [x_min, x_max] {
+                for y in (y_min + 1)..y_max {
+                    if cell_ok(x, y) {
+                        return Some((x, y));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Handle a Move order: pathfind and start moving.
     /// Like C# OpenRA, vehicles turn in place first (TurnsWhileMoving=false),
     /// then begin the Move activity already facing the correct direction.
+    ///
+    /// If the requested target cell is occupied by another actor (or claimed
+    /// by another Move order in this frame), resolves to the nearest free
+    /// walkable cell within 6 cells. This prevents multiple units commanded
+    /// to the same target from stacking on one cell.
     fn order_move(&mut self, actor_id: u32, target: (i32, i32)) {
         let from = match self.actors.get(&actor_id).and_then(|a| a.location) {
             Some(loc) => loc,
             None => return,
         };
-        if let Some(path) = pathfinder::find_path(&self.terrain, from, target, Some(actor_id)) {
+        // Resolve destination: spread to nearest unoccupied cell if target
+        // is taken (by terrain occupancy or by another unit's pending move
+        // destination this frame). The reservation set prevents N concurrent
+        // Move orders to the same target from all picking the same cell —
+        // each picks the next-nearest free cell.
+        let resolved_target = self
+            .find_nearest_unclaimed_cell(target, Some(actor_id), 6)
+            .unwrap_or(target);
+        // Reserve the chosen destination so subsequent orders this frame
+        // don't pick it (only if it's actually different from the from-cell;
+        // staying-put doesn't need a reservation).
+        if resolved_target != from {
+            self.pending_move_destinations.insert(resolved_target);
+        }
+        if let Some(path) = pathfinder::find_path(&self.terrain, from, resolved_target, Some(actor_id)) {
             if path.len() > 1 {
                 let speed = self.actor_speed(actor_id);
                 let move_activity = Activity::Move {
@@ -1667,6 +1755,84 @@ impl World {
                     }
                 }
             }
+        }
+
+        // ── Auto-engage during Move ────────────────────────────────────
+        // Scan each Move-active actor for an enemy in firing range. If one
+        // is found, swap Move → Attack so units fight when commanded toward
+        // (or past) an enemy. Without this, `move(target=enemy_cell)` just
+        // walks units onto the enemy cell where they sit idle — the Rust
+        // Move activity has no fire-during-path logic. This brings parity
+        // with the C# OpenRA `AttackMove` semantic that the LLM system
+        // prompt teaches the model to expect.
+        let mut engage_pairs: Vec<(u32, u32)> = Vec::new();
+        for (id, actor) in &self.actors {
+            if !matches!(actor.activity, Some(Activity::Move { .. })) {
+                continue;
+            }
+            let my_loc = match actor.location {
+                Some(l) => l,
+                None => continue,
+            };
+            let my_owner = match actor.owner_id {
+                Some(o) => o,
+                None => continue,
+            };
+            // Resolve this actor's primary weapon range (cells)
+            let range_cells = actor.actor_type.as_deref()
+                .and_then(|at| self.rules.actor(at))
+                .and_then(|stats| stats.weapons.first())
+                .and_then(|wname| self.rules.weapon(wname))
+                .map(|w| w.range / 1024)
+                .unwrap_or(0);
+            if range_cells <= 0 {
+                continue;
+            }
+            // Find nearest enemy actor within firing range. Enemy = owned by
+            // a different playable owner; we exclude self-owner and the
+            // unowned (None) world-actors. Matches a pragmatic subset of C#
+            // diplomacy — sufficient for rush-hour's two-player scenario.
+            let mut best: Option<(u32, i32)> = None;
+            for (eid, enemy) in &self.actors {
+                if *eid == *id {
+                    continue;
+                }
+                let eloc = match enemy.location {
+                    Some(l) => l,
+                    None => continue,
+                };
+                let eowner = match enemy.owner_id {
+                    Some(o) => o,
+                    None => continue,
+                };
+                if eowner == my_owner {
+                    continue;
+                }
+                if !matches!(
+                    enemy.kind,
+                    ActorKind::Infantry
+                        | ActorKind::Vehicle
+                        | ActorKind::Mcv
+                        | ActorKind::Building
+                ) {
+                    continue;
+                }
+                let dx = (eloc.0 - my_loc.0).abs();
+                let dy = (eloc.1 - my_loc.1).abs();
+                let dist = dx.max(dy); // Chebyshev (matches armament.rs)
+                if dist <= range_cells {
+                    if best.map_or(true, |(_, d)| dist < d) {
+                        best = Some((*eid, dist));
+                    }
+                }
+            }
+            if let Some((target_id, _)) = best {
+                engage_pairs.push((*id, target_id));
+            }
+        }
+        // Apply: Move → Attack
+        for (attacker, target) in engage_pairs {
+            self.order_attack(attacker, target);
         }
 
         // Tick Move activities: advance position along path.
@@ -3815,6 +3981,7 @@ pub fn build_world(
         pending_projectiles: BTreeMap::new(),
         next_projectile_id: 1,
         typed_components: BTreeMap::new(),
+        pending_move_destinations: HashSet::new(),
     };
 
     // Initial shroud reveal around starting units
