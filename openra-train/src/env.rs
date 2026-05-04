@@ -10,7 +10,7 @@
 //! shim that translates `Vec<PyCommand>` → `Vec<Command>` and
 //! `Observation` → `PyDict`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use openra_data::oramap::{self, MapActor, MapDef, OraMap, PlayerDef, ScenarioActor};
@@ -32,9 +32,64 @@ use crate::observation::{EnemyBuilding, EnemyPos, Observation, UnitPos};
 /// number and to align with the C# rush-hour reference).
 pub const DEFAULT_TICKS_PER_STEP: u32 = 30;
 
-/// Hard cap on episode length — matches the prod openra-rl 6000-tick
-/// timeout (~4 game-minutes).
-pub const DEFAULT_MAX_TICKS: u32 = 6000;
+/// Hard cap on episode length. 10000 ticks = 400 game-seconds at the
+/// engine's 25 ticks/second cadence, matching the "of 400s" budget the
+/// briefing displays to the model.
+pub const DEFAULT_MAX_TICKS: u32 = 10000;
+
+/// Default per-signal cooldown — minimum ticks between consecutive fires
+/// for the same dedup key. Prevents flicker spam at fog boundaries.
+/// 30 ticks ≈ 1 game-second.
+pub const DEFAULT_INTERRUPT_COOLDOWN_TICKS: i32 = 30;
+
+/// All interrupt signal names the engine knows about. Mirrors the
+/// production agent_rollout.py:_DEDUPED_INTERRUPTS list. Names are
+/// stable strings so the Python side can opt in/out by name.
+pub const INTERRUPT_SIGNAL_NAMES: &[&str] = &[
+    "enemy_unit_spotted",
+    "enemy_building_spotted",
+    "engage_start",
+];
+
+/// Per-episode tracking state for interrupt detection. Resets on
+/// every `reset()` call.
+#[derive(Debug, Default)]
+pub struct InterruptState {
+    /// Visible-to-agent enemy unit IDs at the *previous check*
+    /// (single-frame snapshot, NOT cumulative). Diffed against the
+    /// current frame to find newly-visible IDs.
+    prev_visible_enemy_unit_ids: HashSet<u32>,
+    /// Same for enemy buildings.
+    prev_visible_enemy_building_ids: HashSet<u32>,
+    /// Own unit IDs that were attacking last check, keyed to the
+    /// target they were attacking. The dedup key is
+    /// `(own_actor_id, target_actor_id)` — different target = new event.
+    prev_attacking_pairs: HashSet<(u32, u32)>,
+    /// Per-(signal, dedup_key) last-fire tick. Suppresses re-fire if
+    /// `current_tick - last_fire_tick < cooldown_ticks`.
+    last_fire_tick: HashMap<(String, u64), i32>,
+}
+
+impl InterruptState {
+    fn cooldown_ok(&self, signal: &str, key: u64, now: i32, cooldown: i32) -> bool {
+        match self.last_fire_tick.get(&(signal.to_string(), key)) {
+            Some(&t) => now - t >= cooldown,
+            None => true,
+        }
+    }
+
+    fn mark_fired(&mut self, signal: &str, key: u64, now: i32) {
+        self.last_fire_tick
+            .insert((signal.to_string(), key), now);
+    }
+
+    fn clear(&mut self) {
+        self.prev_visible_enemy_unit_ids.clear();
+        self.prev_visible_enemy_building_ids.clear();
+        self.prev_attacking_pairs.clear();
+        self.last_fire_tick.clear();
+    }
+}
 
 /// Errors surfaced from `Env::new` / `Env::reset`.
 #[derive(Debug)]
@@ -88,6 +143,13 @@ pub struct Env {
     max_ticks: u32,
     /// Last-step warnings (e.g. ignored unit ids). Surfaced through `info`.
     last_warnings: Vec<String>,
+    /// Interrupt-detection state. Reset on every `reset()`.
+    interrupt_state: InterruptState,
+    /// Which interrupt signals are enabled. Empty = none (back-compat,
+    /// `step()` keeps working as before).
+    enabled_signals: HashSet<String>,
+    /// Cooldown ticks between fires for the same dedup key.
+    cooldown_ticks: i32,
 }
 
 impl Env {
@@ -120,7 +182,28 @@ impl Env {
             ticks_per_step: DEFAULT_TICKS_PER_STEP,
             max_ticks: DEFAULT_MAX_TICKS,
             last_warnings: Vec::new(),
+            interrupt_state: InterruptState::default(),
+            enabled_signals: HashSet::new(),
+            cooldown_ticks: DEFAULT_INTERRUPT_COOLDOWN_TICKS,
         })
+    }
+
+    /// Configure which interrupt signals are emitted by `step_until_event`.
+    /// Pass an empty set to disable all (back-compat). Names must come
+    /// from `INTERRUPT_SIGNAL_NAMES`.
+    pub fn with_enabled_signals<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.enabled_signals = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Override cooldown ticks (default `DEFAULT_INTERRUPT_COOLDOWN_TICKS`).
+    pub fn with_cooldown_ticks(mut self, n: i32) -> Self {
+        self.cooldown_ticks = n.max(0);
+        self
     }
 
     /// Override ticks-per-step (default `DEFAULT_TICKS_PER_STEP`).
@@ -141,6 +224,7 @@ impl Env {
         self.units_killed = 0;
         self.explored_cells.clear();
         self.last_warnings.clear();
+        self.interrupt_state.clear();
         self.refresh_explored_cells();
         self.observation()
     }
@@ -173,6 +257,200 @@ impl Env {
             done,
             warnings: self.last_warnings.clone(),
         }
+    }
+
+    /// Advance up to `max_ticks` frames, checking for interrupt signals
+    /// every `check_every` frames. Returns early as soon as a signal
+    /// fires (or the world reaches terminal). Mirrors the C# bridge's
+    /// `advance` + `CheckInterrupts()` pattern in
+    /// `ExternalBotBridge.cs:614`.
+    ///
+    /// Commands are issued on tick 0 only (same as `step()`).
+    /// `enabled_signals_override` lets a single call narrow the
+    /// configured `enabled_signals` (used for fine-grained per-call
+    /// gating, e.g. silencing engage_start during pure-scout phases).
+    /// Pass `None` to use the env-level `enabled_signals` set.
+    pub fn step_until_event(
+        &mut self,
+        commands: &[Command],
+        max_ticks: u32,
+        check_every: u32,
+        enabled_signals_override: Option<HashSet<String>>,
+    ) -> StepUntilEventResult {
+        self.last_warnings.clear();
+        let orders = self.build_orders(commands);
+
+        // Clone into an owned set so we can call `&mut self` methods
+        // (tick_world_with_orders, check_interrupts) without holding an
+        // immutable borrow on `self.enabled_signals`. The set is tiny.
+        let signals: HashSet<String> = enabled_signals_override
+            .unwrap_or_else(|| self.enabled_signals.clone());
+        let any_enabled = !signals.is_empty();
+        let check_every = check_every.max(1);
+        let max_ticks = max_ticks.max(1);
+
+        let mut ticks_done: u32 = 0;
+        let mut interrupt_reason: Option<String> = None;
+        let mut applied_orders = false;
+
+        while ticks_done < max_ticks {
+            // Issue orders on the very first frame; subsequent ticks
+            // just advance state.
+            if !applied_orders {
+                self.tick_world_with_orders(&orders);
+                applied_orders = true;
+            } else {
+                self.tick_world_with_orders(&[]);
+            }
+            ticks_done += 1;
+
+            if self.is_terminal() {
+                break;
+            }
+
+            // Check signals every `check_every` ticks (and on the last
+            // tick) to keep per-frame overhead bounded.
+            let on_check_boundary = ticks_done % check_every == 0;
+            if any_enabled && on_check_boundary {
+                if let Some(reason) = self.check_interrupts(&signals) {
+                    interrupt_reason = Some(reason);
+                    break;
+                }
+            }
+        }
+
+        self.refresh_explored_cells();
+        self.update_kill_counter();
+
+        let obs = self.observation();
+        let done = self.is_terminal();
+        StepUntilEventResult {
+            obs,
+            reward: 0.0,
+            done,
+            warnings: self.last_warnings.clone(),
+            interrupted: interrupt_reason.is_some(),
+            interrupt_reason,
+            ticks_advanced: ticks_done,
+        }
+    }
+
+    /// Walk the current world and check each enabled signal against the
+    /// previous-frame state. Updates `prev_*` snapshots and the
+    /// last-fire ledger as side-effects. Returns the first signal name
+    /// that fires (priority order matches `INTERRUPT_SIGNAL_NAMES`),
+    /// or `None`.
+    fn check_interrupts(&mut self, signals: &HashSet<String>) -> Option<String> {
+        let world = self.world.as_ref()?;
+        let now = world.world_tick as i32;
+        let cooldown = self.cooldown_ticks;
+
+        // Snapshot the current frame: which enemy unit / building IDs
+        // are agent-visible right now, and which own-unit→target attack
+        // pairs are active.
+        let snap = world.snapshot();
+        let mut cur_visible_enemy_units: HashSet<u32> = HashSet::new();
+        let mut cur_visible_enemy_buildings: HashSet<u32> = HashSet::new();
+        let mut cur_attacking_pairs: HashSet<(u32, u32)> = HashSet::new();
+
+        for a in &snap.actors {
+            if matches!(
+                a.kind,
+                ActorKind::World | ActorKind::Player | ActorKind::Spawn
+            ) {
+                continue;
+            }
+            if matches!(a.kind, ActorKind::Tree | ActorKind::Mine) {
+                continue;
+            }
+            if a.owner == self.enemy_player_id {
+                if !self.is_visible_to_agent(world, a.x, a.y) {
+                    continue;
+                }
+                if matches!(a.kind, ActorKind::Building) {
+                    cur_visible_enemy_buildings.insert(a.id);
+                } else {
+                    cur_visible_enemy_units.insert(a.id);
+                }
+            } else if a.owner == self.agent_player_id {
+                if let Some(tid) = a.target_id {
+                    cur_attacking_pairs.insert((a.id, tid));
+                }
+            }
+        }
+
+        let mut fired: Option<String> = None;
+
+        // Priority order: engage_start > enemy_unit_spotted > enemy_building_spotted.
+        // Engage wins because it implies an immediate combat decision; spots
+        // are recon-grade information.
+        if signals.contains("engage_start") {
+            for &(uid, tid) in &cur_attacking_pairs {
+                if !self.interrupt_state.prev_attacking_pairs.contains(&(uid, tid)) {
+                    let key = ((uid as u64) << 32) | (tid as u64);
+                    if self
+                        .interrupt_state
+                        .cooldown_ok("engage_start", key, now, cooldown)
+                    {
+                        self.interrupt_state.mark_fired("engage_start", key, now);
+                        fired = Some(format!("engage_start: own {} → target {}", uid, tid));
+                        break;
+                    }
+                }
+            }
+        }
+
+        if fired.is_none() && signals.contains("enemy_unit_spotted") {
+            for &id in &cur_visible_enemy_units {
+                if !self
+                    .interrupt_state
+                    .prev_visible_enemy_unit_ids
+                    .contains(&id)
+                {
+                    let key = id as u64;
+                    if self
+                        .interrupt_state
+                        .cooldown_ok("enemy_unit_spotted", key, now, cooldown)
+                    {
+                        self.interrupt_state
+                            .mark_fired("enemy_unit_spotted", key, now);
+                        fired = Some(format!("enemy_unit_spotted: id {}", id));
+                        break;
+                    }
+                }
+            }
+        }
+
+        if fired.is_none() && signals.contains("enemy_building_spotted") {
+            for &id in &cur_visible_enemy_buildings {
+                if !self
+                    .interrupt_state
+                    .prev_visible_enemy_building_ids
+                    .contains(&id)
+                {
+                    let key = id as u64;
+                    if self
+                        .interrupt_state
+                        .cooldown_ok("enemy_building_spotted", key, now, cooldown)
+                    {
+                        self.interrupt_state
+                            .mark_fired("enemy_building_spotted", key, now);
+                        fired = Some(format!("enemy_building_spotted: id {}", id));
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Always update prev-frame snapshots so the next check sees a
+        // proper transition. Crucial: a signal that we suppressed via
+        // cooldown is still added to the prev-set so it doesn't keep
+        // re-evaluating every check.
+        self.interrupt_state.prev_visible_enemy_unit_ids = cur_visible_enemy_units;
+        self.interrupt_state.prev_visible_enemy_building_ids = cur_visible_enemy_buildings;
+        self.interrupt_state.prev_attacking_pairs = cur_attacking_pairs;
+
+        fired
     }
 
     /// Render an ASCII map for debugging (rows top-to-bottom).
@@ -349,7 +627,14 @@ impl Env {
         // Turret typed components per actor below. Falls back to
         // `GameRules::defaults` when the vendor dir is missing.
         let (rules, typed_rules) = load_rules_with_fallback();
-        let mut world = build_world(&ora, seed_i32, &lobby, Some(rules), 0);
+        let mut world = build_world(
+            &ora,
+            seed_i32,
+            &lobby,
+            Some(rules),
+            0,
+            self.map_def.spawn_mcvs,
+        );
 
         // Resolve player ids: `build_world` allocates the World actor
         // (id 0), then non-playable players, then playable players, then
@@ -540,6 +825,7 @@ impl Env {
                     units_killed: 0,
                     game_tick: 0,
                     explored_percent: 0.0,
+                    explored_cells: Vec::new(),
                 };
             }
         };
@@ -580,11 +866,16 @@ impl Env {
                     // unit positions only.
                     continue;
                 }
+                let target = match (a.target_x, a.target_y) {
+                    (Some(tx), Some(ty)) => Some((tx, ty)),
+                    _ => None,
+                };
                 unit_positions.push((
                     id_str.clone(),
                     UnitPos {
                         cell_x: a.x,
                         cell_y: a.y,
+                        target,
                     },
                 ));
                 unit_hp.push((id_str, pct));
@@ -617,6 +908,13 @@ impl Env {
             0.0
         };
 
+        // Snapshot the cumulative explored set as a list. The Python
+        // minimap renderer uses this as ground truth instead of
+        // re-deriving from briefing-time unit positions (which misses
+        // cells units transited between briefings).
+        let explored_cells: Vec<(i32, i32)> =
+            self.explored_cells.iter().copied().collect();
+
         Observation {
             unit_positions,
             unit_hp,
@@ -626,6 +924,7 @@ impl Env {
             units_killed: self.units_killed,
             game_tick: world.world_tick as i32,
             explored_percent,
+            explored_cells,
         }
     }
 
@@ -705,6 +1004,24 @@ pub struct StepResult {
     pub done: bool,
     /// Warnings strung up under `info["warnings"]` on the Python side.
     pub warnings: Vec<String>,
+}
+
+/// Result of `Env::step_until_event` — same shape as `StepResult` plus
+/// fields describing whether (and why) the advance returned early.
+#[derive(Debug, Clone)]
+pub struct StepUntilEventResult {
+    pub obs: Observation,
+    pub reward: f32,
+    pub done: bool,
+    pub warnings: Vec<String>,
+    /// True if the advance returned early because an interrupt fired.
+    pub interrupted: bool,
+    /// Human-readable reason (e.g. `"enemy_unit_spotted: id 1016"`).
+    /// `None` if `interrupted == false`.
+    pub interrupt_reason: Option<String>,
+    /// How many ticks the advance actually consumed (≤ requested
+    /// `max_ticks`). On interrupt this is < max_ticks.
+    pub ticks_advanced: u32,
 }
 
 // ---- Helpers (private) -------------------------------------------------------
@@ -977,6 +1294,7 @@ pub fn build_test_env_with_no_enemies(map_size: (i32, i32), seed: u64) -> Env {
             owner: "agent".into(),
             position: (5, 5),
         }],
+        spawn_mcvs: true,
     };
     let mut env = Env {
         scenario_path: PathBuf::from("<test>"),
@@ -991,6 +1309,9 @@ pub fn build_test_env_with_no_enemies(map_size: (i32, i32), seed: u64) -> Env {
         ticks_per_step: DEFAULT_TICKS_PER_STEP,
         max_ticks: DEFAULT_MAX_TICKS,
         last_warnings: Vec::new(),
+        interrupt_state: InterruptState::default(),
+        enabled_signals: HashSet::new(),
+        cooldown_ticks: DEFAULT_INTERRUPT_COOLDOWN_TICKS,
     };
     env.reset();
     env
@@ -1014,12 +1335,14 @@ mod py {
     #[pymethods]
     impl OpenRAEnv {
         #[new]
-        #[pyo3(signature = (scenario_path, seed, ticks_per_step=None, max_ticks=None))]
+        #[pyo3(signature = (scenario_path, seed, ticks_per_step=None, max_ticks=None, enabled_signals=None, cooldown_ticks=None))]
         fn new(
             scenario_path: String,
             seed: u64,
             ticks_per_step: Option<u32>,
             max_ticks: Option<u32>,
+            enabled_signals: Option<Vec<String>>,
+            cooldown_ticks: Option<i32>,
         ) -> PyResult<Self> {
             let mut env = Env::new(&scenario_path, seed)
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
@@ -1028,6 +1351,21 @@ mod py {
             }
             if let Some(n) = max_ticks {
                 env = env.with_max_ticks(n);
+            }
+            if let Some(s) = enabled_signals {
+                // Validate against the registry — surface typos early.
+                for name in &s {
+                    if !INTERRUPT_SIGNAL_NAMES.contains(&name.as_str()) {
+                        return Err(PyValueError::new_err(format!(
+                            "Unknown interrupt signal: {:?}. Valid: {:?}",
+                            name, INTERRUPT_SIGNAL_NAMES
+                        )));
+                    }
+                }
+                env = env.with_enabled_signals(s);
+            }
+            if let Some(n) = cooldown_ticks {
+                env = env.with_cooldown_ticks(n);
             }
             Ok(OpenRAEnv { inner: env })
         }
@@ -1054,6 +1392,78 @@ mod py {
             info.set_item("warnings", warnings)?;
             info.set_item("game_tick", result.obs.game_tick)?;
             Ok((obs, result.reward, result.done, info))
+        }
+
+        /// Advance up to `max_ticks`, returning early if an enabled
+        /// interrupt signal fires. Returns
+        /// `(obs, reward, done, info, interrupted, interrupt_reason, ticks_advanced)`.
+        /// `info["warnings"]` carries the same per-step warnings as
+        /// `step()`.
+        ///
+        /// `enabled_signals_override` lets a single call narrow the
+        /// constructor-set `enabled_signals` to a subset (e.g. silence
+        /// `engage_start` during pure-recon phases). Pass `None` to
+        /// inherit the env-level set.
+        #[pyo3(signature = (commands, max_ticks=None, check_every=5, enabled_signals_override=None))]
+        fn step_until_event<'py>(
+            &mut self,
+            py: Python<'py>,
+            commands: Vec<PyRef<PyCommand>>,
+            max_ticks: Option<u32>,
+            check_every: u32,
+            enabled_signals_override: Option<Vec<String>>,
+        ) -> PyResult<(
+            Bound<'py, PyDict>,
+            f32,
+            bool,
+            Bound<'py, PyDict>,
+            bool,
+            Option<String>,
+            u32,
+        )> {
+            let cmds: Vec<Command> = commands.into_iter().map(|c| c.inner.clone()).collect();
+            let max_ticks = max_ticks.unwrap_or_else(|| self.inner.ticks_per_step());
+
+            let override_set: Option<HashSet<String>> = enabled_signals_override.map(|v| {
+                v.into_iter().collect()
+            });
+            // Validate override names if provided.
+            if let Some(set) = override_set.as_ref() {
+                for name in set {
+                    if !INTERRUPT_SIGNAL_NAMES.contains(&name.as_str()) {
+                        return Err(PyValueError::new_err(format!(
+                            "Unknown interrupt signal: {:?}. Valid: {:?}",
+                            name, INTERRUPT_SIGNAL_NAMES
+                        )));
+                    }
+                }
+            }
+
+            let result = self.inner.step_until_event(
+                &cmds,
+                max_ticks,
+                check_every,
+                override_set,
+            );
+
+            let obs = result.obs.to_pydict(py)?;
+            let info = PyDict::new_bound(py);
+            let warnings = PyList::empty_bound(py);
+            for w in &result.warnings {
+                warnings.append(w)?;
+            }
+            info.set_item("warnings", warnings)?;
+            info.set_item("game_tick", result.obs.game_tick)?;
+            info.set_item("ticks_advanced", result.ticks_advanced)?;
+            Ok((
+                obs,
+                result.reward,
+                result.done,
+                info,
+                result.interrupted,
+                result.interrupt_reason,
+                result.ticks_advanced,
+            ))
         }
 
         fn render(&self) -> String {

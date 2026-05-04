@@ -29,6 +29,10 @@
 pub struct UnitPos {
     pub cell_x: i32,
     pub cell_y: i32,
+    /// Destination cell of the unit's current activity, if any
+    /// (Move → final path cell; Attack → target's current cell).
+    /// `None` means the unit is idle / turning / harvesting.
+    pub target: Option<(i32, i32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +81,12 @@ pub struct Observation {
     pub game_tick: i32,
     /// Percentage of map cells the agent has ever revealed (0..100).
     pub explored_percent: f32,
+    /// All cells (x, y) the agent has ever revealed. Sticky — once a
+    /// cell is in this set it stays. Accumulated tick-by-tick by the
+    /// engine, so this captures cells that units transited *between*
+    /// briefings (which a position-snapshot-based reveal mask would
+    /// miss). Used by the minimap renderer to draw fog correctly.
+    pub explored_cells: Vec<(i32, i32)>,
 }
 
 impl Observation {
@@ -160,12 +170,18 @@ mod py {
         pub fn to_pydict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
             let d = PyDict::new_bound(py);
 
-            // unit_positions: {id: {cell_x, cell_y}}
+            // unit_positions: {id: {cell_x, cell_y, target?: [tx, ty]}}
             let unit_positions = PyDict::new_bound(py);
             for (id, pos) in &self.unit_positions {
                 let entry = PyDict::new_bound(py);
                 entry.set_item("cell_x", pos.cell_x)?;
                 entry.set_item("cell_y", pos.cell_y)?;
+                if let Some((tx, ty)) = pos.target {
+                    let target = PyList::empty_bound(py);
+                    target.append(tx)?;
+                    target.append(ty)?;
+                    entry.set_item("target", target)?;
+                }
                 unit_positions.set_item(id, entry)?;
             }
             d.set_item("unit_positions", unit_positions)?;
@@ -214,6 +230,18 @@ mod py {
             d.set_item("units_killed", self.units_killed)?;
             d.set_item("game_tick", self.game_tick)?;
             d.set_item("explored_percent", self.explored_percent)?;
+
+            // explored_cells: list[(x, y)] — accurate per-tick fog
+            // accumulation. The renderer uses this instead of
+            // approximating from per-briefing unit positions.
+            let cells = PyList::empty_bound(py);
+            for &(x, y) in &self.explored_cells {
+                let pair = PyList::empty_bound(py);
+                pair.append(x)?;
+                pair.append(y)?;
+                cells.append(pair)?;
+            }
+            d.set_item("explored_cells", cells)?;
             Ok(d)
         }
     }

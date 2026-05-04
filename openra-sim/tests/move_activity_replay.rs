@@ -35,7 +35,7 @@ fn empty_world(w: i32, h: i32) -> world::World {
             enemies: Vec::new(),
         }],
     };
-    world::build_world(&map, 0, &LobbyInfo::default(), None, 0)
+    world::build_world(&map, 0, &LobbyInfo::default(), None, 0, true)
 }
 
 /// Spawn an e1 infantry at `cell` facing East (768) so it doesn't

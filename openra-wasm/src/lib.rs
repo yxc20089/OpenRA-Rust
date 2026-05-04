@@ -165,7 +165,7 @@ impl ReplayViewer {
             .ok_or_else(|| JsValue::from_str("No lobby settings in replay"))?;
         let lobby = lobby_from_replay(&replay);
         let map_tiles_json = map_tiles_to_json(&map);
-        let world = world::build_world(&map, settings.random_seed, &lobby, None, 0);
+        let world = world::build_world(&map, settings.random_seed, &lobby, None, 0, true);
         let max_frame = replay.sync_hashes.last().map(|sh| sh.frame).unwrap_or(0);
         Ok(ReplayViewer {
             world, orders: replay.orders, sync_hashes: replay.sync_hashes,
@@ -266,7 +266,7 @@ impl GameSession {
 
         let map_tiles_json = map_tiles_to_json(&map);
         let rules = load_bundled_rules();
-        let world = world::build_world(&map, seed, &lobby, Some(rules), difficulty);
+        let world = world::build_world(&map, seed, &lobby, Some(rules), difficulty, true);
         let player_ids = world.player_ids().to_vec();
         let human_player_id = player_ids[player_ids.len() - 1 - 2]; // 2 slots
 
@@ -304,7 +304,7 @@ impl GameSession {
 
         let map_tiles_json = map_tiles_to_json(&map);
         let rules = load_bundled_rules();
-        let world = world::build_world(&map, seed, &lobby, Some(rules), difficulty);
+        let world = world::build_world(&map, seed, &lobby, Some(rules), difficulty, true);
         let player_ids = world.player_ids().to_vec();
         let num_slots = lobby.occupied_slots.len();
         let human_player_id = player_ids[player_ids.len() - 1 - num_slots];

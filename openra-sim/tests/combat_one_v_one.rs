@@ -31,7 +31,7 @@ fn empty_world(w: i32, h: i32) -> openra_sim::world::World {
             enemies: Vec::new(),
         }],
     };
-    let mut world = world::build_world(&map, 0, &LobbyInfo::default(), None, 0);
+    let mut world = world::build_world(&map, 0, &LobbyInfo::default(), None, 0, true);
     set_test_unpaused(&mut world);
     world
 }

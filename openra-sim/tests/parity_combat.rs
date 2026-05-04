@@ -76,7 +76,7 @@ fn empty_world(w: i32, h: i32) -> world::World {
             enemies: Vec::new(),
         }],
     };
-    let mut w = world::build_world(&map, 0, &LobbyInfo::default(), None, 0);
+    let mut w = world::build_world(&map, 0, &LobbyInfo::default(), None, 0, true);
     set_test_unpaused(&mut w);
     w
 }

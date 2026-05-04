@@ -372,6 +372,12 @@ pub struct MapDef {
     /// `count:` expansion. The chosen `spawn_point` filter is already
     /// applied to player actors; enemy actors do not have spawn_point.
     pub actors: Vec<ScenarioActor>,
+    /// If true, the engine auto-spawns one MCV per player at their
+    /// assigned spawn-point. Scenarios that pre-place all units (e.g.,
+    /// rush-hour) should set this to `false`. Defaults to `true` to
+    /// preserve behaviour for production scenarios that rely on the
+    /// MCV-deploy → Construction-Yard build chain.
+    pub spawn_mcvs: bool,
 }
 
 impl MapDef {
@@ -541,6 +547,7 @@ pub fn load_rush_hour_map_with_spawn(
         agent_faction: scenario.agent_faction,
         enemy_faction: scenario.enemy_faction,
         actors,
+        spawn_mcvs: scenario.spawn_mcvs.unwrap_or(true),
     })
 }
 
@@ -553,6 +560,10 @@ struct ScenarioYaml {
     agent_faction: String,
     enemy_faction: String,
     actors: Vec<RawScenarioActor>,
+    /// Top-level `spawn_mcvs:` flag. None ⇒ default (true on the
+    /// engine side) for back-compat. Set `spawn_mcvs: false` in the
+    /// scenario YAML to suppress the auto-MCV-per-player.
+    spawn_mcvs: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -632,6 +643,16 @@ fn parse_scenario_yaml(text: &str) -> io::Result<ScenarioYaml> {
                     let (actors, ni) = read_actors_list(&lines, i + 1, detected_indent);
                     out.actors = actors;
                     i = ni;
+                    continue;
+                }
+                "spawn_mcvs" => {
+                    let trimmed_v = v.trim().trim_matches(|c: char| c == '"' || c == '\'');
+                    out.spawn_mcvs = match trimmed_v {
+                        "true" | "True" | "yes" | "1" => Some(true),
+                        "false" | "False" | "no" | "0" => Some(false),
+                        _ => None,
+                    };
+                    i += 1;
                     continue;
                 }
                 _ => {}

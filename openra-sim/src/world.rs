@@ -169,6 +169,14 @@ pub struct ActorSnapshot {
     /// Attack target actor ID (for projectile rendering).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_id: Option<u32>,
+    /// Destination cell of the current activity (x), if any.
+    /// Move → final path cell; Attack → target's current cell at snapshot
+    /// time. None for idle / Turn / Harvest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_x: Option<i32>,
+    /// Destination cell of the current activity (y), if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_y: Option<i32>,
     /// Veterancy rank (0=none, 1=veteran, 2=elite, 3=heroic).
     pub rank: u8,
 }
@@ -488,10 +496,28 @@ impl World {
                 Some(Activity::Attack { target_id, .. }) => Some(*target_id),
                 _ => None,
             };
+            // Surface the activity's destination cell. Move uses path.last();
+            // Attack resolves the target actor's current cell (None if the
+            // target died this tick). Turn/Harvest carry no useful 2-D
+            // destination for the briefing.
+            let (target_x, target_y) = match &actor.activity {
+                Some(Activity::Move { path, .. }) => path
+                    .last()
+                    .copied()
+                    .map(|(tx, ty)| (Some(tx), Some(ty)))
+                    .unwrap_or((None, None)),
+                Some(Activity::Attack { target_id, .. }) => self
+                    .actors
+                    .get(target_id)
+                    .and_then(|a| a.location)
+                    .map(|(tx, ty)| (Some(tx), Some(ty)))
+                    .unwrap_or((None, None)),
+                _ => (None, None),
+            };
             actors.push(ActorSnapshot {
                 id: actor.id, kind: actor.kind, owner, x, y, cx, cy,
                 actor_type: actor_type_str, hp, max_hp, activity, facing,
-                target_id, rank: actor.rank,
+                target_id, target_x, target_y, rank: actor.rank,
             });
         }
         let players = self.player_actor_ids.iter().map(|&pid| {
@@ -3727,6 +3753,7 @@ pub fn build_world(
     lobby: &LobbyInfo,
     rules: Option<GameRules>,
     difficulty: u8,
+    spawn_mcvs: bool,
 ) -> World {
     let rng = MersenneTwister::new(random_seed);
     let mut actors: BTreeMap<u32, Actor> = BTreeMap::new();
@@ -3859,6 +3886,10 @@ pub fn build_world(
     }
 
     // === Starting units (MCVs) ===
+    // Computed unconditionally because some downstream code expects
+    // `player_spawn_assignments` to exist (used for spawn-point lookups
+    // beyond MCV placement). The MCV-actor creation itself is gated on
+    // `spawn_mcvs`.
     let player_spawn_assignments = assign_spawn_points(
         &spawn_locations,
         lobby.occupied_slots.len(),
@@ -3868,22 +3899,27 @@ pub fn build_world(
 
     let facing = 512; // BaseActorFacing default
     let num_non_playable = non_playable.len();
-    for (pi, &(spawn_x, spawn_y)) in player_spawn_assignments.iter().enumerate() {
-        let owner_pid = player_actor_ids[num_non_playable + pi];
-        eprintln!("MCV[{}] spawn=({},{}) facing={} owner={}", pi, spawn_x, spawn_y, facing, owner_pid);
-        let id = next_id;
-        actors.insert(id, Actor {
-            id,
-            kind: ActorKind::Mcv,
-            owner_id: Some(owner_pid),
-            location: Some((spawn_x, spawn_y)),
-            traits: build_mcv_traits(spawn_x, spawn_y, facing),
-            activity: None,
-            actor_type: Some("mcv".to_string()),
-            kills: 0,
-            rank: 0,
-        });
-        next_id += 1;
+    if spawn_mcvs {
+        for (pi, &(spawn_x, spawn_y)) in player_spawn_assignments.iter().enumerate() {
+            let owner_pid = player_actor_ids[num_non_playable + pi];
+            eprintln!(
+                "MCV[{}] spawn=({},{}) facing={} owner={}",
+                pi, spawn_x, spawn_y, facing, owner_pid
+            );
+            let id = next_id;
+            actors.insert(id, Actor {
+                id,
+                kind: ActorKind::Mcv,
+                owner_id: Some(owner_pid),
+                location: Some((spawn_x, spawn_y)),
+                traits: build_mcv_traits(spawn_x, spawn_y, facing),
+                activity: None,
+                actor_type: Some("mcv".to_string()),
+                kills: 0,
+                rank: 0,
+            });
+            next_id += 1;
+        }
     }
 
     // Initialize terrain map and mark impassable tiles (Water, Rock/Cliffs).
