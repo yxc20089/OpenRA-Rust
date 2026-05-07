@@ -155,9 +155,38 @@ pub struct Env {
 impl Env {
     /// Construct a new env. The scenario YAML is loaded once; `reset()`
     /// rebuilds the world from the cached `MapDef`.
+    ///
+    /// Auto-selects the agent's `spawn_point` deterministically from the
+    /// seed. Use [`Env::new_with_spawn_point`] to force a specific one.
     pub fn new(scenario_path_or_alias: &str, seed: u64) -> Result<Self, EnvError> {
+        Self::new_with_spawn_point(scenario_path_or_alias, seed, None)
+    }
+
+    /// Construct a new env with an explicit agent `spawn_point`.
+    /// `spawn_point=None` means "round-robin across the spawn_points
+    /// declared in the scenario YAML, picked by `seed % n`". A scenario
+    /// without any `spawn_point:` fields collapses to `0` (no filter).
+    /// `Some(n)` forces that spawn_point regardless of what the
+    /// scenario declares — caller's responsibility to pass a valid one.
+    pub fn new_with_spawn_point(
+        scenario_path_or_alias: &str,
+        seed: u64,
+        spawn_point: Option<i32>,
+    ) -> Result<Self, EnvError> {
         let scenario_path = resolve_scenario(scenario_path_or_alias)?;
-        let map_def = oramap::load_rush_hour_map(&scenario_path)
+        let chosen_sp = match spawn_point {
+            Some(n) => n,
+            None => {
+                let sps = oramap::distinct_agent_spawn_points(&scenario_path)
+                    .map_err(|e| EnvError::BadScenario(e.to_string()))?;
+                if sps.is_empty() {
+                    0
+                } else {
+                    sps[(seed as usize) % sps.len()]
+                }
+            }
+        };
+        let map_def = oramap::load_rush_hour_map_with_spawn(&scenario_path, chosen_sp)
             .map_err(|e| EnvError::BadScenario(e.to_string()))?;
 
         // Total cells inside the playable bounds: bounds = (x, y, w, h).
@@ -1359,7 +1388,7 @@ mod py {
     #[pymethods]
     impl OpenRAEnv {
         #[new]
-        #[pyo3(signature = (scenario_path, seed, ticks_per_step=None, max_ticks=None, enabled_signals=None, cooldown_ticks=None))]
+        #[pyo3(signature = (scenario_path, seed, ticks_per_step=None, max_ticks=None, enabled_signals=None, cooldown_ticks=None, spawn_point=None))]
         fn new(
             scenario_path: String,
             seed: u64,
@@ -1367,8 +1396,9 @@ mod py {
             max_ticks: Option<u32>,
             enabled_signals: Option<Vec<String>>,
             cooldown_ticks: Option<i32>,
+            spawn_point: Option<i32>,
         ) -> PyResult<Self> {
-            let mut env = Env::new(&scenario_path, seed)
+            let mut env = Env::new_with_spawn_point(&scenario_path, seed, spawn_point)
                 .map_err(|e| PyValueError::new_err(e.to_string()))?;
             if let Some(n) = ticks_per_step {
                 env = env.with_ticks_per_step(n);

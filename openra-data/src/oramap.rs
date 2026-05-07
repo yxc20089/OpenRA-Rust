@@ -445,6 +445,26 @@ pub fn load_rush_hour_map(path: &Path) -> Result<MapDef, MapLoadError> {
     load_rush_hour_map_with_spawn(path, 0)
 }
 
+/// Distinct `spawn_point` values used by agent actors in the scenario,
+/// sorted ascending. An empty result means the scenario does not use
+/// the multi-spawn pattern (callers should treat that as a single
+/// spawn_point=0). Used by the env to round-robin spawns across seeds
+/// without forcing every caller to hard-code the spawn-point count.
+pub fn distinct_agent_spawn_points(path: &Path) -> Result<Vec<i32>, MapLoadError> {
+    let scenario_text = std::fs::read_to_string(path)?;
+    let scenario = parse_scenario_yaml(&scenario_text)
+        .map_err(|e| MapLoadError::BadScenario(e.to_string()))?;
+    let mut sps: Vec<i32> = scenario
+        .actors
+        .iter()
+        .filter(|a| a.owner == "agent")
+        .filter_map(|a| a.spawn_point)
+        .collect();
+    sps.sort_unstable();
+    sps.dedup();
+    Ok(sps)
+}
+
 /// Variant of [`load_rush_hour_map`] that selects a specific spawn point
 /// for the agent (0..=3 in the rush-hour scenario).
 pub fn load_rush_hour_map_with_spawn(
