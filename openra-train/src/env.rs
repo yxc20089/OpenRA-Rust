@@ -941,9 +941,21 @@ impl Env {
             Some(s) => s,
             None => return,
         };
+        // Iterate the playable rectangle only (bounds = x,y,w,h).
+        // Iterating the full map_size would let shroud.is_explored
+        // mark cells in the 2-cell shroud border outside Bounds, which
+        // then push explored_cells.len() past map_total_cells and make
+        // explored_percent exceed 100. 100% must mean 'entire playable
+        // region revealed'.
+        let (bx, by, bw, bh) = self.map_def.bounds;
         let (mw, mh) = self.map_def.map_size;
-        for y in 0..mh {
-            for x in 0..mw {
+        let (x_lo, x_hi, y_lo, y_hi) = if bw > 0 && bh > 0 {
+            (bx, bx + bw, by, by + bh)
+        } else {
+            (0, mw, 0, mh)
+        };
+        for y in y_lo..y_hi {
+            for x in x_lo..x_hi {
                 if shroud.is_explored(x, y) {
                     self.explored_cells.insert((x, y));
                 }
