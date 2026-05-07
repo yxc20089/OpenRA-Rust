@@ -1204,11 +1204,23 @@ fn load_rules_with_fallback() -> (GameRules, data_rules::Rules) {
     // Try common vendor locations relative to the runtime cwd, the
     // env's manifest dir, and HOME. The first hit wins.
     let mut candidates: Vec<PathBuf> = Vec::new();
+    // Explicit env var override takes precedence (production deployments).
+    if let Ok(p) = std::env::var("OPENRA_VENDOR_DIR") {
+        candidates.push(PathBuf::from(p));
+    }
+    // Resolve relative to the openra-train crate's compile-time manifest
+    // dir — this works regardless of where the wheel ends up installed,
+    // as long as the source tree is intact alongside the binary.
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    candidates.push(crate_dir.join("../vendor/OpenRA/mods/ra"));
     if let Ok(home) = std::env::var("HOME") {
         candidates.push(PathBuf::from(&home).join("Projects/OpenRA-Rust/vendor/OpenRA/mods/ra"));
+        // Production deployment: workspace-rooted source tree.
+        candidates.push(PathBuf::from(&home).join("workspace/OpenRA-Rust/vendor/OpenRA/mods/ra"));
     }
     candidates.push(PathBuf::from("vendor/OpenRA/mods/ra"));
     candidates.push(PathBuf::from("../vendor/OpenRA/mods/ra"));
+    candidates.push(PathBuf::from("../../vendor/OpenRA/mods/ra"));
     for c in &candidates {
         if c.exists()
             && let Ok(rs) = data_rules::load_ruleset(c)
