@@ -2233,8 +2233,16 @@ impl World {
             if let Some(target) = self.actors.get_mut(target_id) {
                 for t in &mut target.traits {
                     if let TraitState::Health { hp } = t {
+                        // Credit a kill only on the transition from
+                        // alive→dead. Without this guard, multiple
+                        // attackers landing lethal damage on the same
+                        // victim in one tick each push their own
+                        // (attacker, victim) entry, inflating
+                        // `kills_per_player` past the actual victim
+                        // count.
+                        let was_alive = *hp > 0;
                         *hp -= scaled_damage;
-                        if *hp <= 0 {
+                        if was_alive && *hp <= 0 {
                             dead_actors.push(*target_id);
                             kill_credits.push((*attacker_id, *target_id));
                         }
@@ -2607,8 +2615,12 @@ impl World {
                 if let Some(target) = self.actors.get_mut(victim_id) {
                     for t in &mut target.traits {
                         if let TraitState::Health { hp } = t {
+                            // Credit only on the alive→dead transition;
+                            // splash hits to a victim that is already
+                            // dead this tick must not be re-credited.
+                            let was_alive = *hp > 0;
                             *hp -= final_damage;
-                            if *hp <= 0 {
+                            if was_alive && *hp <= 0 {
                                 dead_from_projectile.push(*victim_id);
                                 kill_credits.push((attacker_id, *victim_id));
                             }
