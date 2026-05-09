@@ -157,6 +157,15 @@ pub struct Env {
     enabled_signals: HashSet<String>,
     /// Cooldown ticks between fires for the same dedup key.
     cooldown_ticks: i32,
+    /// Whether the enemy spawned with at least one MustBeDestroyed
+    /// building (i.e. fact / proc / weap / barr / tent etc.). Decides
+    /// the win-condition policy in `is_terminal`:
+    ///   - true (e.g. maginot): destroying the buildings ends the game;
+    ///     remaining combat units don't matter.
+    ///   - false (e.g. rush-hour, where the enemy is units-only):
+    ///     fall back to "all combat units dead" semantic.
+    /// Set once at the end of `reset()`.
+    enemy_started_with_buildings: bool,
 }
 
 impl Env {
@@ -221,6 +230,7 @@ impl Env {
             interrupt_state: InterruptState::default(),
             enabled_signals: HashSet::new(),
             cooldown_ticks: DEFAULT_INTERRUPT_COOLDOWN_TICKS,
+            enemy_started_with_buildings: false,
         })
     }
 
@@ -261,6 +271,14 @@ impl Env {
         self.explored_cells.clear();
         self.last_warnings.clear();
         self.interrupt_state.clear();
+        // Snapshot whether the enemy starts with any MustBeDestroyed
+        // building. Decides the terminal-condition policy for the rest
+        // of the episode (see `is_terminal`). Done after build_world
+        // so the actor table is populated.
+        self.enemy_started_with_buildings = match &self.world {
+            Some(w) => has_must_be_destroyed_buildings(w, self.enemy_player_id),
+            None => false,
+        };
         self.refresh_explored_cells();
         self.observation()
     }
@@ -1080,20 +1098,27 @@ impl Env {
         if world.world_tick >= self.max_ticks {
             return true;
         }
-        // Victory semantics — asymmetric, mirroring C#
-        // `ConquestVictoryConditions`:
-        //   - The enemy is "alive" iff it has any `MustBeDestroyed`
-        //     building (fact/proc). Defensive structures and stance-2
-        //     defenders DO NOT keep the enemy alive — they can sit at
-        //     their posts indefinitely and we still want the agent to
-        //     win by razing the base behind them.
-        //   - The agent has no buildings in strategy scenarios, so we
-        //     stay with the combat-unit check on its side. If/when an
-        //     agent scenario gains a base, OR with `must_be_destroyed`
-        //     here too.
+        // Victory semantics — scenario-aware:
+        //   - Agent: alive iff has combat units OR MustBeDestroyed
+        //     buildings (most strategy scenarios are units-only on the
+        //     agent side, but covered either way).
+        //   - Enemy: TWO regimes, decided once at reset() based on the
+        //     enemy's initial roster (`enemy_started_with_buildings`):
+        //       * had buildings (e.g. maginot fact/proc): only those
+        //         count. Defenders + remaining infantry are irrelevant
+        //         — destroying the base ends the game even if an e3
+        //         is still posted at a wall.
+        //       * unit-only enemy (e.g. rush-hour): combat-units check.
+        //         Without this branch, my earlier maginot fix collapses
+        //         rush-hour to "no buildings → enemy_alive=False from
+        //         turn 0 → instant terminal".
         let agent_alive = has_combat_units(world, self.agent_player_id)
             || has_must_be_destroyed_buildings(world, self.agent_player_id);
-        let enemy_alive = has_must_be_destroyed_buildings(world, self.enemy_player_id);
+        let enemy_alive = if self.enemy_started_with_buildings {
+            has_must_be_destroyed_buildings(world, self.enemy_player_id)
+        } else {
+            has_combat_units(world, self.enemy_player_id)
+        };
         !agent_alive || !enemy_alive
     }
 }
@@ -1448,6 +1473,7 @@ pub fn build_test_env_with_no_enemies(map_size: (i32, i32), seed: u64) -> Env {
         interrupt_state: InterruptState::default(),
         enabled_signals: HashSet::new(),
         cooldown_ticks: DEFAULT_INTERRUPT_COOLDOWN_TICKS,
+        enemy_started_with_buildings: false,
     };
     env.reset();
     env
