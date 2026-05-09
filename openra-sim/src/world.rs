@@ -308,6 +308,14 @@ pub struct World {
     /// is unaffected. Currently stores `Vehicle` (locomotor + has_turret
     /// flag) and `Turret` (independent yaw, turn-speed) per actor.
     typed_components: BTreeMap<u32, ActorTypedComponents>,
+    /// Reveal-on-attack: when actor X damages a unit owned by player P,
+    /// X's cell is added here for player P. Consumed (and cleared) by
+    /// `update_typed_shroud_all_players`, which forces those cells
+    /// visible+explored regardless of P's own sight coverage. This
+    /// matches OpenRA C# behaviour — getting shot reveals the shooter
+    /// even through fog (otherwise tesla coils silently kill scouts
+    /// from beyond their sight range).
+    combat_reveal_cells: BTreeMap<u32, Vec<(i32, i32)>>,
     /// Per-frame "claimed" move destinations. Cleared at the start of
     /// each `process_frame`, populated by `order_move` so that multiple
     /// simultaneous Move orders to the same target spread to nearby
@@ -1856,7 +1864,8 @@ impl World {
                 engage_pairs.push((*id, target_id));
             }
         }
-        // Apply: Move → Attack
+        // Apply: Move → Attack. After the target dies, the unit goes
+        // idle and the next briefing prompts the agent to re-decide.
         for (attacker, target) in engage_pairs {
             self.order_attack(attacker, target);
         }
@@ -2230,6 +2239,14 @@ impl World {
                 versus_str.insert(key.to_string(), pct);
             }
             let scaled_damage = apply_versus(*damage, target_armor_str, &versus_str);
+            // Reveal-on-attack: queue the attacker's cell to be force-revealed
+            // for the victim's owning player on the next typed-shroud refresh.
+            // Snapshot before the &mut borrow on actors below.
+            let target_owner = self.actors.get(target_id).and_then(|a| a.owner_id);
+            let attacker_cell = self.actors.get(attacker_id).and_then(|a| a.location);
+            if let (Some(owner), Some(cell)) = (target_owner, attacker_cell) {
+                self.combat_reveal_cells.entry(owner).or_default().push(cell);
+            }
             if let Some(target) = self.actors.get_mut(target_id) {
                 for t in &mut target.traits {
                     if let TraitState::Health { hp } = t {
@@ -2286,7 +2303,10 @@ impl World {
         // Phase 7: clear stale Attack activities pointing at corpses so
         // armed buildings (and any other attacker) re-scan for a new target
         // on the next tick. Without this, a static turret can deadlock on
-        // a dead target and never engage subsequent enemies.
+        // a dead target and never engage subsequent enemies. Units go
+        // idle here on purpose — the next briefing surfaces the kill via
+        // an interrupt and the agent decides what to do next (option B
+        // semantics).
         if !dead_ids.is_empty() {
             for actor in self.actors.values_mut() {
                 if let Some(Activity::Attack { target_id, .. }) = actor.activity {
@@ -2611,6 +2631,16 @@ impl World {
                 let final_damage = apply_versus(scaled.max(0) as i32, armor_class, &versus);
                 if final_damage <= 0 {
                     continue;
+                }
+                // Reveal-on-attack (projectile path): mirror the direct-fire
+                // hook above. Use the attacker's current cell if alive, else
+                // the impact cell (best-effort — at minimum the agent sees
+                // where the round hit).
+                let target_owner = self.actors.get(victim_id).and_then(|a| a.owner_id);
+                let reveal_cell = self.actors.get(&attacker_id).and_then(|a| a.location)
+                    .unwrap_or(impact_cell);
+                if let Some(owner) = target_owner {
+                    self.combat_reveal_cells.entry(owner).or_default().push(reveal_cell);
                 }
                 if let Some(target) = self.actors.get_mut(victim_id) {
                     for t in &mut target.traits {
@@ -3386,7 +3416,21 @@ impl World {
             let entry = self.typed_shroud.entry(pid)
                 .or_insert_with(|| crate::traits::Shroud::new(self.map_width, self.map_height));
             crate::traits::update_from_actors(entry, entries.iter().copied(), pid);
+            // Reveal-on-attack: force-reveal cells of any actor that just
+            // damaged a unit owned by this player. Radius 1 (just the
+            // attacker's cell) is enough to surface the building / unit
+            // that scored the hit so the agent can attack it back.
+            if let Some(cells) = self.combat_reveal_cells.get(&pid) {
+                for &(cx, cy) in cells {
+                    entry.reveal(cx, cy, 1);
+                }
+            }
         }
+        // Combat reveals are one-shot: clear after applying so the
+        // visibility only persists for the tick of the hit (the
+        // attacker's cell stays in `explored` permanently because
+        // `Shroud::reveal` sets both layers).
+        self.combat_reveal_cells.clear();
     }
 
     /// Phase-3 win condition: returns the player ids whose
@@ -4029,6 +4073,7 @@ pub fn build_world(
         pending_projectiles: BTreeMap::new(),
         next_projectile_id: 1,
         typed_components: BTreeMap::new(),
+        combat_reveal_cells: BTreeMap::new(),
         pending_move_destinations: HashSet::new(),
     };
 
@@ -4061,6 +4106,124 @@ mod tests {
     fn player_resources_5000_cash() {
         let t = TraitState::PlayerResources { cash: 5000, resources: 0, resource_capacity: 0 };
         assert_eq!(t.sync_hash(), 5000);
+    }
+
+    #[test]
+    fn reveal_on_attack_marks_attacker_cell_visible() {
+        // The hook in `tick_actors` / projectile resolve pushes the
+        // attacker's cell into `combat_reveal_cells[target_owner]`.
+        // `update_typed_shroud_all_players` then force-reveals each
+        // queued cell on the victim's shroud (regardless of the
+        // victim's own RevealsShroud range) and clears the queue.
+        // This test bypasses the combat path and pokes the field
+        // directly so it isolates the reveal logic.
+        let map = openra_data::oramap::OraMap {
+            title: "tiny".into(),
+            tileset: "TEMPERAT".into(),
+            map_size: (20, 20),
+            bounds: (0, 0, 20, 20),
+            tiles: Vec::new(),
+            actors: vec![
+                openra_data::oramap::MapActor {
+                    id: "Actor0".into(), actor_type: "mpspawn".into(),
+                    owner: "Neutral".into(), location: (5, 5),
+                },
+                openra_data::oramap::MapActor {
+                    id: "Actor1".into(), actor_type: "mpspawn".into(),
+                    owner: "Neutral".into(), location: (15, 15),
+                },
+            ],
+            players: vec![
+                openra_data::oramap::PlayerDef {
+                    name: "Neutral".into(), playable: false, owns_world: true,
+                    non_combatant: true, faction: "allies".into(), enemies: Vec::new(),
+                },
+                openra_data::oramap::PlayerDef {
+                    name: "P1".into(), playable: true, owns_world: false,
+                    non_combatant: false, faction: "allies".into(), enemies: vec!["P2".into()],
+                },
+                openra_data::oramap::PlayerDef {
+                    name: "P2".into(), playable: true, owns_world: false,
+                    non_combatant: false, faction: "soviet".into(), enemies: vec!["P1".into()],
+                },
+            ],
+        };
+        let lobby = LobbyInfo {
+            starting_cash: 5000,
+            allow_spectators: true,
+            occupied_slots: vec![
+                SlotInfo { player_reference: "P1".into(), faction: "allies".into(), is_bot: false },
+                SlotInfo { player_reference: "P2".into(), faction: "soviet".into(), is_bot: false },
+            ],
+        };
+        let mut world = build_world(&map, 0, &lobby, None, 0, false);
+        // Pull the last 2 player ids before the spectator ("everyone").
+        // build_world order: non-playables first, then occupied slots,
+        // then `everyone_player_id`.
+        let mut all_pids: Vec<u32> = world.player_actor_ids.clone();
+        // Drop spectator from the end.
+        let last = all_pids.pop();
+        assert_eq!(last, Some(world.everyone_player_id));
+        assert!(all_pids.len() >= 3,
+            "expected ≥1 non-playable + 2 playables, got {:?}", all_pids);
+        let victim_owner = all_pids.pop().unwrap();
+        let attacker_owner = all_pids.pop().unwrap();
+
+        // Place attacker on the far side of the map — well outside the
+        // victim's typical sight range — so we can prove the reveal is
+        // *only* coming from the combat hook.
+        let attacker_cell = (15, 15);
+        let victim_cell = (1, 1);
+        insert_test_actor(&mut world, Actor {
+            id: 1001, kind: ActorKind::Building,
+            owner_id: Some(attacker_owner),
+            location: Some(attacker_cell),
+            traits: vec![TraitState::Health { hp: 40000 }],
+            activity: None, actor_type: Some("tsla".into()), kills: 0, rank: 0,
+        });
+        insert_test_actor(&mut world, Actor {
+            id: 1002, kind: ActorKind::Infantry,
+            owner_id: Some(victim_owner),
+            location: Some(victim_cell),
+            traits: vec![TraitState::Health { hp: 5000 }],
+            activity: None, actor_type: Some("e1".into()), kills: 0, rank: 0,
+        });
+        world.update_typed_shroud_all_players();
+
+        // Pre-condition: victim cannot see the attacker (too far).
+        assert!(!world.typed_shroud(victim_owner).unwrap()
+            .is_visible(attacker_cell.0, attacker_cell.1),
+            "victim should NOT see attacker before the combat reveal");
+
+        // Simulate "attacker just damaged victim" by populating the queue
+        // exactly as `tick_actors` does after applying damage.
+        world.combat_reveal_cells.entry(victim_owner).or_default().push(attacker_cell);
+        world.update_typed_shroud_all_players();
+
+        // Post-condition 1: victim now sees attacker.
+        assert!(world.typed_shroud(victim_owner).unwrap()
+            .is_visible(attacker_cell.0, attacker_cell.1),
+            "victim should see attacker after combat reveal");
+        assert!(world.typed_shroud(victim_owner).unwrap()
+            .is_explored(attacker_cell.0, attacker_cell.1),
+            "attacker cell should be explored (sticky)");
+
+        // Post-condition 2: queue is consumed (reveal is one-shot).
+        assert!(world.combat_reveal_cells.is_empty(),
+            "combat_reveal_cells must clear after each shroud refresh");
+
+        // Post-condition 3: subsequent shroud refresh (without a new hit)
+        // drops the active visibility — only `explored` persists. This
+        // matches OpenRA C# behaviour: stop being shot at, the building
+        // fades back to fog after one tick.
+        world.update_typed_shroud_all_players();
+        assert!(!world.typed_shroud(victim_owner).unwrap()
+            .is_visible(attacker_cell.0, attacker_cell.1),
+            "without a fresh hit, attacker visibility decays after one tick");
+
+        // Sanity: the *attacker's* own player still sees their own actor.
+        assert!(world.typed_shroud(attacker_owner).unwrap()
+            .is_visible(attacker_cell.0, attacker_cell.1));
     }
 
     /// C#'s Util.TickFacing: advance facing toward desired by step.

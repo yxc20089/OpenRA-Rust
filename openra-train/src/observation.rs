@@ -40,6 +40,10 @@ pub struct EnemyPos {
     pub cell_x: i32,
     pub cell_y: i32,
     pub id: String,
+    /// Actor type string from rules (e.g. "1tnk", "e1", "jeep"). Empty if
+    /// unknown. Surfaced so the briefing can show "1tnk" instead of a
+    /// generic "enemy" label.
+    pub actor_type: String,
 }
 
 /// Phase-7 enemy-building entry surfaced through `enemy_buildings_summary`.
@@ -193,13 +197,17 @@ mod py {
             }
             d.set_item("unit_hp", unit_hp)?;
 
-            // enemy_positions: [{cell_x, cell_y, id}]
+            // enemy_positions: [{cell_x, cell_y, id, actor_type}]
+            // actor_type lets the briefing show "1tnk(1023)@(55,10)" instead
+            // of a generic "enemy" label. Buildings have their own list
+            // (`enemy_buildings_summary`) and are NOT mixed in here.
             let enemy_positions = PyList::empty_bound(py);
             for ep in &self.enemy_positions {
                 let entry = PyDict::new_bound(py);
                 entry.set_item("cell_x", ep.cell_x)?;
                 entry.set_item("cell_y", ep.cell_y)?;
                 entry.set_item("id", &ep.id)?;
+                entry.set_item("actor_type", &ep.actor_type)?;
                 enemy_positions.append(entry)?;
             }
             d.set_item("enemy_positions", enemy_positions)?;

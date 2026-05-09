@@ -44,7 +44,7 @@ fn empty_world(w: i32, h: i32) -> world::World {
             enemies: Vec::new(),
         }],
     };
-    world::build_world(&map, 0, &LobbyInfo::default(), None, 0)
+    world::build_world(&map, 0, &LobbyInfo::default(), None, 0, false)
 }
 
 fn spawn_e1(world: &mut world::World, cell: (i32, i32)) -> u32 {

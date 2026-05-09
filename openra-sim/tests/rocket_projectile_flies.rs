@@ -53,7 +53,7 @@ fn build_arena(seed: i32) -> Option<World> {
             SlotInfo { player_reference: "Multi1".into(), faction: "soviet".into(), is_bot: false },
         ],
     };
-    let mut world = world::build_world(&map, seed, &lobby, Some(rules), 0);
+    let mut world = world::build_world(&map, seed, &lobby, Some(rules), 0, false);
     set_test_unpaused(&mut world);
     Some(world)
 }

@@ -104,7 +104,7 @@ fn build_arena_with_real_rules(seed: i32) -> World {
             },
         ],
     };
-    let mut world = world::build_world(&map, seed, &lobby, Some(rules), 0);
+    let mut world = world::build_world(&map, seed, &lobby, Some(rules), 0, false);
     set_test_unpaused(&mut world);
     world
 }

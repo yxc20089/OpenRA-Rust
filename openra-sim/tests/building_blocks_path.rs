@@ -82,7 +82,7 @@ fn build_arena(seed: i32) -> World {
         ],
     };
     // Use defaults so we don't depend on the vendor dir for path tests.
-    let mut world = world::build_world(&map, seed, &lobby, None, 0);
+    let mut world = world::build_world(&map, seed, &lobby, None, 0, false);
     set_test_unpaused(&mut world);
     world
 }

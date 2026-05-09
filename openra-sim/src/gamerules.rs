@@ -38,6 +38,11 @@ pub struct ActorStats {
     pub footprint: (i32, i32),
     pub armor_type: ArmorType,
     pub is_building: bool,
+    /// Whether the C# `MustBeDestroyed` trait is set (used by victory
+    /// detection: only these actors count toward "this side is dead").
+    /// Buildings without this flag (defenses, scenery like powr/barr) do
+    /// NOT need to be destroyed for the opposing side to win.
+    pub must_be_destroyed: bool,
     pub prerequisites: Vec<String>,
     pub weapons: Vec<String>,
     pub sight_range: i32,
@@ -100,6 +105,7 @@ impl GameRules {
                 .unwrap_or(0);
 
             let is_building = info.has_trait("Building");
+            let must_be_destroyed = info.has_trait("MustBeDestroyed");
 
             let footprint = if is_building {
                 parse_building_dimensions(info)
@@ -122,8 +128,13 @@ impl GameRules {
                 .filter_map(|t| t.get("Weapon").map(|w| w.to_string()))
                 .collect();
 
+            // RA YAML stores Range as "Xc0" / "XcY" (cells + sub-cell). The
+            // C# WDist parser is lenient: also accepts a bare integer in
+            // world units. Use `parse_range` which handles both, then
+            // collapse to a cell-count for `sight_range` (cells, not WDist).
             let sight_range = info.trait_info("RevealsShroud")
-                .and_then(|t| t.get_i32("Range"))
+                .and_then(|t| t.get("Range"))
+                .map(|s| parse_range(s) / 1024)
                 .unwrap_or(if is_building { 5 } else { 4 });
 
             let kind = classify_actor(info);
@@ -163,6 +174,7 @@ impl GameRules {
                 footprint,
                 armor_type,
                 is_building,
+                must_be_destroyed,
                 prerequisites,
                 weapons: weapon_names,
                 sight_range,
@@ -219,7 +231,12 @@ impl GameRules {
                 actors.insert($name.to_string(), ActorStats {
                     kind: $kind, hp: $hp, speed: $speed, cost: $cost, power: $power,
                     footprint: ($fw, $fh), armor_type: ArmorType::None,
-                    is_building: $building, prerequisites: Vec::new(),
+                    is_building: $building,
+                    // Defaults treat fact/proc as MustBeDestroyed; everything
+                    // else off. The Ruleset path (above) reads the C# trait
+                    // directly so this is just for the no-ruleset fallback.
+                    must_be_destroyed: $building && matches!($name, "fact" | "proc"),
+                    prerequisites: Vec::new(),
                     weapons: Vec::new(), sight_range: if $building { 5 } else { 4 },
                     provides_prerequisites: Vec::new(), build_palette_order: 9999,
                 });
@@ -672,5 +689,38 @@ mod tests {
         // TurretGun (gun building): explicit Damage 6000
         let w = rules.weapon("TurretGun").expect("TurretGun not parsed");
         assert_eq!(w.damage, 6000, "TurretGun damage");
+    }
+
+    #[test]
+    fn sight_range_parses_wdist_format() {
+        // RA stores RevealsShroud.Range as "Xc0" (cells + sub-cell). The
+        // old code called `get_i32` which silently fell through to a
+        // 4-cell default for every actor — letting tesla coils
+        // out-range scout sight (gun = 6c0 attack vs jeep = 7c0 sight).
+        // This test pins the values so the regression can't sneak back.
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let mod_dir =
+            std::path::PathBuf::from(format!("{}/../vendor/OpenRA/mods/ra", manifest));
+        if !mod_dir.exists() {
+            eprintln!("skipping: vendored OpenRA mod dir not found");
+            return;
+        }
+        let ruleset = openra_data::rules::load_ruleset(&mod_dir).unwrap();
+        let rules = GameRules::from_ruleset(&ruleset);
+
+        // Vehicles: jeep should out-see tesla. Defenses don't get to
+        // shoot first if the scout's reveal radius covers them.
+        let jeep = rules.actor("jeep").expect("jeep not parsed");
+        assert_eq!(jeep.sight_range, 7, "jeep sight (7c0 expected)");
+        let dog = rules.actor("dog").expect("dog not parsed");
+        assert!(dog.sight_range >= 5, "dog sight (5c0 expected, got {})", dog.sight_range);
+        let tnk = rules.actor("2tnk").expect("2tnk not parsed");
+        assert!(tnk.sight_range >= 5, "2tnk sight (>=5c0 expected, got {})", tnk.sight_range);
+        // Buildings: defenses have RevealsShroud too (Range tied to
+        // attack range so the player sees their own field of fire).
+        // We only require they parse to a positive value, not the
+        // default 5 fallback.
+        let tsla = rules.actor("tsla").expect("tsla not parsed");
+        assert!(tsla.sight_range > 0, "tsla sight parsed");
     }
 }

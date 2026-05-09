@@ -55,7 +55,7 @@ mod tests {
                 enemies: Vec::new(),
             }],
         };
-        let world = world::build_world(&map, 0, &LobbyInfo::default(), None, 0);
+        let world = world::build_world(&map, 0, &LobbyInfo::default(), None, 0, false);
         let actor = Actor {
             id: 7,
             kind: ActorKind::Infantry,

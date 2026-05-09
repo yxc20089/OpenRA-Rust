@@ -183,7 +183,7 @@ mod tests {
                 enemies: Vec::new(),
             }],
         };
-        let mut world = world::build_world(&map, 0, &LobbyInfo::default(), None, 0);
+        let mut world = world::build_world(&map, 0, &LobbyInfo::default(), None, 0, false);
         set_test_unpaused(&mut world);
         world
     }

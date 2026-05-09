@@ -123,7 +123,7 @@ mod tests {
                 enemies: Vec::new(),
             }],
         };
-        world::build_world(&map, 0, &LobbyInfo::default(), None, 0)
+        world::build_world(&map, 0, &LobbyInfo::default(), None, 0, false)
     }
 
     fn fresh_actor(at: (i32, i32)) -> Actor {

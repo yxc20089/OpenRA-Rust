@@ -49,6 +49,7 @@ pub const INTERRUPT_SIGNAL_NAMES: &[&str] = &[
     "enemy_unit_spotted",
     "enemy_building_spotted",
     "engage_start",
+    "own_unit_destroyed",
 ];
 
 /// Per-episode tracking state for interrupt detection. Resets on
@@ -61,6 +62,11 @@ pub struct InterruptState {
     prev_visible_enemy_unit_ids: HashSet<u32>,
     /// Same for enemy buildings.
     prev_visible_enemy_building_ids: HashSet<u32>,
+    /// Own (agent-owned) unit IDs alive at the previous check. Diffed
+    /// against the current frame to detect lost units (used by the
+    /// `own_unit_destroyed` signal so the agent gets re-prompted while
+    /// it's losing forces, not after the wipeout).
+    prev_own_unit_ids: HashSet<u32>,
     /// Own unit IDs that were attacking last check, keyed to the
     /// target they were attacking. The dedup key is
     /// `(own_actor_id, target_actor_id)` — different target = new event.
@@ -86,6 +92,7 @@ impl InterruptState {
     fn clear(&mut self) {
         self.prev_visible_enemy_unit_ids.clear();
         self.prev_visible_enemy_building_ids.clear();
+        self.prev_own_unit_ids.clear();
         self.prev_attacking_pairs.clear();
         self.last_fire_tick.clear();
     }
@@ -381,6 +388,7 @@ impl Env {
         let mut cur_visible_enemy_units: HashSet<u32> = HashSet::new();
         let mut cur_visible_enemy_buildings: HashSet<u32> = HashSet::new();
         let mut cur_attacking_pairs: HashSet<(u32, u32)> = HashSet::new();
+        let mut cur_own_unit_ids: HashSet<u32> = HashSet::new();
 
         for a in &snap.actors {
             if matches!(
@@ -402,6 +410,20 @@ impl Env {
                     cur_visible_enemy_units.insert(a.id);
                 }
             } else if a.owner == self.agent_player_id {
+                // Track agent-owned combat units (incl. MCV) for the
+                // own_unit_destroyed interrupt. Buildings are excluded —
+                // building loss is a coarser endgame condition handled
+                // by `is_terminal`.
+                if matches!(
+                    a.kind,
+                    ActorKind::Infantry
+                        | ActorKind::Vehicle
+                        | ActorKind::Aircraft
+                        | ActorKind::Ship
+                        | ActorKind::Mcv
+                ) {
+                    cur_own_unit_ids.insert(a.id);
+                }
                 if let Some(tid) = a.target_id {
                     cur_attacking_pairs.insert((a.id, tid));
                 }
@@ -410,10 +432,36 @@ impl Env {
 
         let mut fired: Option<String> = None;
 
-        // Priority order: engage_start > enemy_unit_spotted > enemy_building_spotted.
-        // Engage wins because it implies an immediate combat decision; spots
-        // are recon-grade information.
-        if signals.contains("engage_start") {
+        // Priority order: own_unit_destroyed > engage_start > enemy_unit_spotted
+        // > enemy_building_spotted. Losing one of your own units is the most
+        // urgent signal — re-prompt the agent immediately so it can react
+        // before the rest of the force is wiped.
+        if signals.contains("own_unit_destroyed") {
+            // A previously-tracked own unit ID that no longer appears
+            // in the world snapshot has been destroyed. Report up to
+            // one such loss per check (cooldown-throttled per id).
+            let lost_ids: Vec<u32> = self
+                .interrupt_state
+                .prev_own_unit_ids
+                .iter()
+                .filter(|id| !cur_own_unit_ids.contains(id))
+                .copied()
+                .collect();
+            for id in lost_ids {
+                let key = id as u64;
+                if self
+                    .interrupt_state
+                    .cooldown_ok("own_unit_destroyed", key, now, cooldown)
+                {
+                    self.interrupt_state
+                        .mark_fired("own_unit_destroyed", key, now);
+                    fired = Some(format!("own_unit_destroyed: id {}", id));
+                    break;
+                }
+            }
+        }
+
+        if fired.is_none() && signals.contains("engage_start") {
             for &(uid, tid) in &cur_attacking_pairs {
                 if !self.interrupt_state.prev_attacking_pairs.contains(&(uid, tid)) {
                     let key = ((uid as u64) << 32) | (tid as u64);
@@ -477,6 +525,7 @@ impl Env {
         // re-evaluating every check.
         self.interrupt_state.prev_visible_enemy_unit_ids = cur_visible_enemy_units;
         self.interrupt_state.prev_visible_enemy_building_ids = cur_visible_enemy_buildings;
+        self.interrupt_state.prev_own_unit_ids = cur_own_unit_ids;
         self.interrupt_state.prev_attacking_pairs = cur_attacking_pairs;
 
         fired
@@ -925,6 +974,7 @@ impl Env {
                         cell_x: a.x,
                         cell_y: a.y,
                         id: id_str.clone(),
+                        actor_type: a.actor_type.clone(),
                     });
                     enemy_hp.push((id_str, pct));
                 }
@@ -1023,15 +1073,20 @@ impl Env {
         if world.world_tick >= self.max_ticks {
             return true;
         }
-        // Either side at zero combat units AND zero buildings → done.
-        // Phase 7 — strategy scenarios place enemy buildings; the kill-
-        // all condition needs buildings cleared too. We retain the
-        // rush-hour semantics by including buildings in the alive check
-        // (rush-hour has no buildings, so the new check matches the old).
+        // Victory semantics — asymmetric, mirroring C#
+        // `ConquestVictoryConditions`:
+        //   - The enemy is "alive" iff it has any `MustBeDestroyed`
+        //     building (fact/proc). Defensive structures and stance-2
+        //     defenders DO NOT keep the enemy alive — they can sit at
+        //     their posts indefinitely and we still want the agent to
+        //     win by razing the base behind them.
+        //   - The agent has no buildings in strategy scenarios, so we
+        //     stay with the combat-unit check on its side. If/when an
+        //     agent scenario gains a base, OR with `must_be_destroyed`
+        //     here too.
         let agent_alive = has_combat_units(world, self.agent_player_id)
-            || has_buildings(world, self.agent_player_id);
-        let enemy_alive = has_combat_units(world, self.enemy_player_id)
-            || has_buildings(world, self.enemy_player_id);
+            || has_must_be_destroyed_buildings(world, self.agent_player_id);
+        let enemy_alive = has_must_be_destroyed_buildings(world, self.enemy_player_id);
         !agent_alive || !enemy_alive
     }
 }
@@ -1091,6 +1146,27 @@ fn has_buildings(world: &World, player_id: u32) -> bool {
     for aid in world.actor_ids_for_player(player_id) {
         if matches!(world.actor_kind(aid), Some(ActorKind::Building)) {
             return true;
+        }
+    }
+    false
+}
+
+/// Like `has_buildings` but only counts buildings whose actor type has the
+/// C# `MustBeDestroyed` trait. Defenses (gun/tsla/pbox/...) and scenery
+/// (powr/barr) are EXCLUDED — destroying those is not a victory condition.
+fn has_must_be_destroyed_buildings(world: &World, player_id: u32) -> bool {
+    for aid in world.actor_ids_for_player(player_id) {
+        if !matches!(world.actor_kind(aid), Some(ActorKind::Building)) {
+            continue;
+        }
+        let actor_type = match world.actor_type_name(aid) {
+            Some(t) => t,
+            None => continue,
+        };
+        if let Some(stats) = world.rules.actor(actor_type) {
+            if stats.must_be_destroyed {
+                return true;
+            }
         }
     }
     false
@@ -1551,6 +1627,91 @@ mod py {
                 self.inner.agent_player_id(),
                 self.inner.enemy_player_id(),
             )
+        }
+
+        /// Return parsed actor + weapon stats for the requested actor types.
+        ///
+        /// `types` — list of actor-type strings (e.g. ["jeep", "tsla"]).
+        /// Pass an empty list (default) to return every type the engine
+        /// knows about (useful for offline debugging).
+        ///
+        /// The returned dict maps `type -> stats` where each stats dict has:
+        ///   hp, kind ("Building"/"Vehicle"/"Infantry"/"Mcv"/...),
+        ///   speed, sight_range, footprint=[fw,fh], armor_type, is_building,
+        ///   must_be_destroyed, weapons=[{name, damage, range_cells, range_wdist,
+        ///                                 reload_delay, burst, dps, splash_radius_cells,
+        ///                                 versus={armor_class -> pct}}]
+        ///
+        /// Only types parsed by the active ruleset are returned; unknown
+        /// types are silently skipped (matches engine fallback behavior).
+        #[pyo3(signature = (types=None))]
+        fn unit_codex<'py>(
+            &self,
+            py: Python<'py>,
+            types: Option<Vec<String>>,
+        ) -> PyResult<Bound<'py, PyDict>> {
+            let world = match self.inner.world() {
+                Some(w) => w,
+                None => {
+                    // No live world (env not reset yet) — return empty dict.
+                    return Ok(PyDict::new_bound(py));
+                }
+            };
+            let rules = &world.rules;
+            let out = PyDict::new_bound(py);
+            let want: Vec<String> = match types {
+                Some(t) if !t.is_empty() => t.into_iter().map(|s| s.to_lowercase()).collect(),
+                _ => rules.actors.keys().cloned().collect(),
+            };
+            for t in &want {
+                let stats = match rules.actor(t) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let entry = PyDict::new_bound(py);
+                entry.set_item("hp", stats.hp)?;
+                entry.set_item("kind", format!("{:?}", stats.kind))?;
+                entry.set_item("speed", stats.speed)?;
+                entry.set_item("sight_range", stats.sight_range)?;
+                entry.set_item("footprint", (stats.footprint.0, stats.footprint.1))?;
+                entry.set_item("armor_type", format!("{:?}", stats.armor_type))?;
+                entry.set_item("is_building", stats.is_building)?;
+                entry.set_item("must_be_destroyed", stats.must_be_destroyed)?;
+                entry.set_item("cost", stats.cost)?;
+                let weapons = PyList::empty_bound(py);
+                for wname in &stats.weapons {
+                    let w = match rules.weapon(wname) {
+                        Some(w) => w,
+                        None => continue,
+                    };
+                    let wentry = PyDict::new_bound(py);
+                    wentry.set_item("name", wname)?;
+                    wentry.set_item("damage", w.damage)?;
+                    wentry.set_item("range_wdist", w.range)?;
+                    wentry.set_item("range_cells", (w.range as f32) / 1024.0)?;
+                    wentry.set_item("reload_delay", w.reload_delay)?;
+                    wentry.set_item("burst", w.burst)?;
+                    // DPS = damage * burst / reload_delay (ticks ≈ 25/sec). Convert
+                    // to dmg/sec by dividing reload_delay by 25 (engine ticks/sec).
+                    let dps = if w.reload_delay > 0 {
+                        (w.damage as f32) * (w.burst as f32) * 25.0 / (w.reload_delay as f32)
+                    } else {
+                        0.0
+                    };
+                    wentry.set_item("dps", dps)?;
+                    wentry.set_item("splash_radius_cells", (w.splash_radius as f32) / 1024.0)?;
+                    wentry.set_item("projectile_speed", w.projectile_speed)?;
+                    let versus = PyDict::new_bound(py);
+                    for (armor, pct) in &w.versus {
+                        versus.set_item(format!("{:?}", armor), pct)?;
+                    }
+                    wentry.set_item("versus", versus)?;
+                    weapons.append(wentry)?;
+                }
+                entry.set_item("weapons", weapons)?;
+                out.set_item(t, entry)?;
+            }
+            Ok(out)
         }
     }
 }

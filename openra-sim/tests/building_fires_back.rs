@@ -92,7 +92,7 @@ fn build_arena(seed: i32) -> Option<World> {
             },
         ],
     };
-    let mut world = world::build_world(&map, seed, &lobby, Some(rules), 0);
+    let mut world = world::build_world(&map, seed, &lobby, Some(rules), 0, false);
     set_test_unpaused(&mut world);
     Some(world)
 }
