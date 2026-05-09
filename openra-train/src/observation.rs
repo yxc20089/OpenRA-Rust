@@ -33,6 +33,16 @@ pub struct UnitPos {
     /// (Move → final path cell; Attack → target's current cell).
     /// `None` means the unit is idle / turning / harvesting.
     pub target: Option<(i32, i32)>,
+    /// Activity descriptor for the briefing: "idle", "moving",
+    /// "attacking", "turning", "harvesting". Lets the Python side
+    /// distinguish a Move from an Attack — both populate `target`,
+    /// but they mean very different things to the agent.
+    pub activity: String,
+    /// If `activity == "attacking"`, the actor id of the target.
+    /// `None` for any other activity. Surfaced so the briefing can
+    /// render "attacking 1023" instead of the misleading
+    /// "moving to (55,10)" (which is the target's cell, not a path).
+    pub attacking_target_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -174,7 +184,7 @@ mod py {
         pub fn to_pydict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
             let d = PyDict::new_bound(py);
 
-            // unit_positions: {id: {cell_x, cell_y, target?: [tx, ty]}}
+            // unit_positions: {id: {cell_x, cell_y, target?, activity, attacking_target_id?}}
             let unit_positions = PyDict::new_bound(py);
             for (id, pos) in &self.unit_positions {
                 let entry = PyDict::new_bound(py);
@@ -185,6 +195,10 @@ mod py {
                     target.append(tx)?;
                     target.append(ty)?;
                     entry.set_item("target", target)?;
+                }
+                entry.set_item("activity", &pos.activity)?;
+                if let Some(tid) = pos.attacking_target_id.as_deref() {
+                    entry.set_item("attacking_target_id", tid)?;
                 }
                 unit_positions.set_item(id, entry)?;
             }

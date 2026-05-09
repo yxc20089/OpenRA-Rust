@@ -1791,17 +1791,21 @@ impl World {
             }
         }
 
-        // ── Auto-engage during Move ────────────────────────────────────
-        // Scan each Move-active actor for an enemy in firing range. If one
-        // is found, swap Move → Attack so units fight when commanded toward
-        // (or past) an enemy. Without this, `move(target=enemy_cell)` just
-        // walks units onto the enemy cell where they sit idle — the Rust
-        // Move activity has no fire-during-path logic. This brings parity
-        // with the C# OpenRA `AttackMove` semantic that the LLM system
-        // prompt teaches the model to expect.
+        // ── Auto-engage on idle ────────────────────────────────────────
+        // Only IDLE units (Activity::None) auto-engage enemies in range.
+        // Active Move / Attack / Harvest are preserved — the agent's
+        // explicit orders override defensive auto-fire. To attack a
+        // specific actor, the agent uses `attack_target`. To position,
+        // it uses `move`. Auto-engage is the defensive fallback for
+        // units that have completed (or never received) an order.
+        //
+        // Old behaviour overwrote Move → Attack each tick, which made
+        // any move past an enemy permanently divert into combat — agents
+        // had no way to issue a second move to escape, because the next
+        // tick's auto-engage scan would re-grab them.
         let mut engage_pairs: Vec<(u32, u32)> = Vec::new();
         for (id, actor) in &self.actors {
-            if !matches!(actor.activity, Some(Activity::Move { .. })) {
+            if actor.activity.is_some() {
                 continue;
             }
             let my_loc = match actor.location {

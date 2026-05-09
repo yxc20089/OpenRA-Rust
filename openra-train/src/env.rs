@@ -948,12 +948,19 @@ impl Env {
                     (Some(tx), Some(ty)) => Some((tx, ty)),
                     _ => None,
                 };
+                let attacking_target_id = if a.activity == "attacking" {
+                    a.target_id.map(|tid| tid.to_string())
+                } else {
+                    None
+                };
                 unit_positions.push((
                     id_str.clone(),
                     UnitPos {
                         cell_x: a.x,
                         cell_y: a.y,
                         target,
+                        activity: a.activity.clone(),
+                        attacking_target_id,
                     },
                 ));
                 unit_hp.push((id_str, pct));
