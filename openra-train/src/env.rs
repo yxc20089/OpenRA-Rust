@@ -873,6 +873,98 @@ impl Env {
                         });
                     }
                 }
+                Command::AttackMove { unit_ids, target_x, target_y } => {
+                    for id in unit_ids {
+                        if let Some(aid) =
+                            resolve_owned(id, &agent_owned, &mut self.last_warnings)
+                        {
+                            orders.push(GameOrder {
+                                order_string: "AttackMove".into(),
+                                subject_id: Some(aid),
+                                target_string: Some(format!("{target_x},{target_y}")),
+                                extra_data: None,
+                            });
+                        }
+                    }
+                }
+                Command::Harvest { unit_ids, target_x, target_y } => {
+                    for id in unit_ids {
+                        if let Some(aid) =
+                            resolve_owned(id, &agent_owned, &mut self.last_warnings)
+                        {
+                            orders.push(GameOrder {
+                                order_string: "Harvest".into(),
+                                subject_id: Some(aid),
+                                target_string: Some(format!("{target_x},{target_y}")),
+                                extra_data: None,
+                            });
+                        }
+                    }
+                }
+                Command::SetRallyPoint { unit_ids, target_x, target_y } => {
+                    for id in unit_ids {
+                        if let Some(aid) =
+                            resolve_owned(id, &agent_owned, &mut self.last_warnings)
+                        {
+                            orders.push(GameOrder {
+                                order_string: "SetRallyPoint".into(),
+                                subject_id: Some(aid),
+                                target_string: Some(format!("{target_x},{target_y}")),
+                                extra_data: None,
+                            });
+                        }
+                    }
+                }
+                Command::Stop { unit_ids }
+                | Command::Deploy { unit_ids }
+                | Command::Sell { unit_ids }
+                | Command::Repair { unit_ids }
+                | Command::PowerDown { unit_ids } => {
+                    let order_string = match cmd {
+                        Command::Stop { .. } => "Stop",
+                        Command::Deploy { .. } => "DeployTransform",
+                        Command::Sell { .. } => "Sell",
+                        Command::Repair { .. } => "RepairBuilding",
+                        Command::PowerDown { .. } => "PowerDown",
+                        _ => unreachable!(),
+                    };
+                    for id in unit_ids {
+                        if let Some(aid) =
+                            resolve_owned(id, &agent_owned, &mut self.last_warnings)
+                        {
+                            orders.push(GameOrder {
+                                order_string: order_string.into(),
+                                subject_id: Some(aid),
+                                target_string: None,
+                                extra_data: None,
+                            });
+                        }
+                    }
+                }
+                Command::Build { item } => {
+                    orders.push(GameOrder {
+                        order_string: "StartProduction".into(),
+                        subject_id: Some(self.agent_player_id),
+                        target_string: Some(item.clone()),
+                        extra_data: None,
+                    });
+                }
+                Command::CancelProduction { item } => {
+                    orders.push(GameOrder {
+                        order_string: "CancelProduction".into(),
+                        subject_id: Some(self.agent_player_id),
+                        target_string: Some(item.clone()),
+                        extra_data: None,
+                    });
+                }
+                Command::PlaceBuilding { item, target_x, target_y } => {
+                    orders.push(GameOrder {
+                        order_string: "PlaceBuilding".into(),
+                        subject_id: Some(self.agent_player_id),
+                        target_string: Some(format!("{item},{target_x},{target_y}")),
+                        extra_data: None,
+                    });
+                }
             }
         }
         orders
@@ -1158,6 +1250,27 @@ fn parse_actor_id(s: &str) -> Option<u32> {
     s.parse::<u32>().ok()
 }
 
+/// Resolve a Python unit-id string to an agent-owned actor id, pushing
+/// a warning (and returning None) on a parse failure or ownership
+/// violation. Shared by every unit-targeted command in `build_orders`.
+fn resolve_owned(
+    id_str: &str,
+    agent_owned: &HashSet<u32>,
+    warnings: &mut Vec<String>,
+) -> Option<u32> {
+    match parse_actor_id(id_str) {
+        None => {
+            warnings.push(format!("invalid unit_id {id_str:?}"));
+            None
+        }
+        Some(aid) if agent_owned.contains(&aid) => Some(aid),
+        Some(aid) => {
+            warnings.push(format!("unit {aid} not owned by player_0"));
+            None
+        }
+    }
+}
+
 /// Pick a starting actor id high enough to avoid collision with
 /// anything `build_world` allocated. We can't read `World::next_actor_id`
 /// directly, so we walk the public APIs.
@@ -1384,6 +1497,7 @@ fn load_rules_with_fallback() -> (GameRules, data_rules::Rules) {
             units: std::collections::BTreeMap::new(),
             weapons: std::collections::BTreeMap::new(),
             buildings: std::collections::BTreeMap::new(),
+            buildables: std::collections::BTreeMap::new(),
         },
     )
 }

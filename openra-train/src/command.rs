@@ -1,41 +1,53 @@
 //! Typed command DSL for `OpenRAEnv::step`.
 //!
-//! Three commands map to OpenRA orders:
-//!   * `MoveUnits { unit_ids, target_x, target_y }` → one `Move` order
-//!     per unit.
-//!   * `AttackUnit { unit_ids, target_id }` → one `Attack` order per
-//!     unit (target is an enemy actor id).
-//!   * `Observe` → no-op; the env still ticks N frames.
+//! Each variant maps to an OpenRA `GameOrder` the sim already handles
+//! (see `world.rs::process_order`). Unit-targeted commands take actor
+//! id strings (validated agent-owned in `env::build_orders`); economy
+//! commands (`Build`/`CancelProduction`/`PlaceBuilding`) are owned by
+//! the agent player's production, so they carry no actor id.
 //!
-//! Python sees a single `Command` class with three static constructors
-//! (`Command.move_units(...)`, `Command.attack_unit(...)`,
-//! `Command.observe()`). Internally we keep a Rust enum so the env
-//! handler can `match` exhaustively.
+//! Python sees one `Command` class with static constructors. Internally
+//! a Rust enum keeps the env handler exhaustive.
 
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
 
-/// Native Rust representation. Used by integration tests and by the
-/// PyO3 wrapper.
+/// Native Rust representation. Used by integration tests and the PyO3
+/// wrapper.
 #[derive(Debug, Clone)]
 pub enum Command {
-    MoveUnits {
-        unit_ids: Vec<String>,
-        target_x: i32,
-        target_y: i32,
-    },
-    AttackUnit {
-        unit_ids: Vec<String>,
-        target_id: String,
-    },
+    /// Move each unit to a cell (auto-fire opportunistically en route).
+    MoveUnits { unit_ids: Vec<String>, target_x: i32, target_y: i32 },
+    /// Pathfind to and focus-fire an enemy actor.
+    AttackUnit { unit_ids: Vec<String>, target_id: String },
+    /// Move toward a cell while engaging hostiles along the way.
+    AttackMove { unit_ids: Vec<String>, target_x: i32, target_y: i32 },
+    /// Cancel current activity (go idle).
+    Stop { unit_ids: Vec<String> },
+    /// Transform an MCV into a construction yard.
+    Deploy { unit_ids: Vec<String> },
+    /// Enqueue production of `item` in the agent player's queue
+    /// (covers both C# BUILD and TRAIN — same handler).
+    Build { item: String },
+    /// Cancel the last queued `item` (refunds remaining cost).
+    CancelProduction { item: String },
+    /// Place a completed building `item` at a cell.
+    PlaceBuilding { item: String, target_x: i32, target_y: i32 },
+    /// Send harvesters to a resource cell.
+    Harvest { unit_ids: Vec<String>, target_x: i32, target_y: i32 },
+    /// Sell a building (immediate refund).
+    Sell { unit_ids: Vec<String> },
+    /// Toggle repair on a building.
+    Repair { unit_ids: Vec<String> },
+    /// Toggle a building's power.
+    PowerDown { unit_ids: Vec<String> },
+    /// Set a production building's rally point.
+    SetRallyPoint { unit_ids: Vec<String>, target_x: i32, target_y: i32 },
+    /// No-op; the env still ticks N frames.
     Observe,
 }
 
 /// Python-facing shim around `Command`.
-///
-/// PyO3 0.22 doesn't easily round-trip an enum with mixed-shape variants
-/// without a discriminant, so we go with a single class plus three
-/// classmethod constructors.
 #[cfg(feature = "python")]
 #[pyclass(name = "Command", module = "openra_train")]
 #[derive(Debug, Clone)]
@@ -46,54 +58,79 @@ pub struct PyCommand {
 #[cfg(feature = "python")]
 #[pymethods]
 impl PyCommand {
-    /// Issue a Move order for each listed unit, all targeting the same cell.
     #[staticmethod]
     fn move_units(unit_ids: Vec<String>, target_x: i32, target_y: i32) -> Self {
-        PyCommand {
-            inner: Command::MoveUnits {
-                unit_ids,
-                target_x,
-                target_y,
-            },
-        }
+        Self { inner: Command::MoveUnits { unit_ids, target_x, target_y } }
     }
 
-    /// Issue an Attack order against the named enemy actor for each unit.
     #[staticmethod]
     fn attack_unit(unit_ids: Vec<String>, target_id: String) -> Self {
-        PyCommand {
-            inner: Command::AttackUnit {
-                unit_ids,
-                target_id,
-            },
-        }
+        Self { inner: Command::AttackUnit { unit_ids, target_id } }
     }
 
-    /// No-op: env still advances N ticks.
+    #[staticmethod]
+    fn attack_move(unit_ids: Vec<String>, target_x: i32, target_y: i32) -> Self {
+        Self { inner: Command::AttackMove { unit_ids, target_x, target_y } }
+    }
+
+    #[staticmethod]
+    fn stop(unit_ids: Vec<String>) -> Self {
+        Self { inner: Command::Stop { unit_ids } }
+    }
+
+    #[staticmethod]
+    fn deploy(unit_ids: Vec<String>) -> Self {
+        Self { inner: Command::Deploy { unit_ids } }
+    }
+
+    /// Enqueue production of `item` (BUILD/TRAIN).
+    #[staticmethod]
+    fn build(item: String) -> Self {
+        Self { inner: Command::Build { item } }
+    }
+
+    #[staticmethod]
+    fn cancel_production(item: String) -> Self {
+        Self { inner: Command::CancelProduction { item } }
+    }
+
+    #[staticmethod]
+    fn place_building(item: String, target_x: i32, target_y: i32) -> Self {
+        Self { inner: Command::PlaceBuilding { item, target_x, target_y } }
+    }
+
+    #[staticmethod]
+    fn harvest(unit_ids: Vec<String>, target_x: i32, target_y: i32) -> Self {
+        Self { inner: Command::Harvest { unit_ids, target_x, target_y } }
+    }
+
+    #[staticmethod]
+    fn sell(unit_ids: Vec<String>) -> Self {
+        Self { inner: Command::Sell { unit_ids } }
+    }
+
+    #[staticmethod]
+    fn repair(unit_ids: Vec<String>) -> Self {
+        Self { inner: Command::Repair { unit_ids } }
+    }
+
+    #[staticmethod]
+    fn power_down(unit_ids: Vec<String>) -> Self {
+        Self { inner: Command::PowerDown { unit_ids } }
+    }
+
+    #[staticmethod]
+    fn set_rally_point(unit_ids: Vec<String>, target_x: i32, target_y: i32) -> Self {
+        Self { inner: Command::SetRallyPoint { unit_ids, target_x, target_y } }
+    }
+
     #[staticmethod]
     fn observe() -> Self {
-        PyCommand {
-            inner: Command::Observe,
-        }
+        Self { inner: Command::Observe }
     }
 
-    /// Pretty-print for Python `repr()`.
     fn __repr__(&self) -> String {
-        match &self.inner {
-            Command::MoveUnits {
-                unit_ids,
-                target_x,
-                target_y,
-            } => format!(
-                "Command.move_units({:?}, {}, {})",
-                unit_ids, target_x, target_y
-            ),
-            Command::AttackUnit {
-                unit_ids,
-                target_id,
-            } => format!("Command.attack_unit({:?}, {:?})", unit_ids, target_id),
-            Command::Observe => "Command.observe()".into(),
-        }
+        format!("Command::{:?}", self.inner)
     }
 }
 
