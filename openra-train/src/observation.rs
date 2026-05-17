@@ -86,6 +86,9 @@ pub struct EconomyObs {
     pub power_provided: i32,
     pub power_drained: i32,
     pub harvesters: i32,
+    /// S1: stored resources and storage capacity (refineries/silos).
+    pub resources: i32,
+    pub resource_capacity: i32,
 }
 
 /// S9 — an agent-owned building (parity with C# RlBuildingInfo subset).
@@ -218,6 +221,8 @@ impl Observation {
         bytes_of_i32(self.economy.power_provided, &mut h);
         bytes_of_i32(self.economy.power_drained, &mut h);
         bytes_of_i32(self.economy.harvesters, &mut h);
+        bytes_of_i32(self.economy.resources, &mut h);
+        bytes_of_i32(self.economy.resource_capacity, &mut h);
         for ob in &self.own_buildings {
             bytes_of_str(&ob.building_type, &mut h);
             bytes_of_i32(ob.cell_x, &mut h);
@@ -320,6 +325,8 @@ mod py {
             econ.set_item("power_provided", self.economy.power_provided)?;
             econ.set_item("power_drained", self.economy.power_drained)?;
             econ.set_item("harvesters", self.economy.harvesters)?;
+            econ.set_item("resources", self.economy.resources)?;
+            econ.set_item("resource_capacity", self.economy.resource_capacity)?;
             d.set_item("economy", econ)?;
 
             // S9 own_buildings: [{id, type, cell_x, cell_y, hp_pct}]

@@ -139,4 +139,43 @@ impl Actor {
             }
         }
     }
+
+    /// Stored (harvested-but-not-yet-cashed) resources.
+    pub fn resources(&self) -> i32 {
+        for t in &self.traits {
+            if let TraitState::PlayerResources { resources, .. } = t {
+                return *resources;
+            }
+        }
+        0
+    }
+
+    pub fn set_resources(&mut self, n: i32) {
+        for t in &mut self.traits {
+            if let TraitState::PlayerResources { resources, .. } = t {
+                *resources = n;
+                return;
+            }
+        }
+    }
+
+    /// Storage capacity (from refineries/silos) — the cap on stored
+    /// resources; harvested ore beyond this is lost.
+    pub fn resource_capacity(&self) -> i32 {
+        for t in &self.traits {
+            if let TraitState::PlayerResources { resource_capacity, .. } = t {
+                return *resource_capacity;
+            }
+        }
+        0
+    }
+
+    pub fn set_resource_capacity(&mut self, n: i32) {
+        for t in &mut self.traits {
+            if let TraitState::PlayerResources { resource_capacity, .. } = t {
+                *resource_capacity = n;
+                return;
+            }
+        }
+    }
 }

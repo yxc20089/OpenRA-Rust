@@ -1173,6 +1173,8 @@ impl Env {
             economy.cash = ps.cash;
             economy.power_provided = ps.power_provided;
             economy.power_drained = ps.power_drained;
+            economy.resources = ps.resources;
+            economy.resource_capacity = ps.resource_capacity;
             for q in &ps.production_queue {
                 production.push(crate::observation::ProductionObs {
                     item: q.item_name.clone(),

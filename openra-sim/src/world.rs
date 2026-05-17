@@ -187,6 +187,10 @@ pub struct PlayerSnapshot {
     pub cash: i32,
     pub power_provided: i32,
     pub power_drained: i32,
+    /// S1: stored (harvested, not-yet-cashed) resources and the storage
+    /// cap from refineries/silos.
+    pub resources: i32,
+    pub resource_capacity: i32,
     pub production_queue: Vec<ProductionSnapshot>,
 }
 
@@ -534,6 +538,8 @@ impl World {
         let players = self.player_actor_ids.iter().map(|&pid| {
             let actor = self.actors.get(&pid);
             let cash = actor.map(|a| a.cash()).unwrap_or(0);
+            let resources = actor.map(|a| a.resources()).unwrap_or(0);
+            let resource_capacity = self.player_storage_capacity(pid);
             let (power_provided, power_drained) = actor
                 .map(|a| {
                     for t in &a.traits {
@@ -562,7 +568,7 @@ impl World {
                 }
                 all_items
             }).unwrap_or_default();
-            PlayerSnapshot { index: pid, cash, power_provided, power_drained, production_queue }
+            PlayerSnapshot { index: pid, cash, power_provided, power_drained, resources, resource_capacity, production_queue }
         }).collect();
         // Collect resource cells for rendering
         let mut resources = Vec::new();
@@ -1477,11 +1483,15 @@ impl World {
                         } else {
                             (ResourceType::Ore, resource_value(ResourceType::Ore))
                         };
-                        // Add cash to player
+                        // S1: deposit into the capped resource store
+                        // (overflow beyond storage capacity is lost).
+                        // A per-tick drain converts it to spendable cash.
                         if let Some(pid) = owner {
+                            let cap = self.player_storage_capacity(pid);
                             if let Some(player) = self.actors.get_mut(&pid) {
-                                let current = player.cash();
-                                player.set_cash(current + value);
+                                player.set_resource_capacity(cap);
+                                let r = player.resources();
+                                player.set_resources((r + value).min(cap));
                             }
                         }
                         // Decrement carried
@@ -2473,6 +2483,25 @@ impl World {
         // Tick Harvest activities.
         self.tick_harvesters();
 
+        // S1: trickle stored resources into spendable cash. Storage
+        // capacity (refineries/silos) bounds how much can be banked
+        // between drains — out-harvesting cap+drain loses ore, which is
+        // the incentive to build silos. "Final economy value" = cash +
+        // stored resources.
+        const RESOURCE_DRAIN_PER_TICK: i32 = 10;
+        let player_ids: Vec<u32> = self.player_actor_ids.clone();
+        for pid in player_ids {
+            if let Some(p) = self.actors.get_mut(&pid) {
+                let r = p.resources();
+                if r > 0 {
+                    let d = r.min(RESOURCE_DRAIN_PER_TICK);
+                    p.set_resources(r - d);
+                    let c = p.cash();
+                    p.set_cash(c + d);
+                }
+            }
+        }
+
         // Tick production queues: consume cash, advance build time.
         let player_ids: Vec<u32> = self.production.keys().copied().collect();
         let mut completed_items: Vec<(u32, String)> = Vec::new();
@@ -2844,6 +2873,23 @@ impl World {
             }
         }
         None
+    }
+
+    /// S1: total resource-storage capacity from a player's refineries
+    /// and silos (RA: proc≈2000, silo≈3000). Harvested ore beyond this
+    /// is lost on deposit — building silos raises the cap.
+    fn player_storage_capacity(&self, pid: u32) -> i32 {
+        let mut cap = 0;
+        for a in self.actors.values() {
+            if a.owner_id == Some(pid) && a.kind == ActorKind::Building {
+                match a.actor_type.as_deref() {
+                    Some("proc") => cap += 2000,
+                    Some("silo") => cap += 3000,
+                    _ => {}
+                }
+            }
+        }
+        cap
     }
 
     /// Find a refinery (PROC) owned by a player.
