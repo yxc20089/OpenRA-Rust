@@ -117,6 +117,31 @@ fn economy_and_structure_commands_are_accepted_cleanly() {
 }
 
 #[test]
+fn economy_observation_is_surfaced_and_deterministic() {
+    let Some(path) = scenario_path() else { return };
+    let mut a = Env::new(path.to_str().unwrap(), 7).unwrap();
+    let mut b = Env::new(path.to_str().unwrap(), 7).unwrap();
+    let oa = a.reset();
+    // S9 fields exist and are well-formed.
+    assert!(oa.economy.cash >= 0, "cash {}", oa.economy.cash);
+    assert!(oa.economy.harvesters >= 0);
+    assert!(oa.economy.power_provided >= 0 && oa.economy.power_drained >= 0);
+    // production is a list (possibly empty in rush-hour).
+    let _ = oa.production.len();
+    let _ = oa.own_buildings.len();
+
+    // Same seed ⇒ identical economy after identical stepping.
+    b.reset();
+    for _ in 0..5 {
+        a.step(&[Command::Observe]);
+        b.step(&[Command::Observe]);
+    }
+    let ea = a.last_observation();
+    let eb = b.last_observation();
+    assert_eq!(ea.economy, eb.economy, "economy must be deterministic per seed");
+}
+
+#[test]
 fn ownership_validation_still_rejects_bad_ids() {
     let Some(path) = scenario_path() else { return };
     let mut env = Env::new(path.to_str().unwrap(), 7).unwrap();

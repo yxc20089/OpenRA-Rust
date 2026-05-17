@@ -1014,6 +1014,9 @@ impl Env {
                     game_tick: 0,
                     explored_percent: 0.0,
                     explored_cells: Vec::new(),
+                    economy: crate::observation::EconomyObs::default(),
+                    own_buildings: Vec::new(),
+                    production: Vec::new(),
                 };
             }
         };
@@ -1111,6 +1114,46 @@ impl Env {
         let explored_cells: Vec<(i32, i32)> =
             self.explored_cells.iter().copied().collect();
 
+        // S9 — economy / own buildings / production for the agent.
+        let mut economy = crate::observation::EconomyObs::default();
+        let mut production: Vec<crate::observation::ProductionObs> = Vec::new();
+        if let Some(ps) = snap.players.iter().find(|p| p.index == self.agent_player_id)
+        {
+            economy.cash = ps.cash;
+            economy.power_provided = ps.power_provided;
+            economy.power_drained = ps.power_drained;
+            for q in &ps.production_queue {
+                production.push(crate::observation::ProductionObs {
+                    item: q.item_name.clone(),
+                    progress: q.progress,
+                    done: q.done,
+                });
+            }
+        }
+        let mut own_buildings: Vec<crate::observation::OwnBuilding> = Vec::new();
+        for a in &snap.actors {
+            if a.owner != self.agent_player_id {
+                continue;
+            }
+            if a.actor_type.to_ascii_lowercase().starts_with("harv") {
+                economy.harvesters += 1;
+            }
+            if matches!(a.kind, ActorKind::Building) {
+                let hp_pct = if a.max_hp > 0 {
+                    (a.hp as f32 / a.max_hp as f32).clamp(0.0, 1.0)
+                } else {
+                    1.0
+                };
+                own_buildings.push(crate::observation::OwnBuilding {
+                    id: a.id.to_string(),
+                    building_type: a.actor_type.clone(),
+                    cell_x: a.x,
+                    cell_y: a.y,
+                    hp_pct,
+                });
+            }
+        }
+
         Observation {
             unit_positions,
             unit_hp,
@@ -1121,6 +1164,9 @@ impl Env {
             game_tick: world.world_tick as i32,
             explored_percent,
             explored_cells,
+            economy,
+            own_buildings,
+            production,
         }
     }
 

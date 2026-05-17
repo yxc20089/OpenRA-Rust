@@ -69,6 +69,34 @@ pub struct EnemyBuilding {
     pub hp_pct: f32,
 }
 
+/// S9 — agent economy snapshot (parity with C# RlEconomy subset the
+/// Rust sim can ground today: cash/power/harvesters; ore via resources).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EconomyObs {
+    pub cash: i32,
+    pub power_provided: i32,
+    pub power_drained: i32,
+    pub harvesters: i32,
+}
+
+/// S9 — an agent-owned building (parity with C# RlBuildingInfo subset).
+#[derive(Debug, Clone)]
+pub struct OwnBuilding {
+    pub id: String,
+    pub building_type: String,
+    pub cell_x: i32,
+    pub cell_y: i32,
+    pub hp_pct: f32,
+}
+
+/// S9 — a queued production item (parity with C# RlProductionInfo).
+#[derive(Debug, Clone)]
+pub struct ProductionObs {
+    pub item: String,
+    pub progress: f32,
+    pub done: bool,
+}
+
 /// All fields the Python rollout pipeline reads off an observation.
 ///
 /// Stored with native Rust types; the PyO3 boundary layer (in
@@ -101,6 +129,12 @@ pub struct Observation {
     /// briefings (which a position-snapshot-based reveal mask would
     /// miss). Used by the minimap renderer to draw fog correctly.
     pub explored_cells: Vec<(i32, i32)>,
+    /// S9 — agent economy (cash/power/harvesters).
+    pub economy: EconomyObs,
+    /// S9 — agent-owned buildings.
+    pub own_buildings: Vec<OwnBuilding>,
+    /// S9 — agent production queue items.
+    pub production: Vec<ProductionObs>,
 }
 
 impl Observation {
@@ -168,6 +202,20 @@ impl Observation {
         bytes_of_i32(self.units_killed, &mut h);
         bytes_of_i32(self.game_tick, &mut h);
         bytes_of_f32(self.explored_percent, &mut h);
+        mix(&mut h, b'|');
+        bytes_of_i32(self.economy.cash, &mut h);
+        bytes_of_i32(self.economy.power_provided, &mut h);
+        bytes_of_i32(self.economy.power_drained, &mut h);
+        bytes_of_i32(self.economy.harvesters, &mut h);
+        for ob in &self.own_buildings {
+            bytes_of_str(&ob.building_type, &mut h);
+            bytes_of_i32(ob.cell_x, &mut h);
+            bytes_of_i32(ob.cell_y, &mut h);
+        }
+        for p in &self.production {
+            bytes_of_str(&p.item, &mut h);
+            bytes_of_f32(p.progress, &mut h);
+        }
         h
     }
 }
@@ -252,6 +300,38 @@ mod py {
             d.set_item("units_killed", self.units_killed)?;
             d.set_item("game_tick", self.game_tick)?;
             d.set_item("explored_percent", self.explored_percent)?;
+
+            // S9 economy: {cash, power_provided, power_drained, harvesters}
+            let econ = PyDict::new_bound(py);
+            econ.set_item("cash", self.economy.cash)?;
+            econ.set_item("power_provided", self.economy.power_provided)?;
+            econ.set_item("power_drained", self.economy.power_drained)?;
+            econ.set_item("harvesters", self.economy.harvesters)?;
+            d.set_item("economy", econ)?;
+
+            // S9 own_buildings: [{id, type, cell_x, cell_y, hp_pct}]
+            let own_b = PyList::empty_bound(py);
+            for ob in &self.own_buildings {
+                let e = PyDict::new_bound(py);
+                e.set_item("id", &ob.id)?;
+                e.set_item("type", &ob.building_type)?;
+                e.set_item("cell_x", ob.cell_x)?;
+                e.set_item("cell_y", ob.cell_y)?;
+                e.set_item("hp_pct", ob.hp_pct)?;
+                own_b.append(e)?;
+            }
+            d.set_item("own_buildings", own_b)?;
+
+            // S9 production: [{item, progress, done}]
+            let prod = PyList::empty_bound(py);
+            for p in &self.production {
+                let e = PyDict::new_bound(py);
+                e.set_item("item", &p.item)?;
+                e.set_item("progress", p.progress)?;
+                e.set_item("done", p.done)?;
+                prod.append(e)?;
+            }
+            d.set_item("production", prod)?;
 
             // explored_cells: list[(x, y)] — accurate per-tick fog
             // accumulation. The renderer uses this instead of
