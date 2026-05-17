@@ -1039,6 +1039,7 @@ impl Env {
                     economy: crate::observation::EconomyObs::default(),
                     own_buildings: Vec::new(),
                     production: Vec::new(),
+                    map_info: crate::observation::MapInfo::default(),
                 };
             }
         };
@@ -1189,6 +1190,10 @@ impl Env {
             economy,
             own_buildings,
             production,
+            map_info: crate::observation::MapInfo {
+                width: snap.map_width,
+                height: snap.map_height,
+            },
         }
     }
 

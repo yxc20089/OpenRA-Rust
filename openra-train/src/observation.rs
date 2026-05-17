@@ -69,6 +69,15 @@ pub struct EnemyBuilding {
     pub hp_pct: f32,
 }
 
+/// S9 — map dimensions (parity with C# RlMapInfo). Lets the bench use
+/// true map size for region win-conditions / the minimap renderer
+/// instead of synthesising bounds from observed cells.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MapInfo {
+    pub width: i32,
+    pub height: i32,
+}
+
 /// S9 — agent economy snapshot (parity with C# RlEconomy subset the
 /// Rust sim can ground today: cash/power/harvesters; ore via resources).
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -135,6 +144,8 @@ pub struct Observation {
     pub own_buildings: Vec<OwnBuilding>,
     /// S9 — agent production queue items.
     pub production: Vec<ProductionObs>,
+    /// S9 — true map dimensions.
+    pub map_info: MapInfo,
 }
 
 impl Observation {
@@ -216,6 +227,8 @@ impl Observation {
             bytes_of_str(&p.item, &mut h);
             bytes_of_f32(p.progress, &mut h);
         }
+        bytes_of_i32(self.map_info.width, &mut h);
+        bytes_of_i32(self.map_info.height, &mut h);
         h
     }
 }
@@ -332,6 +345,11 @@ mod py {
                 prod.append(e)?;
             }
             d.set_item("production", prod)?;
+
+            let mi = PyDict::new_bound(py);
+            mi.set_item("width", self.map_info.width)?;
+            mi.set_item("height", self.map_info.height)?;
+            d.set_item("map_info", mi)?;
 
             // explored_cells: list[(x, y)] — accurate per-tick fog
             // accumulation. The renderer uses this instead of
