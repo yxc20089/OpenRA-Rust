@@ -257,6 +257,9 @@ pub struct World {
     everyone_player_id: u32,
     /// Number of mine actors (for SeedsResource RNG consumption).
     mine_count: usize,
+    /// Cell locations of mine actors — seed + replenish ore here so
+    /// harvesters have something to collect.
+    mine_locations: Vec<(i32, i32)>,
     /// Ticks until next SeedsResource seeding event.
     seeds_resource_ticks: i32,
     /// Active production items per player actor ID.
@@ -1742,9 +1745,24 @@ impl World {
             self.seeds_resource_ticks -= 1;
         }
         if self.seeds_resource_ticks <= 0 {
-            for _ in 0..self.mine_count {
-                self.rng.next_range(-1, 2); // dx
-                self.rng.next_range(-1, 2); // dy
+            // Replenish ore near each mine. The two RNG draws per mine
+            // are preserved (determinism / C# replay parity) but now
+            // actually place a cell of ore at the jittered offset.
+            let mines = self.mine_locations.clone();
+            for &(mx, my) in &mines {
+                let dx = self.rng.next_range(-1, 2); // dx
+                let dy = self.rng.next_range(-1, 2); // dy
+                let (x, y) = (mx + dx, my + dy);
+                if self.terrain.contains(x, y) && self.terrain.is_terrain_passable(x, y)
+                {
+                    self.terrain.set_resource(x, y, ResourceType::Ore, 50);
+                }
+            }
+            // Any counted mine without a tracked location still consumes
+            // its 2 RNG draws so the stream stays identical.
+            for _ in mines.len()..self.mine_count {
+                self.rng.next_range(-1, 2);
+                self.rng.next_range(-1, 2);
             }
             self.seeds_resource_ticks = 75;
         }
@@ -3898,6 +3916,7 @@ pub fn build_world(
     // === Map actors ===
     let mut spawn_locations: Vec<(i32, i32)> = Vec::new();
     let mut mine_count: usize = 0;
+    let mut mine_locations: Vec<(i32, i32)> = Vec::new();
 
     for map_actor in &map.actors {
         let id = next_id;
@@ -3919,6 +3938,7 @@ pub fn build_world(
             trait_list.push(TraitState::Health { hp: 50000 });
         } else if is_mine {
             mine_count += 1;
+            mine_locations.push(map_actor.location);
             kind = ActorKind::Mine;
             trait_list.push(TraitState::BodyOrientation { quantized_facings: 1 });
             trait_list.push(TraitState::Building { top_left });
@@ -3985,6 +4005,26 @@ pub fn build_world(
     // Initialize terrain map and mark impassable tiles (Water, Rock/Cliffs).
     let mut terrain = TerrainMap::new(map.map_size.0, map.map_size.1);
     apply_temperat_passability(&map.tiles, &mut terrain);
+    // S0: seed an ore field around each mine actor. Without this the
+    // terrain has no resources and harvesters never find ore (the
+    // `mine` actor was previously only counted, never seeded).
+    for &(mx, my) in &mine_locations {
+        let r: i32 = 5;
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx * dx + dy * dy > r * r {
+                    continue;
+                }
+                let (x, y) = (mx + dx, my + dy);
+                if (x, y) == (mx, my) {
+                    continue; // the mine itself occupies this cell
+                }
+                if terrain.contains(x, y) && terrain.is_terrain_passable(x, y) {
+                    terrain.set_resource(x, y, ResourceType::Ore, 50);
+                }
+            }
+        }
+    }
     // Resolve the rules early so initial-build building footprints can
     // honour rules-derived dimensions (Phase 7 — pbox=1×1, fact=3×2 etc).
     // We materialise a temporary Rules clone for this lookup; the caller
@@ -4059,6 +4099,7 @@ pub fn build_world(
         player_actor_ids,
         everyone_player_id,
         mine_count,
+        mine_locations,
         seeds_resource_ticks: 0,
         production: HashMap::new(),
         terrain,
