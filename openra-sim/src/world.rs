@@ -1049,6 +1049,16 @@ impl World {
 
     /// Handle a Harvest order: send a harvester to harvest at a location.
     fn order_harvest(&mut self, actor_id: u32, target: (i32, i32)) {
+        // Idempotent: a unit already harvesting must not have its
+        // in-progress run (accumulated ore / FSM state) wiped by a
+        // re-issued harvest order — agents/models re-send commands
+        // every turn, and clobbering here starves the harvester so it
+        // never reaches capacity and never delivers cash.
+        if let Some(a) = self.actors.get(&actor_id) {
+            if matches!(a.activity, Some(Activity::Harvest { .. })) {
+                return;
+            }
+        }
         let (speed, owner_id) = match self.actors.get(&actor_id) {
             Some(a) => (self.actor_speed(actor_id), a.owner_id),
             None => return,
