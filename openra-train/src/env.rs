@@ -166,6 +166,8 @@ pub struct Env {
     ///     fall back to "all combat units dead" semantic.
     /// Set once at the end of `reset()`.
     enemy_started_with_buildings: bool,
+    /// True iff the scenario placed any enemy actor (see is_terminal).
+    enemy_started_present: bool,
 }
 
 impl Env {
@@ -231,6 +233,7 @@ impl Env {
             enabled_signals: HashSet::new(),
             cooldown_ticks: DEFAULT_INTERRUPT_COOLDOWN_TICKS,
             enemy_started_with_buildings: false,
+            enemy_started_present: false,
         })
     }
 
@@ -277,6 +280,14 @@ impl Env {
         // so the actor table is populated.
         self.enemy_started_with_buildings = match &self.world {
             Some(w) => has_must_be_destroyed_buildings(w, self.enemy_player_id),
+            None => false,
+        };
+        // Whether the scenario placed *any* enemy actor. A no-enemy
+        // scenario (agent-objective only, everything from YAML) must NOT
+        // be auto-terminated by the enemy-elimination check — it would
+        // otherwise be `done` at tick 0.
+        self.enemy_started_present = match &self.world {
+            Some(w) => !w.actor_ids_for_player(self.enemy_player_id).is_empty(),
             None => false,
         };
         // Reveal the shroud around starting units *before* the first
@@ -1263,7 +1274,13 @@ impl Env {
         //         turn 0 → instant terminal".
         let agent_alive = has_combat_units(world, self.agent_player_id)
             || has_must_be_destroyed_buildings(world, self.agent_player_id);
-        let enemy_alive = if self.enemy_started_with_buildings {
+        let enemy_alive = if !self.enemy_started_present {
+            // No enemy in this scenario: enemy-elimination is not a
+            // victory/terminal condition. Termination is driven solely
+            // by max_ticks, the agent being wiped, or the scenario's
+            // declarative win_condition (evaluated bench-side).
+            true
+        } else if self.enemy_started_with_buildings {
             has_must_be_destroyed_buildings(world, self.enemy_player_id)
         } else {
             has_combat_units(world, self.enemy_player_id)
@@ -1646,6 +1663,7 @@ pub fn build_test_env_with_no_enemies(map_size: (i32, i32), seed: u64) -> Env {
         enabled_signals: HashSet::new(),
         cooldown_ticks: DEFAULT_INTERRUPT_COOLDOWN_TICKS,
         enemy_started_with_buildings: false,
+        enemy_started_present: false,
     };
     env.reset();
     env
