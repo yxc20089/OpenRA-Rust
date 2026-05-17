@@ -32,6 +32,10 @@ pub enum Locomotor {
     Tracked,
     /// Heavy-tracked (4tnk only in this codebase). Slow, stronger crush.
     HeavyTracked,
+    /// Heavy-wheeled (harvester, MCV, some support vehicles). Wheeled
+    /// chassis but heavier — ground-based, treated like Wheeled for
+    /// movement until per-locomotor terrain-cost tables land.
+    HeavyWheeled,
     /// Naval — not used by strategy scenarios but kept for completeness.
     Naval,
     /// Aircraft — flies over everything.
@@ -48,6 +52,7 @@ impl Locomotor {
             "wheeled" => Locomotor::Wheeled,
             "tracked" => Locomotor::Tracked,
             "heavytracked" => Locomotor::HeavyTracked,
+            "heavywheeled" => Locomotor::HeavyWheeled,
             "naval" | "lcraft" => Locomotor::Naval,
             "fly" | "aircraft" | "helicopter" => Locomotor::Aircraft,
             other => {
@@ -63,7 +68,11 @@ impl Locomotor {
     pub fn is_ground(self) -> bool {
         matches!(
             self,
-            Locomotor::Foot | Locomotor::Wheeled | Locomotor::Tracked | Locomotor::HeavyTracked
+            Locomotor::Foot
+                | Locomotor::Wheeled
+                | Locomotor::HeavyWheeled
+                | Locomotor::Tracked
+                | Locomotor::HeavyTracked
         )
     }
 }
@@ -99,6 +108,9 @@ mod tests {
         assert_eq!(Locomotor::from_yaml("wheeled"), Locomotor::Wheeled);
         assert_eq!(Locomotor::from_yaml("tracked"), Locomotor::Tracked);
         assert_eq!(Locomotor::from_yaml("heavytracked"), Locomotor::HeavyTracked);
+        assert_eq!(Locomotor::from_yaml("heavywheeled"), Locomotor::HeavyWheeled);
+        assert_eq!(Locomotor::from_yaml("HeavyWheeled"), Locomotor::HeavyWheeled);
+        assert!(Locomotor::HeavyWheeled.is_ground());
         assert_eq!(Locomotor::from_yaml("naval"), Locomotor::Naval);
     }
 
