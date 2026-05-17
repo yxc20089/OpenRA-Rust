@@ -1,0 +1,106 @@
+# OpenRA-Rust → Full C# Parity Plan
+
+Goal: make the Rust engine (`openra-sim` + `openra-train`) a faithful
+reimplementation of the C# RA engine as exposed by
+`openra-rl/proto/rl_bridge.proto` — **all 22 actions, full observation,
+economy, tech tree, buildings, sabotage, every unit type** — so the
+OpenRA-Bench eval and Training run on Rust alone (C# dropped).
+
+Parity is defined by the proto + the C# handlers
+(`ExternalBotBridge.cs`, `ActionHandler.cs`, `ObservationSerializer.cs`).
+Every subsystem is TDD'd against concrete C# values (the rules data is
+the same RA YAML the C# loads).
+
+## Strict dependency order
+
+Nothing downstream is correct until the layer under it is. Build in
+this order; each layer ships with tests before the next starts.
+
+```
+F  Foundation
+   F1 rules/data: parse cost, build_time, power, prerequisites,
+      footprint, queue/produces, versus armor, locomotor terrain
+      costs, sellable/refund, repair  (openra-data/rules.rs,
+      openra-sim/gamerules.rs)
+   F2 generic World::spawn_unit(type, owner, cell)  (world.rs)
+   F3 order plumbing: Command variants + env.build_orders +
+      world.process_frame dispatch skeleton for all 22 actions
+S  Subsystems (each TDD vs C#)
+   S1 Economy   : ResourceLayer (ore/gem density), harvester loop,
+      refinery→cash, PlayerResources; action HARVEST
+   S2 Power     : PowerManager aggregation, low-power build modifier;
+      action POWER_DOWN
+   S3 Production: tick_production (cost/time/power), queues;
+      actions BUILD, TRAIN, CANCEL_PRODUCTION; available_production
+   S4 Build/Struct: footprint placement, construction HP ramp;
+      actions PLACE_BUILDING, DEPLOY (MCV→cyard), SELL, REPAIR
+   S5 Tech tree : ProvidesPrerequisite, queue enable/disable, gating
+   S6 Units     : all infantry/vehicle/tank/arty/air/ship/mcv/harv/
+      engineer/spy/thief/medic/tanya; multi-armament, burst, versus,
+      turret-vs-hull, locomotor terrain, melee, AA
+   S7 Commands  : ATTACK_MOVE, STOP, GUARD, SET_STANCE,
+      SET_RALLY_POINT, SET_PRIMARY, ENTER_TRANSPORT/UNLOAD (cargo),
+      SURRENDER, PATROL
+   S8 Sabotage/special: engineer capture/repair, spy infiltrate+
+      sabotage+disguise, thief steal cash, C4/demolition, dog detects
+      spy, MAD/Chrono/Iron-Curtain, superweapons (nuke, paras…)
+   S9 Observation parity: full RlEconomy/RlMilitary/RlUnitInfo/
+      RlBuildingInfo/RlProductionInfo/RlMapInfo/RlKillEvent, 9-channel
+      spatial tensor, done/result, fast-advance + interrupt signals,
+      kill_events drain
+   S10 Map      : generic .oramap binary terrain + arbitrary scenario
+      actor loading (unblocks custom maps for the bench)
+```
+
+S9 is incremental: every subsystem adds its own observation fields as
+it lands (don't defer all serialization to the end).
+
+## Parity spec anchors (from code, not assumed)
+
+- Actions: 22 enum values, field usage per action — `ActionHandler.cs`.
+  PATROL defined but unimplemented in C# (parity = no-op/dropped).
+  FAST_ADVANCE handled in bridge, not an order.
+- Observation: spatial tensor = H×W×**9** float32, row-major
+  channels-last; ch0 terrain, 1 height, 2 resource density, 3
+  passability{0,1}, 4 fog{0,0.5,1}, 5 own bldg, 6 own unit density,
+  7 enemy bldg, 8 enemy unit density (`ObservationSerializer.cs`).
+- Economy: cost=`ValuedInfo.Cost`; build_time=`BuildableInfo.BuildDuration`
+  (−1⇒use cost) × actor + queue modifiers; low-power ⇒ ×LowPowerModifier.
+  Power = per-building `Power.Amount` (+provide/−drain); player aggregates.
+- Prerequisites: `BuildableInfo.Prerequisites` (`~` hidden, `!` inverted),
+  granted by `ProvidesPrerequisite` on buildings; enforced by TechTree.
+- Kill events drained every advance; interrupt signals: game_over,
+  enemy_spotted, unit_destroyed, under_attack, building_discovered,
+  enemy_building_destroyed, own_building_destroyed, unit_arrived,
+  production_complete, exploration_milestone.
+
+## Extension points (from architecture map)
+
+- New action: `openra-train/src/command.rs` (enum + PyCommand) →
+  `env.rs::build_orders()` (→GameOrder) →
+  `world.rs::process_frame()` (dispatch) → Activity in
+  `actor.rs`/`activities/` + tick in `tick_actors()` or new subsystem fn.
+- New obs field: `observation.rs::Observation` → `env.rs::observation()`
+  → `to_pydict()`; update deterministic hash if load-bearing.
+- New system: parse in `openra-data/rules.rs`, expose via
+  `openra-sim/gamerules.rs`, add `TraitState` variant +
+  `sync_hash()` if state is sync-critical, tick in `process_frame()`.
+- Determinism: every sync-critical field must enter `SyncHash`; tests
+  assert tick-exact behavior vs C# reference numbers.
+
+## Test strategy
+
+- `openra-data/tests`: rules values vs known C# (E1 hp 5000, costs,
+  build times, power, prerequisites, footprints, versus).
+- `openra-sim/tests`: per-subsystem integration (build empty world,
+  insert actors, drive orders, assert tick-exact outcomes).
+- `openra-train/tests`: `Env` step/obs parity per action.
+- Determinism gate: same (scenario, seed, orders) ⇒ identical SyncHash.
+
+## Honest scoping
+
+Full RA parity incl. spies/sabotage/superweapons is a large,
+multi-iteration effort. Order above is value-and-dependency optimal:
+F→S5 unlocks economy/production/tech (the bench's missing scenario
+families); S6–S8 broaden unit/ability coverage; S10 unlocks arbitrary
+maps. Progress is shipped per-subsystem with green tests, not big-bang.

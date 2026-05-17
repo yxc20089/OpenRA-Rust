@@ -418,6 +418,84 @@ pub fn building_info_from_actor(actor: &ActorInfo) -> Option<BuildingInfo> {
     })
 }
 
+/// Split a MiniYAML comma-list (`"Infantry, Soldier"`) into trimmed,
+/// non-empty tokens. Returns `[]` for `None`/empty.
+fn comma_list(v: Option<&str>) -> Vec<String> {
+    v.unwrap_or("")
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// F1 — economy / production / tech view over an actor. This is the
+/// parity surface for cost, build time, power, queue, prerequisites and
+/// sell refund, matching C# `ValuedInfo` / `BuildableInfo` /
+/// `PowerInfo` / `ProductionInfo` / `ProvidesPrerequisiteInfo` /
+/// `SellableInfo`. Returned for any actor that has `Valued` or
+/// `Buildable` (everything purchasable / sellable / score-bearing).
+#[derive(Debug, Clone)]
+pub struct BuildableInfo {
+    pub name: String,
+    /// `Valued.Cost`. 0 if the actor has no `Valued` trait.
+    pub cost: i32,
+    /// `Buildable.BuildDuration`. `-1` (the OpenRA default) means "derive
+    /// from `cost`" — callers apply the cost fallback + modifiers.
+    pub build_duration: i32,
+    /// `Buildable.BuildDurationModifier` percent (OpenRA default 100).
+    pub build_duration_modifier: i32,
+    /// `Buildable.Queue` tokens (e.g. `["Infantry"]`, `["Building"]`).
+    /// Empty ⇒ not directly producible from a queue.
+    pub queue: Vec<String>,
+    /// `Buildable.Prerequisites` tokens, verbatim (`~hidden`, `!inverted`
+    /// markers preserved for the S5 tech-tree resolver).
+    pub prerequisites: Vec<String>,
+    /// `Power.Amount`: positive provides, negative drains, 0 = none.
+    pub power: i32,
+    /// `Production.Produces` queue tokens this (building) feeds.
+    pub produces: Vec<String>,
+    /// Has a `ProvidesPrerequisite` trait (grants tech to the player).
+    pub provides_prerequisite: bool,
+    /// `Sellable.RefundPercent` (RA default 50). Sell value =
+    /// `cost * refund_percent / 100`.
+    pub refund_percent: i32,
+}
+
+/// Build a `BuildableInfo` from a resolved `ActorInfo`. Returns `None`
+/// for actors that are neither valued nor buildable (pure scenery).
+pub fn buildable_info_from_actor(actor: &ActorInfo) -> Option<BuildableInfo> {
+    let valued = actor.trait_info("Valued");
+    let buildable = actor.trait_info("Buildable");
+    if valued.is_none() && buildable.is_none() {
+        return None;
+    }
+    Some(BuildableInfo {
+        name: actor.name.clone(),
+        cost: valued.and_then(|t| t.get_i32("Cost")).unwrap_or(0),
+        build_duration: buildable
+            .and_then(|t| t.get_i32("BuildDuration"))
+            .unwrap_or(-1),
+        build_duration_modifier: buildable
+            .and_then(|t| t.get_i32("BuildDurationModifier"))
+            .unwrap_or(100),
+        queue: comma_list(buildable.and_then(|t| t.get("Queue"))),
+        prerequisites: comma_list(buildable.and_then(|t| t.get("Prerequisites"))),
+        power: actor
+            .trait_info("Power")
+            .and_then(|t| t.get_i32("Amount"))
+            .unwrap_or(0),
+        produces: comma_list(
+            actor.trait_info("Production").and_then(|t| t.get("Produces")),
+        ),
+        provides_prerequisite: actor.has_trait("ProvidesPrerequisite"),
+        refund_percent: actor
+            .trait_info("Sellable")
+            .and_then(|t| t.get_i32("RefundPercent"))
+            .unwrap_or(50),
+    })
+}
+
 /// Sim-facing typed view over a ruleset. Built from a `Ruleset` via
 /// `Rules::from_ruleset`. Lookups are by uppercase actor/weapon name.
 #[derive(Debug, Clone)]
@@ -427,6 +505,8 @@ pub struct Rules {
     /// Phase-7 — typed view of static buildings keyed by their uppercase
     /// actor name (`"GUN"`, `"PBOX"`, `"TSLA"`, `"FACT"`, …).
     pub buildings: BTreeMap<String, BuildingInfo>,
+    /// F1 — economy/production/tech view keyed by uppercase actor name.
+    pub buildables: BTreeMap<String, BuildableInfo>,
 }
 
 impl Rules {
@@ -439,12 +519,16 @@ impl Rules {
     pub fn from_ruleset(ruleset: &Ruleset) -> Self {
         let mut units = BTreeMap::new();
         let mut buildings = BTreeMap::new();
+        let mut buildables = BTreeMap::new();
         for (name, actor) in &ruleset.actors {
             if let Some(unit) = unit_info_from_actor(actor) {
                 units.insert(name.clone(), unit);
             }
             if let Some(b) = building_info_from_actor(actor) {
                 buildings.insert(name.clone(), b);
+            }
+            if let Some(b) = buildable_info_from_actor(actor) {
+                buildables.insert(name.clone(), b);
             }
         }
         let mut weapons = BTreeMap::new();
@@ -453,7 +537,7 @@ impl Rules {
                 weapons.insert(name.clone(), stats);
             }
         }
-        Rules { units, weapons, buildings }
+        Rules { units, weapons, buildings, buildables }
     }
 
     pub fn unit(&self, name: &str) -> Option<&UnitInfo> {
@@ -469,11 +553,95 @@ impl Rules {
         self.buildings.get(name)
     }
 
+    /// F1 — look up economy/production/tech info by uppercase actor name.
+    pub fn buildable(&self, name: &str) -> Option<&BuildableInfo> {
+        self.buildables.get(name)
+    }
+
+    /// F1 — effective build time in ticks, applying the C# rule:
+    /// `BuildDuration` (or `cost` when -1) × `BuildDurationModifier`%.
+    /// Power / queue / veterancy modifiers are layered by the sim (S3).
+    pub fn build_time(&self, name: &str) -> Option<i32> {
+        let b = self.buildables.get(name)?;
+        let base = if b.build_duration >= 0 {
+            b.build_duration
+        } else {
+            b.cost
+        };
+        Some(base * b.build_duration_modifier / 100)
+    }
+
     /// Convenience: load a Rules from a mod directory (e.g.
     /// `"vendor/OpenRA/mods/ra"`).
     pub fn load(mod_dir: &Path) -> std::io::Result<Self> {
         let ruleset = load_ruleset(mod_dir)?;
         Ok(Self::from_ruleset(&ruleset))
+    }
+}
+
+#[cfg(test)]
+mod buildable_tests {
+    use super::*;
+
+    fn ra_rules() -> Option<Rules> {
+        let vendored = format!(
+            "{}/../vendor/OpenRA/mods/ra",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let dir = Path::new(&vendored);
+        if !dir.exists() {
+            eprintln!("skip: vendored RA mod not found");
+            return None;
+        }
+        Some(Rules::load(dir).unwrap())
+    }
+
+    #[test]
+    fn powr_economy_parity() {
+        let Some(r) = ra_rules() else { return };
+        let p = r.buildable("POWR").expect("POWR buildable");
+        assert_eq!(p.cost, 300, "POWR cost");
+        assert_eq!(p.power, 100, "POWR provides +100 power");
+        assert_eq!(p.queue, vec!["Building"]);
+        assert!(
+            p.prerequisites.iter().any(|x| x == "~techlevel.infonly"),
+            "POWR prereqs {:?}",
+            p.prerequisites
+        );
+    }
+
+    #[test]
+    fn barr_production_and_tech_parity() {
+        let Some(r) = ra_rules() else { return };
+        let b = r.buildable("BARR").expect("BARR buildable");
+        assert_eq!(b.cost, 500, "BARR cost");
+        assert_eq!(b.produces, vec!["Infantry", "Soldier"], "BARR produces");
+        assert!(b.provides_prerequisite, "BARR grants a prerequisite");
+        assert_eq!(b.queue, vec!["Building"]);
+    }
+
+    #[test]
+    fn e1_buildable_parity_and_build_time() {
+        let Some(r) = ra_rules() else { return };
+        let e1 = r.buildable("E1").expect("E1 buildable");
+        assert_eq!(e1.cost, 100, "E1 cost");
+        assert_eq!(e1.queue, vec!["Infantry"]);
+        assert!(
+            e1.prerequisites.iter().any(|x| x == "~barracks"),
+            "E1 prereqs {:?}",
+            e1.prerequisites
+        );
+        // BuildDuration unset ⇒ -1 ⇒ derive from cost; modifier default 100.
+        assert_eq!(e1.build_duration, -1);
+        assert_eq!(e1.build_duration_modifier, 100);
+        assert_eq!(r.build_time("E1"), Some(100), "E1 build time = cost");
+    }
+
+    #[test]
+    fn refund_defaults_to_50_percent() {
+        let Some(r) = ra_rules() else { return };
+        // POWR has no explicit Sellable.RefundPercent ⇒ RA default 50.
+        assert_eq!(r.buildable("POWR").unwrap().refund_percent, 50);
     }
 }
 
