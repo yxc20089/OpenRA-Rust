@@ -378,6 +378,10 @@ pub struct MapDef {
     /// preserve behaviour for production scenarios that rely on the
     /// MCV-deploy → Construction-Yard build chain.
     pub spawn_mcvs: bool,
+    /// Per-scenario starting cash for every player (designed economy
+    /// constraint). Defaults to 5000 (OpenRA skirmish default) when the
+    /// scenario omits `starting_cash:`.
+    pub starting_cash: i32,
 }
 
 impl MapDef {
@@ -568,6 +572,7 @@ pub fn load_rush_hour_map_with_spawn(
         enemy_faction: scenario.enemy_faction,
         actors,
         spawn_mcvs: scenario.spawn_mcvs.unwrap_or(true),
+        starting_cash: scenario.starting_cash.unwrap_or(5000),
     })
 }
 
@@ -584,6 +589,10 @@ struct ScenarioYaml {
     /// engine side) for back-compat. Set `spawn_mcvs: false` in the
     /// scenario YAML to suppress the auto-MCV-per-player.
     spawn_mcvs: Option<bool>,
+    /// Top-level `starting_cash:` — designed economy constraint. None ⇒
+    /// engine default (5000, the OpenRA skirmish default). Contributors
+    /// set this to gate economy/production difficulty.
+    starting_cash: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -663,6 +672,15 @@ fn parse_scenario_yaml(text: &str) -> io::Result<ScenarioYaml> {
                     let (actors, ni) = read_actors_list(&lines, i + 1, detected_indent);
                     out.actors = actors;
                     i = ni;
+                    continue;
+                }
+                "starting_cash" => {
+                    out.starting_cash = v
+                        .trim()
+                        .trim_matches(|c: char| c == '"' || c == '\'')
+                        .parse()
+                        .ok();
+                    i += 1;
                     continue;
                 }
                 "spawn_mcvs" => {

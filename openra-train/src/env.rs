@@ -705,7 +705,10 @@ impl Env {
         };
 
         let lobby = LobbyInfo {
-            starting_cash: 0,
+            // Designed economy constraint from the scenario (default
+            // 5000 = OpenRA skirmish default). Was hardcoded 0, which
+            // starved all production/economy scenarios.
+            starting_cash: self.map_def.starting_cash,
             allow_spectators: true,
             occupied_slots: vec![
                 SlotInfo {
@@ -1624,6 +1627,7 @@ pub fn build_test_env_with_no_enemies(map_size: (i32, i32), seed: u64) -> Env {
             position: (5, 5),
         }],
         spawn_mcvs: true,
+        starting_cash: 5000,
     };
     let mut env = Env {
         scenario_path: PathBuf::from("<test>"),
