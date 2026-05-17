@@ -792,6 +792,34 @@ impl Env {
         // assigned by `build_world` so nothing collides.
         let mut next_id = scenario_id_seed(&world);
         for sa in self.map_def.actors.iter() {
+            // Resource source: a `mine`/`gmine` is a neutral map prop
+            // (no owner). Scenario actors are injected here AFTER
+            // build_world, so build_world's ore-seeding never sees
+            // them — seed the ore patch into the live terrain now so
+            // harvesters can find it.
+            if sa.actor_type == "mine" || sa.actor_type == "gmine" {
+                let (mx, my) = sa.position;
+                let r: i32 = 5;
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        if dx * dx + dy * dy > r * r || (dx == 0 && dy == 0) {
+                            continue;
+                        }
+                        let (x, y) = (mx + dx, my + dy);
+                        if world.terrain.contains(x, y)
+                            && world.terrain.is_terrain_passable(x, y)
+                        {
+                            world.terrain.set_resource(
+                                x,
+                                y,
+                                openra_sim::terrain::ResourceType::Ore,
+                                50,
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
             let owner = match sa.owner.as_str() {
                 "agent" => agent_pid,
                 "enemy" => enemy_pid,
