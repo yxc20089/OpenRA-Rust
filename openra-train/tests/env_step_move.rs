@@ -44,9 +44,12 @@ fn move_command_advances_unit_positions() {
         .map(|(id, p)| (id.clone(), (p.cell_x, p.cell_y)))
         .expect("expected ≥ 1 own unit at reset");
 
-    // Target: same row but ~30 cells east.
-    let target_x = start_pos.0 + 30;
-    let target_y = start_pos.1;
+    // Target ~25 cells toward the map interior. The chosen seed can spawn
+    // the first unit at the east edge (x~120 on the ~128-wide rush-hour
+    // map), so a blind +30 east would be off-map and the engine
+    // correctly refuses to path off-map (C# parity).
+    let target_x = if start_pos.0 > 64 { start_pos.0 - 25 } else { start_pos.0 + 25 };
+    let target_y = start_pos.1.clamp(3, 36);
 
     let cmd = Command::MoveUnits {
         unit_ids: vec![pick_id.clone()],
@@ -84,10 +87,13 @@ fn move_command_advances_unit_positions() {
         "unit {pick_id} should have moved from {start_pos:?} after a Move order"
     );
 
-    // Should be advancing toward the target (eastward).
+    // Should be advancing toward the target (direction depends on
+    // which side of the map the seed spawned this unit).
+    let d_start = (target_x - start_pos.0).abs() + (target_y - start_pos.1).abs();
+    let d_end = (target_x - last_pos.0).abs() + (target_y - last_pos.1).abs();
     assert!(
-        last_pos.0 > start_pos.0,
-        "expected eastward progress: started {start_pos:?}, ended {last_pos:?}"
+        d_end < d_start,
+        "expected progress toward ({target_x},{target_y}): {start_pos:?} -> {last_pos:?}"
     );
 }
 

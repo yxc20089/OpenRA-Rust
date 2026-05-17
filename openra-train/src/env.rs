@@ -279,6 +279,14 @@ impl Env {
             Some(w) => has_must_be_destroyed_buildings(w, self.enemy_player_id),
             None => false,
         };
+        // Reveal the shroud around starting units *before* the first
+        // observation — OpenRA grants sight at game start (units have
+        // RevealsShroud), so explored_percent must be > 0 at reset, not
+        // only after the first step (which is the only other caller of
+        // update_typed_shroud_all_players).
+        if let Some(w) = self.world.as_mut() {
+            w.update_typed_shroud_all_players();
+        }
         self.refresh_explored_cells();
         self.observation()
     }
