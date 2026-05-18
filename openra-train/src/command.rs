@@ -22,6 +22,8 @@ pub enum Command {
     AttackUnit { unit_ids: Vec<String>, target_id: String },
     /// Move toward a cell while engaging hostiles along the way.
     AttackMove { unit_ids: Vec<String>, target_x: i32, target_y: i32 },
+    /// Follow and protect a friendly actor (C# Guard — follow subset).
+    Guard { unit_ids: Vec<String>, target_id: String },
     /// Cancel current activity (go idle).
     Stop { unit_ids: Vec<String> },
     /// Transform an MCV into a construction yard.
@@ -79,6 +81,11 @@ impl PyCommand {
     #[staticmethod]
     fn attack_move(unit_ids: Vec<String>, target_x: i32, target_y: i32) -> Self {
         Self { inner: Command::AttackMove { unit_ids, target_x, target_y } }
+    }
+
+    #[staticmethod]
+    fn guard(unit_ids: Vec<String>, target_id: String) -> Self {
+        Self { inner: Command::Guard { unit_ids, target_id } }
     }
 
     #[staticmethod]

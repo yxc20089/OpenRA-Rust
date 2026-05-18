@@ -1017,6 +1017,28 @@ impl Env {
                         });
                     }
                 }
+                Command::Guard { unit_ids, target_id } => {
+                    let target_aid = match parse_actor_id(target_id) {
+                        Some(v) => v,
+                        None => {
+                            self.last_warnings
+                                .push(format!("invalid target_id {target_id:?}"));
+                            continue;
+                        }
+                    };
+                    for id in unit_ids {
+                        if let Some(aid) =
+                            resolve_owned(id, &agent_owned, &mut self.last_warnings)
+                        {
+                            orders.push(GameOrder {
+                                order_string: "Guard".into(),
+                                subject_id: Some(aid),
+                                target_string: None,
+                                extra_data: Some(target_aid),
+                            });
+                        }
+                    }
+                }
                 Command::AttackMove { unit_ids, target_x, target_y } => {
                     for id in unit_ids {
                         if let Some(aid) =

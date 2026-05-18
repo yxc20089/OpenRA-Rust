@@ -507,6 +507,7 @@ impl World {
                 Some(Activity::Move { .. }) => "moving",
                 Some(Activity::Turn { .. }) => "turning",
                 Some(Activity::Attack { .. }) => "attacking",
+                Some(Activity::Guard { .. }) => "guarding",
                 Some(Activity::Harvest { .. }) => "harvesting",
             }.to_string();
             let (facing, cx, cy) = actor.traits.iter().find_map(|t| {
@@ -805,6 +806,13 @@ impl World {
                         // Explicit agent/player order — overrides stance.
                         self.order_attack(subject_id, target_actor_id, false);
                     }
+                }
+            }
+            "Guard" => {
+                if let (Some(subject_id), Some(target_actor_id)) =
+                    (order.subject_id, order.extra_data)
+                {
+                    self.order_guard(subject_id, target_actor_id);
                 }
             }
             "PlaceBuilding" => {
@@ -1146,6 +1154,31 @@ impl World {
                 burst,
                 burst_remaining: burst,
                 auto_acquired,
+            });
+        }
+    }
+
+    /// Order an actor to GUARD a friendly target actor — follow it and
+    /// stay within a small leash radius. C# `Guard`/`GuardActivity`
+    /// (follow subset). Validation (ownership, target existence) is
+    /// done at the env layer; here we only require both actors to
+    /// exist and be mobile-capable.
+    fn order_guard(&mut self, actor_id: u32, target_id: u32) {
+        if actor_id == target_id {
+            return; // can't guard yourself
+        }
+        if !self.actors.contains_key(&target_id) {
+            return;
+        }
+        let speed = self.actor_speed(actor_id);
+        if speed <= 0 {
+            return; // immobile actors can't guard
+        }
+        if let Some(actor) = self.actors.get_mut(&actor_id) {
+            actor.activity = Some(Activity::Guard {
+                target_id,
+                leash: 2,
+                speed,
             });
         }
     }
@@ -1899,6 +1932,82 @@ impl World {
             for id in abandon {
                 if let Some(actor) = self.actors.get_mut(&id) {
                     actor.activity = None;
+                }
+            }
+        }
+
+        // ── Guard: follow the guarded actor ────────────────────────────
+        // C# GuardActivity keeps the guard within `range` of its target,
+        // repathing when it drifts outside. We step one cell/tick toward
+        // a cell adjacent to the guarded actor whenever the Chebyshev
+        // gap exceeds `leash`. If the guarded actor is gone, go idle
+        // (the next briefing lets the agent re-decide). When already
+        // inside leash the guard holds position (so it can still be
+        // picked up by the stance auto-engage scan as "idle-equivalent"
+        // is NOT done — guarding units don't opportunistically wander;
+        // C# Guard layers AttackFollow on top, a documented gap).
+        {
+            let mut guard_steps: Vec<(u32, (i32, i32), (i32, i32))> = Vec::new();
+            let mut guard_drop: Vec<u32> = Vec::new();
+            for (id, actor) in &self.actors {
+                let (target_id, leash) = match actor.activity {
+                    Some(Activity::Guard { target_id, leash, .. }) => (target_id, leash),
+                    _ => continue,
+                };
+                let from = match actor.location {
+                    Some(l) => l,
+                    None => continue,
+                };
+                let tgt_loc = match self.actors.get(&target_id).and_then(|a| a.location) {
+                    Some(l) => l,
+                    None => {
+                        guard_drop.push(*id);
+                        continue;
+                    }
+                };
+                let gap = (from.0 - tgt_loc.0).abs().max((from.1 - tgt_loc.1).abs());
+                if gap <= leash {
+                    continue; // close enough — hold
+                }
+                let dest = self
+                    .find_adjacent_passable(tgt_loc, *id)
+                    .unwrap_or(tgt_loc);
+                if let Some(path) =
+                    pathfinder::find_path(&self.terrain, from, dest, Some(*id))
+                {
+                    if path.len() > 1 {
+                        guard_steps.push((*id, from, path[1]));
+                    }
+                }
+            }
+            for id in guard_drop {
+                if let Some(actor) = self.actors.get_mut(&id) {
+                    actor.activity = None;
+                }
+            }
+            for (id, from, next_cell) in guard_steps {
+                let occ = self.terrain.occupant(next_cell.0, next_cell.1);
+                if occ == 0 || occ == id {
+                    self.terrain.clear_occupant(from.0, from.1);
+                    self.terrain.set_occupant(next_cell.0, next_cell.1, id);
+                    if let Some(actor) = self.actors.get_mut(&id) {
+                        actor.location = Some(next_cell);
+                        for t in &mut actor.traits {
+                            if let TraitState::Mobile {
+                                center_position,
+                                from_cell,
+                                to_cell,
+                                ..
+                            } = t
+                            {
+                                *center_position =
+                                    center_of_cell(next_cell.0, next_cell.1);
+                                *from_cell = CPos::new(next_cell.0, next_cell.1);
+                                *to_cell = CPos::new(next_cell.0, next_cell.1);
+                                break;
+                            }
+                        }
+                    }
                 }
             }
         }

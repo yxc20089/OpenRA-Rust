@@ -52,6 +52,16 @@ pub enum Activity {
         /// faithful to C# AttackBase / AutoTarget.
         auto_acquired: bool,
     },
+    /// Guard a friendly actor: stay within `leash` cells of it,
+    /// repathing toward it whenever it drifts out of `leash`. C#
+    /// `GuardActivity` / `Guard` trait (follow subset). `speed` is the
+    /// guard's movement speed (world units/tick) reused for the
+    /// internal chase Move.
+    Guard {
+        target_id: u32,
+        leash: i32,
+        speed: i32,
+    },
     /// Harvest resources: find ore → move → harvest → deliver → repeat.
     Harvest {
         state: HarvestState,
