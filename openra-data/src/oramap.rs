@@ -319,6 +319,10 @@ pub struct ScenarioActor {
     /// Cell coordinates `(x, y)`. The scenario YAML uses cell units (1 cell
     /// per integer step), the same convention as `MapActor::location`.
     pub position: (i32, i32),
+    /// Optional initial engagement stance:
+    /// 0=HoldFire, 1=ReturnFire, 2=Defend, 3=AttackAnything.
+    /// `None` means "use the engine default" (AttackAnything).
+    pub stance: Option<u8>,
 }
 
 impl ScenarioActor {
@@ -602,6 +606,7 @@ struct RawScenarioActor {
     position: (i32, i32),
     count: i32,
     spawn_point: Option<i32>,
+    stance: Option<u8>,
 }
 
 /// Parse the discovery-style scenario YAML.
@@ -803,6 +808,7 @@ fn read_actors_list(
                 position: (0, 0),
                 count: 1,
                 spawn_point: None,
+                stance: None,
             };
             if let Some((k, v)) = split_key_value(rest)
                 && k == "type"
@@ -838,7 +844,9 @@ fn read_actors_list(
                     Some(("spawn_point", v)) => {
                         actor.spawn_point = v.parse().ok();
                     }
-                    Some(("stance", _)) => { /* sim doesn't use this yet */ }
+                    Some(("stance", v)) => {
+                        actor.stance = v.trim().parse::<u8>().ok().map(|s| s.min(3));
+                    }
                     Some(("position", "")) => {
                         // 2-element list on the next two lines, at indent
                         // sub_indent (sibling lines that start with `- N`).
@@ -989,6 +997,7 @@ fn expand_scenario_actors(raw: &[RawScenarioActor], spawn_point: i32) -> Vec<Sce
                 actor_type: r.actor_type.clone(),
                 owner: r.owner.clone(),
                 position: r.position,
+                stance: r.stance,
             });
         }
     }

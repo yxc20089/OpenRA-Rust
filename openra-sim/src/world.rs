@@ -802,7 +802,8 @@ impl World {
             "Attack" => {
                 if let Some(subject_id) = order.subject_id {
                     if let Some(target_actor_id) = order.extra_data {
-                        self.order_attack(subject_id, target_actor_id);
+                        // Explicit agent/player order — overrides stance.
+                        self.order_attack(subject_id, target_actor_id, false);
                     }
                 }
             }
@@ -1113,7 +1114,15 @@ impl World {
     }
 
     /// Handle an Attack order: set attack activity with weapon stats from rules.
-    fn order_attack(&mut self, actor_id: u32, target_id: u32) {
+    fn order_attack(&mut self, actor_id: u32, target_id: u32, auto_acquired: bool) {
+        // Faithful HoldFire: an *auto-acquired* engagement is suppressed
+        // outright when the actor's stance is HoldFire(0). Explicit
+        // (order-issued) attacks always proceed — player/agent intent
+        // overrides stance, exactly like C# AttackBase.OnQueueAttack vs
+        // AutoTarget's opportunistic acquisition.
+        if auto_acquired && self.stances.get(&actor_id).copied().unwrap_or(3) == 0 {
+            return;
+        }
         // Look up attacker's primary weapon from rules
         let weapon = self.actors.get(&actor_id)
             .and_then(|a| a.actor_type.as_deref())
@@ -1136,6 +1145,7 @@ impl World {
                 reload_remaining: 0,
                 burst,
                 burst_remaining: burst,
+                auto_acquired,
             });
         }
     }
@@ -1867,6 +1877,32 @@ impl World {
         // any move past an enemy permanently divert into combat — agents
         // had no way to issue a second move to escape, because the next
         // tick's auto-engage scan would re-grab them.
+        // ── Faithful HoldFire abandonment ──────────────────────────────
+        // C# AutoTarget cancels an opportunistically-acquired attack the
+        // moment the unit's stance no longer permits it. Gating only at
+        // acquisition is insufficient: the env's reset warmup frame runs
+        // one auto-engage scan BEFORE the agent can issue SET_STANCE, so
+        // a unit can already hold an auto-acquired Attack when HoldFire
+        // is later set. Every tick, drop any auto-acquired Attack whose
+        // owner is now on HoldFire(0) and return the unit to idle.
+        // Order-issued attacks (auto_acquired=false) are never touched —
+        // explicit agent intent always overrides stance.
+        {
+            let mut abandon: Vec<u32> = Vec::new();
+            for (id, actor) in &self.actors {
+                if let Some(Activity::Attack { auto_acquired: true, .. }) = actor.activity {
+                    if self.stances.get(id).copied().unwrap_or(3) == 0 {
+                        abandon.push(*id);
+                    }
+                }
+            }
+            for id in abandon {
+                if let Some(actor) = self.actors.get_mut(&id) {
+                    actor.activity = None;
+                }
+            }
+        }
+
         let mut engage_pairs: Vec<(u32, u32)> = Vec::new();
         for (id, actor) in &self.actors {
             if actor.activity.is_some() {
@@ -1939,7 +1975,8 @@ impl World {
         // Apply: Move → Attack. After the target dies, the unit goes
         // idle and the next briefing prompts the agent to re-decide.
         for (attacker, target) in engage_pairs {
-            self.order_attack(attacker, target);
+            // Idle opportunistic engagement — auto-acquired.
+            self.order_attack(attacker, target, true);
         }
 
         // Tick Move activities: advance position along path.
@@ -2148,6 +2185,11 @@ impl World {
             }
         }
         for (aid, tid, damage, range_cells, reload, burst) in new_defense_attacks {
+            // Faithful HoldFire: a defensive auto-scan is auto-acquired,
+            // so a HoldFire(0) building never engages.
+            if self.stances.get(&aid).copied().unwrap_or(3) == 0 {
+                continue;
+            }
             if let Some(actor) = self.actors.get_mut(&aid) {
                 actor.activity = Some(Activity::Attack {
                     target_id: tid,
@@ -2157,6 +2199,7 @@ impl World {
                     reload_remaining: 0,
                     burst,
                     burst_remaining: burst,
+                    auto_acquired: true,
                 });
             }
         }
@@ -3897,6 +3940,13 @@ pub fn remove_test_actor(world: &mut World, id: u32) -> Option<Actor> {
 #[doc(hidden)]
 pub fn all_actor_ids(world: &World) -> Vec<u32> {
     world.actors.keys().copied().collect()
+}
+
+/// Set an actor's initial engagement stance (0=HoldFire, 1=ReturnFire,
+/// 2=Defend, 3=AttackAnything). Used by scenario injection to honour a
+/// per-actor `stance:` field. Mirrors the in-game SetStance order.
+pub fn set_actor_stance(world: &mut World, actor_id: u32, stance: u8) {
+    world.stances.insert(actor_id, stance.min(3));
 }
 
 /// Test-only: lift the world's "paused" flag so subsequent

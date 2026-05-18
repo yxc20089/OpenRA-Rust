@@ -104,3 +104,25 @@ multi-iteration effort. Order above is value-and-dependency optimal:
 F→S5 unlocks economy/production/tech (the bench's missing scenario
 families); S6–S8 broaden unit/ability coverage; S10 unlocks arbitrary
 maps. Progress is shipped per-subsystem with green tests, not big-bang.
+
+## Progress log (per-subsystem, green-committed)
+
+- **S7 — FAITHFUL HoldFire** (task #10) ✅
+  C# AttackBase/AutoTarget parity. `Activity::Attack` now carries an
+  `auto_acquired` flag (true = idle auto-engage / defensive-building
+  scan; false = explicit agent/player "Attack" order). Three gates:
+  (1) `order_attack` refuses an auto-acquired engagement under
+  HoldFire(0); (2) every `tick_actors` an *abandonment* pass drops any
+  auto-acquired Attack whose owner is now on HoldFire (handles the env
+  reset-warmup frame that auto-engages before the agent can SET_STANCE
+  — the documented root cause); (3) defensive-building auto-scan
+  skips HoldFire owners. Explicit `attack_unit` always overrides
+  stance (player intent wins). Scenario YAML per-actor `stance:` is
+  now parsed (was discarded) and applied to the world before the
+  warmup frame via `world::set_actor_stance`.
+  Integ test: `openra-train/tests/env_holdfire.rs` — HoldFire deals
+  ZERO damage to an adjacent enemy over 200 steps; a no-stance control
+  DOES damage it; explicit attack_unit under HoldFire STILL attacks.
+  Honest gap: faithful ReturnFire(1) retaliation is not asserted by a
+  dedicated test (documented in the test header; ReturnFire/Defend/
+  AttackAnything behaviour otherwise unchanged).

@@ -43,6 +43,14 @@ pub enum Activity {
         reload_remaining: i32, // ticks until next shot
         burst: i32,            // shots per reload cycle
         burst_remaining: i32,  // shots left in current burst
+        /// `true` when this Attack was acquired by auto-target /
+        /// opportunistic engagement (idle auto-engage, defensive
+        /// building scan). `false` when it came from an explicit
+        /// agent/player "Attack" order. HoldFire stance abandons
+        /// auto-acquired attacks every tick but NEVER cancels an
+        /// order-issued one (player intent overrides stance) —
+        /// faithful to C# AttackBase / AutoTarget.
+        auto_acquired: bool,
     },
     /// Harvest resources: find ore → move → harvest → deliver → repeat.
     Harvest {

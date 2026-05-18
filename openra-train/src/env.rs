@@ -877,6 +877,13 @@ impl Env {
             };
             let actor = build_scenario_actor(next_id, sa, owner, &world);
             world::insert_test_actor(&mut world, actor);
+            // Honour an optional per-actor `stance:` from the scenario
+            // (e.g. an enemy spawned on HoldFire so it won't pre-empt
+            // the agent). Applied BEFORE the reset warmup frame so the
+            // first auto-engage scan already respects it.
+            if let Some(s) = sa.stance {
+                world::set_actor_stance(&mut world, next_id, s);
+            }
             // Phase 8 — attach Vehicle + Turret typed components for
             // vehicle actors (2tnk, 1tnk, 3tnk, jeep, apc, harv, mcv).
             // Static defenses with turrets (gun) carry their own
@@ -1832,6 +1839,7 @@ pub fn build_test_env_with_no_enemies(map_size: (i32, i32), seed: u64) -> Env {
             actor_type: "e1".into(),
             owner: "agent".into(),
             position: (5, 5),
+            stance: None,
         }],
         spawn_mcvs: true,
         starting_cash: 5000,
