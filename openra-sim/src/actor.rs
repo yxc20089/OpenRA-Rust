@@ -62,6 +62,13 @@ pub enum Activity {
         leash: i32,
         speed: i32,
     },
+    /// Move to a transport actor and board it (C# `EnterTransport` /
+    /// `Cargo`). When the passenger reaches a cell adjacent to the
+    /// transport it is removed from the world and stored as cargo.
+    EnterTransport {
+        transport_id: u32,
+        speed: i32,
+    },
     /// Harvest resources: find ore → move → harvest → deliver → repeat.
     Harvest {
         state: HarvestState,

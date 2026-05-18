@@ -27,6 +27,10 @@ pub enum Command {
     /// Designate a production building as PRIMARY for its type
     /// (C# PrimaryBuilding). `unit_ids` carries the building id(s).
     SetPrimary { unit_ids: Vec<String> },
+    /// Order passenger units to board a transport actor (C# Cargo).
+    EnterTransport { unit_ids: Vec<String>, target_id: String },
+    /// Order transport(s) to eject all carried passengers (C# Unload).
+    Unload { unit_ids: Vec<String> },
     /// Cancel current activity (go idle).
     Stop { unit_ids: Vec<String> },
     /// Transform an MCV into a construction yard.
@@ -94,6 +98,16 @@ impl PyCommand {
     #[staticmethod]
     fn set_primary(unit_ids: Vec<String>) -> Self {
         Self { inner: Command::SetPrimary { unit_ids } }
+    }
+
+    #[staticmethod]
+    fn enter_transport(unit_ids: Vec<String>, target_id: String) -> Self {
+        Self { inner: Command::EnterTransport { unit_ids, target_id } }
+    }
+
+    #[staticmethod]
+    fn unload(unit_ids: Vec<String>) -> Self {
+        Self { inner: Command::Unload { unit_ids } }
     }
 
     #[staticmethod]

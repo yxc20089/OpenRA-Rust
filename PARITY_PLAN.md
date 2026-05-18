@@ -156,3 +156,24 @@ maps. Progress is shipped per-subsystem with green tests, not big-bang.
   non-owned id warns.
   Honest gap: C# also routes the production EXIT cell through the
   primary — we assert spawn-building preference + the flag only.
+
+- **S7 — cargo: ENTER_TRANSPORT / UNLOAD** (task #10 cont.) ✅
+  C# `Cargo`/`Passenger` (count-capacity subset). World gains
+  `cargo: HashMap<u32, Vec<Actor>>` (boarded passenger Actors stashed
+  out of the active map). New `Activity::EnterTransport`: the
+  passenger paths to a cell adjacent to the transport then boards
+  (removed from world + terrain, pushed to cargo; capacity re-checked
+  at board time). `order_unload` ejects every passenger onto the
+  nearest free passable cell. `transport_capacity` (apc/lst/tran = 5),
+  `transport_cargo` query (pub). Commands EnterTransport/Unload +
+  Python shims + env plumbing: target/ownership validation and an
+  explicit over-capacity warning (rejected, not silently dropped).
+  Bench: `enter_transport` + `unload` tool schemas + `_to_commands`
+  dispatch, congruence 1:1 (wildcard count 19→21). Integ test
+  `openra-train/tests/env_cargo.rs`: two e1 board an APC (cease to be
+  standalone actors, reported as cargo), UNLOAD restores them; bad
+  ids warn.
+  Honest gap: per-passenger weight classes (C# Passenger.Weight /
+  Cargo.MaxWeight) — we count units, not weighted slots; firing
+  while loaded / load-unload animation out of scope (documented in
+  test header).

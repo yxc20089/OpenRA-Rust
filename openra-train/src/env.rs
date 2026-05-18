@@ -1053,6 +1053,53 @@ impl Env {
                         }
                     }
                 }
+                Command::EnterTransport { unit_ids, target_id } => {
+                    let target_aid = match parse_actor_id(target_id) {
+                        Some(v) => v,
+                        None => {
+                            self.last_warnings
+                                .push(format!("invalid target_id {target_id:?}"));
+                            continue;
+                        }
+                    };
+                    let cap = world.transport_capacity(target_aid) as usize;
+                    let already = world.transport_cargo(target_aid).len();
+                    let mut accepted = 0usize;
+                    for id in unit_ids {
+                        if let Some(aid) =
+                            resolve_owned(id, &agent_owned, &mut self.last_warnings)
+                        {
+                            if already + accepted >= cap {
+                                self.last_warnings.push(format!(
+                                    "transport {target_aid} full (capacity {cap}); \
+                                     passenger {aid} rejected"
+                                ));
+                                continue;
+                            }
+                            accepted += 1;
+                            orders.push(GameOrder {
+                                order_string: "EnterTransport".into(),
+                                subject_id: Some(aid),
+                                target_string: None,
+                                extra_data: Some(target_aid),
+                            });
+                        }
+                    }
+                }
+                Command::Unload { unit_ids } => {
+                    for id in unit_ids {
+                        if let Some(aid) =
+                            resolve_owned(id, &agent_owned, &mut self.last_warnings)
+                        {
+                            orders.push(GameOrder {
+                                order_string: "Unload".into(),
+                                subject_id: Some(aid),
+                                target_string: None,
+                                extra_data: None,
+                            });
+                        }
+                    }
+                }
                 Command::AttackMove { unit_ids, target_x, target_y } => {
                     for id in unit_ids {
                         if let Some(aid) =

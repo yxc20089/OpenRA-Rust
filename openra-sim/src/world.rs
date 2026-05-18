@@ -289,6 +289,9 @@ pub struct World {
     repairing: HashSet<u32>,
     /// Rally points per building actor ID.
     rally_points: HashMap<u32, (i32, i32)>,
+    /// Cargo: transport actor id → boarded passenger Actors (stashed
+    /// out of the active `actors` map while carried). C# `Cargo`.
+    cargo: HashMap<u32, Vec<Actor>>,
     /// Building actor IDs flagged PRIMARY for production
     /// (C# `PrimaryBuilding`). At most one per (owner, building-type):
     /// produced units of that category spawn from / rally through the
@@ -513,6 +516,7 @@ impl World {
                 Some(Activity::Turn { .. }) => "turning",
                 Some(Activity::Attack { .. }) => "attacking",
                 Some(Activity::Guard { .. }) => "guarding",
+                Some(Activity::EnterTransport { .. }) => "entering",
                 Some(Activity::Harvest { .. }) => "harvesting",
             }.to_string();
             let (facing, cx, cy) = actor.traits.iter().find_map(|t| {
@@ -818,6 +822,18 @@ impl World {
                     (order.subject_id, order.extra_data)
                 {
                     self.order_guard(subject_id, target_actor_id);
+                }
+            }
+            "EnterTransport" => {
+                if let (Some(subject_id), Some(target_actor_id)) =
+                    (order.subject_id, order.extra_data)
+                {
+                    self.order_enter_transport(subject_id, target_actor_id);
+                }
+            }
+            "Unload" => {
+                if let Some(subject_id) = order.subject_id {
+                    self.order_unload(subject_id);
                 }
             }
             "PlaceBuilding" => {
@@ -1190,6 +1206,88 @@ impl World {
                 leash: 2,
                 speed,
             });
+        }
+    }
+
+    /// Order a passenger-capable actor to walk to and board a
+    /// transport (C# `EnterTransport`). Capacity is checked again at
+    /// board time (other passengers may fill it en route).
+    fn order_enter_transport(&mut self, actor_id: u32, transport_id: u32) {
+        if actor_id == transport_id {
+            return;
+        }
+        if !self.is_passenger_capable(actor_id) {
+            return;
+        }
+        if self.transport_capacity(transport_id) == 0 {
+            return; // not a transport
+        }
+        if !self.actors.contains_key(&transport_id) {
+            return;
+        }
+        let speed = self.actor_speed(actor_id);
+        if let Some(actor) = self.actors.get_mut(&actor_id) {
+            actor.activity = Some(Activity::EnterTransport {
+                transport_id,
+                speed,
+            });
+        }
+    }
+
+    /// Order a transport to eject all its passengers onto passable
+    /// cells adjacent to it (C# `UnloadCargo`).
+    fn order_unload(&mut self, transport_id: u32) {
+        let passengers = match self.cargo.remove(&transport_id) {
+            Some(p) if !p.is_empty() => p,
+            _ => return,
+        };
+        let base = match self.actors.get(&transport_id).and_then(|a| a.location) {
+            Some(l) => l,
+            None => {
+                // Transport gone — drop cargo silently (it died with it).
+                return;
+            }
+        };
+        for mut passenger in passengers {
+            // Find a free passable cell near the transport.
+            let mut placed = None;
+            'search: for r in 1..=4 {
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        let (cx, cy) = (base.0 + dx, base.1 + dy);
+                        if !self.terrain.is_passable(cx, cy) {
+                            continue;
+                        }
+                        if self.terrain.occupant(cx, cy) != 0 {
+                            continue;
+                        }
+                        placed = Some((cx, cy));
+                        break 'search;
+                    }
+                }
+            }
+            let cell = match placed {
+                Some(c) => c,
+                None => base, // fallback: stack on the transport cell
+            };
+            passenger.location = Some(cell);
+            for t in &mut passenger.traits {
+                if let TraitState::Mobile {
+                    center_position,
+                    from_cell,
+                    to_cell,
+                    ..
+                } = t
+                {
+                    *center_position = center_of_cell(cell.0, cell.1);
+                    *from_cell = CPos::new(cell.0, cell.1);
+                    *to_cell = CPos::new(cell.0, cell.1);
+                }
+            }
+            passenger.activity = None;
+            let pid = passenger.id;
+            self.terrain.set_occupant(cell.0, cell.1, pid);
+            self.actors.insert(pid, passenger);
         }
     }
 
@@ -2047,6 +2145,99 @@ impl World {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        // ── EnterTransport: walk to transport, then board ──────────────
+        // C# EnterTransport: move adjacent to the transport, then the
+        // passenger is removed from the world and stashed as cargo
+        // (capacity re-checked at board time). If the transport is gone
+        // the passenger goes idle.
+        {
+            let mut step_moves: Vec<(u32, (i32, i32), (i32, i32))> = Vec::new();
+            let mut board: Vec<(u32, u32)> = Vec::new(); // (passenger, transport)
+            let mut drop_idle: Vec<u32> = Vec::new();
+            for (id, actor) in &self.actors {
+                let transport_id = match actor.activity {
+                    Some(Activity::EnterTransport { transport_id, .. }) => transport_id,
+                    _ => continue,
+                };
+                let from = match actor.location {
+                    Some(l) => l,
+                    None => continue,
+                };
+                let tloc = match self.actors.get(&transport_id).and_then(|a| a.location)
+                {
+                    Some(l) => l,
+                    None => {
+                        drop_idle.push(*id);
+                        continue;
+                    }
+                };
+                let gap = (from.0 - tloc.0).abs().max((from.1 - tloc.1).abs());
+                if gap <= 1 {
+                    board.push((*id, transport_id));
+                } else {
+                    let dest = self
+                        .find_adjacent_passable(tloc, *id)
+                        .unwrap_or(tloc);
+                    if let Some(path) =
+                        pathfinder::find_path(&self.terrain, from, dest, Some(*id))
+                    {
+                        if path.len() > 1 {
+                            step_moves.push((*id, from, path[1]));
+                        }
+                    }
+                }
+            }
+            for id in drop_idle {
+                if let Some(a) = self.actors.get_mut(&id) {
+                    a.activity = None;
+                }
+            }
+            for (id, from, next_cell) in step_moves {
+                let occ = self.terrain.occupant(next_cell.0, next_cell.1);
+                if occ == 0 || occ == id {
+                    self.terrain.clear_occupant(from.0, from.1);
+                    self.terrain.set_occupant(next_cell.0, next_cell.1, id);
+                    if let Some(actor) = self.actors.get_mut(&id) {
+                        actor.location = Some(next_cell);
+                        for t in &mut actor.traits {
+                            if let TraitState::Mobile {
+                                center_position,
+                                from_cell,
+                                to_cell,
+                                ..
+                            } = t
+                            {
+                                *center_position =
+                                    center_of_cell(next_cell.0, next_cell.1);
+                                *from_cell = CPos::new(next_cell.0, next_cell.1);
+                                *to_cell = CPos::new(next_cell.0, next_cell.1);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            for (pid, tid) in board {
+                let cap = self.transport_capacity(tid) as usize;
+                let cur = self.cargo.get(&tid).map(|v| v.len()).unwrap_or(0);
+                if cur >= cap {
+                    // Full — abandon the attempt (go idle); the env
+                    // layer surfaced the capacity warning at order time.
+                    if let Some(a) = self.actors.get_mut(&pid) {
+                        a.activity = None;
+                    }
+                    continue;
+                }
+                if let Some(mut passenger) = self.actors.remove(&pid) {
+                    if let Some(loc) = passenger.location {
+                        self.terrain.clear_occupant(loc.0, loc.1);
+                    }
+                    passenger.activity = None;
+                    self.cargo.entry(tid).or_default().push(passenger);
                 }
             }
         }
@@ -3113,6 +3304,40 @@ impl World {
     /// Whether a building actor is currently flagged PRIMARY.
     pub fn is_primary_building(&self, building_id: u32) -> bool {
         self.primary_buildings.contains(&building_id)
+    }
+
+    /// Passenger ids currently carried by a transport (C# `Cargo`).
+    pub fn transport_cargo(&self, transport_id: u32) -> Vec<u32> {
+        self.cargo
+            .get(&transport_id)
+            .map(|v| v.iter().map(|a| a.id).collect())
+            .unwrap_or_default()
+    }
+
+    /// Cargo capacity (passenger COUNT) for a transport actor. Pragmatic
+    /// subset of C# `Cargo.MaxWeight` — we count units, not weighted
+    /// slots. Only known transports carry; everything else is 0.
+    pub fn transport_capacity(&self, transport_id: u32) -> u32 {
+        match self
+            .actors
+            .get(&transport_id)
+            .and_then(|a| a.actor_type.as_deref())
+        {
+            Some("apc") => 5,
+            Some("apc.ukraine") => 5,
+            Some("lst") => 5,   // landing craft
+            Some("tran") => 5,  // chinook
+            _ => 0,
+        }
+    }
+
+    /// Whether an actor can be a passenger (C# `Passenger`): infantry
+    /// only, in our subset.
+    fn is_passenger_capable(&self, actor_id: u32) -> bool {
+        self.actors
+            .get(&actor_id)
+            .map(|a| a.kind == ActorKind::Infantry)
+            .unwrap_or(false)
     }
 
     /// S1: total resource-storage capacity from a player's refineries
@@ -4432,6 +4657,7 @@ pub fn build_world(
         bots,
         repairing: HashSet::new(),
         rally_points: HashMap::new(),
+        cargo: HashMap::new(),
         primary_buildings: HashSet::new(),
         stances: HashMap::new(),
         superweapon_timers: HashMap::new(),
