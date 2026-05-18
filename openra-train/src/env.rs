@@ -1050,6 +1050,66 @@ impl Env {
 
     /// Build the observation snapshot, fog-filtering enemies through
     /// the agent's shroud.
+    /// S9 spatial tensor: flat row-major `[y][x][c]`, 6 channels
+    /// (passable, fog, own-unit density, visible-enemy density, own
+    /// building, resource). Pure function of already-observed state.
+    fn build_spatial(
+        &self,
+        world: &World,
+        snap: &openra_sim::world::WorldSnapshot,
+    ) -> (Vec<f32>, (i32, i32, i32)) {
+        let (w, h) = (snap.map_width, snap.map_height);
+        let c = crate::observation::SPATIAL_CHANNELS;
+        if w <= 0 || h <= 0 {
+            return (Vec::new(), (0, 0, c));
+        }
+        let mut t = vec![0f32; (w * h * c) as usize];
+        let idx = |x: i32, y: i32, ch: i32| ((y * w + x) * c + ch) as usize;
+        for y in 0..h {
+            for x in 0..w {
+                if world.terrain.is_terrain_passable(x, y) {
+                    t[idx(x, y, 0)] = 1.0;
+                }
+                t[idx(x, y, 1)] = if self.is_visible_to_agent(world, x, y) {
+                    1.0
+                } else if self.explored_cells.contains(&(x, y)) {
+                    0.5
+                } else {
+                    0.0
+                };
+                if world.terrain.has_resource(x, y) {
+                    t[idx(x, y, 5)] = 1.0;
+                }
+            }
+        }
+        for a in &snap.actors {
+            let (x, y) = (a.x, a.y);
+            if x < 0 || x >= w || y < 0 || y >= h {
+                continue;
+            }
+            let own = a.owner == self.agent_player_id;
+            match a.kind {
+                ActorKind::Building => {
+                    if own {
+                        t[idx(x, y, 4)] = 1.0;
+                    }
+                }
+                ActorKind::Infantry
+                | ActorKind::Vehicle
+                | ActorKind::Mcv
+                | ActorKind::Ship => {
+                    if own {
+                        t[idx(x, y, 2)] += 1.0;
+                    } else if self.is_visible_to_agent(world, x, y) {
+                        t[idx(x, y, 3)] += 1.0;
+                    }
+                }
+                _ => {}
+            }
+        }
+        (t, (h, w, c))
+    }
+
     fn observation(&self) -> Observation {
         let world = match &self.world {
             Some(w) => w,
@@ -1068,6 +1128,8 @@ impl Env {
                     own_buildings: Vec::new(),
                     production: Vec::new(),
                     map_info: crate::observation::MapInfo::default(),
+                    spatial: Vec::new(),
+                    spatial_shape: (0, 0, crate::observation::SPATIAL_CHANNELS),
                 };
             }
         };
@@ -1207,6 +1269,8 @@ impl Env {
             }
         }
 
+        let (spatial, spatial_shape) = self.build_spatial(world, &snap);
+
         Observation {
             unit_positions,
             unit_hp,
@@ -1224,6 +1288,8 @@ impl Env {
                 width: snap.map_width,
                 height: snap.map_height,
             },
+            spatial,
+            spatial_shape,
         }
     }
 

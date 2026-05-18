@@ -149,7 +149,18 @@ pub struct Observation {
     pub production: Vec<ProductionObs>,
     /// S9 — true map dimensions.
     pub map_info: MapInfo,
+    /// S9 — spatial tensor, flat row-major `[y][x][c]`, shape
+    /// `spatial_shape = (h, w, c)` with c=6 channels:
+    /// 0 passable, 1 fog (1 visible / 0.5 explored / 0 unknown),
+    /// 2 own-unit density, 3 visible-enemy-unit density,
+    /// 4 own building, 5 resource present. Enables grid/occupancy
+    /// spatial reasoning (the ERQA-transfer axis).
+    pub spatial: Vec<f32>,
+    pub spatial_shape: (i32, i32, i32),
 }
+
+/// Channel count of the spatial tensor.
+pub const SPATIAL_CHANNELS: i32 = 6;
 
 impl Observation {
     /// Stable hash of the observation for determinism testing. Order is
@@ -234,6 +245,15 @@ impl Observation {
         }
         bytes_of_i32(self.map_info.width, &mut h);
         bytes_of_i32(self.map_info.height, &mut h);
+        // Spatial tensor is a pure function of already-hashed state
+        // (units / explored / terrain / resources); hashing shape +
+        // length keeps the hash cheap while still detecting structural
+        // divergence.
+        let (sh, sw, sc) = self.spatial_shape;
+        bytes_of_i32(sh, &mut h);
+        bytes_of_i32(sw, &mut h);
+        bytes_of_i32(sc, &mut h);
+        bytes_of_i32(self.spatial.len() as i32, &mut h);
         h
     }
 }
@@ -357,6 +377,11 @@ mod py {
             mi.set_item("width", self.map_info.width)?;
             mi.set_item("height", self.map_info.height)?;
             d.set_item("map_info", mi)?;
+
+            // S9 spatial tensor: flat row-major [y][x][c] + shape.
+            d.set_item("spatial", self.spatial.clone())?;
+            let (sh, sw, sc) = self.spatial_shape;
+            d.set_item("spatial_shape", (sh, sw, sc))?;
 
             // explored_cells: list[(x, y)] — accurate per-tick fog
             // accumulation. The renderer uses this instead of
