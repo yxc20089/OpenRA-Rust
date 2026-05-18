@@ -920,6 +920,35 @@ impl Env {
                         extra_data: None,
                     });
                 }
+                Command::SetStance { unit_ids, stance } => {
+                    let s = (*stance).clamp(0, 3) as u32;
+                    for id in unit_ids {
+                        if let Some(aid) =
+                            resolve_owned(id, &agent_owned, &mut self.last_warnings)
+                        {
+                            orders.push(GameOrder {
+                                order_string: "SetStance".into(),
+                                subject_id: Some(aid),
+                                target_string: None,
+                                extra_data: Some(s),
+                            });
+                        }
+                    }
+                }
+                Command::Patrol { unit_ids } => {
+                    for id in unit_ids {
+                        if let Some(aid) =
+                            resolve_owned(id, &agent_owned, &mut self.last_warnings)
+                        {
+                            orders.push(GameOrder {
+                                order_string: "Patrol".into(),
+                                subject_id: Some(aid),
+                                target_string: None,
+                                extra_data: None,
+                            });
+                        }
+                    }
+                }
                 Command::MoveUnits {
                     unit_ids,
                     target_x,

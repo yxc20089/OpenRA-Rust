@@ -289,6 +289,9 @@ pub struct World {
     repairing: HashSet<u32>,
     /// Rally points per building actor ID.
     rally_points: HashMap<u32, (i32, i32)>,
+    /// Engagement stance per actor id: 0=HoldFire, 1=ReturnFire,
+    /// 2=Defend, 3=AttackAnything. Missing = engage (current default).
+    stances: HashMap<u32, u8>,
     /// Superweapon charge timers: (building_type, owner_player_id) → ticks_remaining.
     superweapon_timers: HashMap<(String, u32), i32>,
     /// Actors with invulnerability ticks remaining (Iron Curtain).
@@ -897,6 +900,15 @@ impl World {
                     }
                 }
             }
+            "SetStance" => {
+                if let Some(subject_id) = order.subject_id {
+                    let s = order.extra_data.unwrap_or(3).min(3) as u8;
+                    self.stances.insert(subject_id, s);
+                }
+            }
+            // C# parity: PATROL defined but unimplemented — accept
+            // silently (no warn, no behaviour change).
+            "Patrol" => {}
             "StartGame" | "Command" => {}
             other => {
                 eprintln!("ORDER: unhandled '{}' subject={:?}", other, order.subject_id);
@@ -1858,6 +1870,10 @@ impl World {
         let mut engage_pairs: Vec<(u32, u32)> = Vec::new();
         for (id, actor) in &self.actors {
             if actor.activity.is_some() {
+                continue;
+            }
+            // HoldFire stance suppresses defensive auto-engage.
+            if self.stances.get(id).copied().unwrap_or(3) == 0 {
                 continue;
             }
             let my_loc = match actor.location {
@@ -4181,6 +4197,7 @@ pub fn build_world(
         bots,
         repairing: HashSet::new(),
         rally_points: HashMap::new(),
+        stances: HashMap::new(),
         superweapon_timers: HashMap::new(),
         invulnerable: HashMap::new(),
         player_factions,

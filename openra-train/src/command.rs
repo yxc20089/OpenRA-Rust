@@ -43,6 +43,12 @@ pub enum Command {
     PowerDown { unit_ids: Vec<String> },
     /// Set a production building's rally point.
     SetRallyPoint { unit_ids: Vec<String>, target_x: i32, target_y: i32 },
+    /// Set engagement stance: 0=HoldFire, 1=ReturnFire, 2=Defend,
+    /// 3=AttackAnything (clamped). HoldFire suppresses auto-engage.
+    SetStance { unit_ids: Vec<String>, stance: i32 },
+    /// C# parity: PATROL is defined but unimplemented — accepted as a
+    /// no-op (does not warn / does not divert the unit).
+    Patrol { unit_ids: Vec<String> },
     /// Concede the match (the agent loses immediately).
     Surrender,
     /// No-op; the env still ticks N frames.
@@ -134,6 +140,16 @@ impl PyCommand {
     #[staticmethod]
     fn surrender() -> Self {
         Self { inner: Command::Surrender }
+    }
+
+    #[staticmethod]
+    fn set_stance(unit_ids: Vec<String>, stance: i32) -> Self {
+        Self { inner: Command::SetStance { unit_ids, stance } }
+    }
+
+    #[staticmethod]
+    fn patrol(unit_ids: Vec<String>) -> Self {
+        Self { inner: Command::Patrol { unit_ids } }
     }
 
     fn __repr__(&self) -> String {
