@@ -912,6 +912,14 @@ impl Env {
         for cmd in commands {
             match cmd {
                 Command::Observe => {}
+                Command::Surrender => {
+                    orders.push(GameOrder {
+                        order_string: "Surrender".into(),
+                        subject_id: Some(self.agent_player_id),
+                        target_string: None,
+                        extra_data: None,
+                    });
+                }
                 Command::MoveUnits {
                     unit_ids,
                     target_x,
@@ -1423,8 +1431,10 @@ impl Env {
         //         Without this branch, my earlier maginot fix collapses
         //         rush-hour to "no buildings → enemy_alive=False from
         //         turn 0 → instant terminal".
-        let agent_alive = has_combat_units(world, self.agent_player_id)
-            || has_must_be_destroyed_buildings(world, self.agent_player_id);
+        // A surrendered agent is defeated regardless of remaining force.
+        let agent_alive = !world.is_surrendered(self.agent_player_id)
+            && (has_combat_units(world, self.agent_player_id)
+                || has_must_be_destroyed_buildings(world, self.agent_player_id));
         let enemy_alive = if !self.enemy_started_present {
             // No enemy in this scenario: enemy-elimination is not a
             // victory/terminal condition. Termination is driven solely

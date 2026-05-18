@@ -43,6 +43,8 @@ pub enum Command {
     PowerDown { unit_ids: Vec<String> },
     /// Set a production building's rally point.
     SetRallyPoint { unit_ids: Vec<String>, target_x: i32, target_y: i32 },
+    /// Concede the match (the agent loses immediately).
+    Surrender,
     /// No-op; the env still ticks N frames.
     Observe,
 }
@@ -127,6 +129,11 @@ impl PyCommand {
     #[staticmethod]
     fn observe() -> Self {
         Self { inner: Command::Observe }
+    }
+
+    #[staticmethod]
+    fn surrender() -> Self {
+        Self { inner: Command::Surrender }
     }
 
     fn __repr__(&self) -> String {

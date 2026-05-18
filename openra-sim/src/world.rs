@@ -264,6 +264,9 @@ pub struct World {
     /// Cell locations of mine actors — seed + replenish ore here so
     /// harvesters have something to collect.
     mine_locations: Vec<(i32, i32)>,
+    /// Player ids that have surrendered (conceded). A surrendered
+    /// player is treated as defeated by the env's terminal check.
+    surrendered: std::collections::HashSet<u32>,
     /// Ticks until next SeedsResource seeding event.
     seeds_resource_ticks: i32,
     /// Active production items per player actor ID.
@@ -361,6 +364,11 @@ impl World {
     }
 
     /// Get a player's cash.
+    /// True if the player has conceded via a Surrender order.
+    pub fn is_surrendered(&self, player_id: u32) -> bool {
+        self.surrendered.contains(&player_id)
+    }
+
     pub fn player_cash(&self, player_id: u32) -> i32 {
         self.actors.get(&player_id).map(|a| a.cash()).unwrap_or(0)
     }
@@ -822,6 +830,12 @@ impl World {
                     if let Some(actor) = self.actors.get_mut(&subject_id) {
                         actor.activity = None;
                     }
+                }
+            }
+            "Surrender" => {
+                // subject_id is the conceding player's id.
+                if let Some(pid) = order.subject_id {
+                    self.surrendered.insert(pid);
                 }
             }
             "Sell" => {
@@ -4156,6 +4170,7 @@ pub fn build_world(
         everyone_player_id,
         mine_count,
         mine_locations,
+        surrendered: std::collections::HashSet::new(),
         seeds_resource_ticks: 0,
         production: HashMap::new(),
         terrain,
