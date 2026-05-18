@@ -1039,6 +1039,20 @@ impl Env {
                         }
                     }
                 }
+                Command::SetPrimary { unit_ids } => {
+                    for id in unit_ids {
+                        if let Some(aid) =
+                            resolve_owned(id, &agent_owned, &mut self.last_warnings)
+                        {
+                            orders.push(GameOrder {
+                                order_string: "SetPrimary".into(),
+                                subject_id: Some(aid),
+                                target_string: None,
+                                extra_data: None,
+                            });
+                        }
+                    }
+                }
                 Command::AttackMove { unit_ids, target_x, target_y } => {
                     for id in unit_ids {
                         if let Some(aid) =
@@ -1381,6 +1395,7 @@ impl Env {
                     cell_x: a.x,
                     cell_y: a.y,
                     hp_pct,
+                    is_primary: world.is_primary_building(a.id),
                 });
             }
         }

@@ -24,6 +24,9 @@ pub enum Command {
     AttackMove { unit_ids: Vec<String>, target_x: i32, target_y: i32 },
     /// Follow and protect a friendly actor (C# Guard — follow subset).
     Guard { unit_ids: Vec<String>, target_id: String },
+    /// Designate a production building as PRIMARY for its type
+    /// (C# PrimaryBuilding). `unit_ids` carries the building id(s).
+    SetPrimary { unit_ids: Vec<String> },
     /// Cancel current activity (go idle).
     Stop { unit_ids: Vec<String> },
     /// Transform an MCV into a construction yard.
@@ -86,6 +89,11 @@ impl PyCommand {
     #[staticmethod]
     fn guard(unit_ids: Vec<String>, target_id: String) -> Self {
         Self { inner: Command::Guard { unit_ids, target_id } }
+    }
+
+    #[staticmethod]
+    fn set_primary(unit_ids: Vec<String>) -> Self {
+        Self { inner: Command::SetPrimary { unit_ids } }
     }
 
     #[staticmethod]

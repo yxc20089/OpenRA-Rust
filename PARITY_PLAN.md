@@ -126,3 +126,33 @@ maps. Progress is shipped per-subsystem with green tests, not big-bang.
   Honest gap: faithful ReturnFire(1) retaliation is not asserted by a
   dedicated test (documented in the test header; ReturnFire/Defend/
   AttackAnything behaviour otherwise unchanged).
+
+- **S7 — GUARD** (task #10 cont.) ✅
+  C# `Guard`/`GuardActivity` follow subset. New
+  `Activity::Guard{target_id,leash,speed}`; the guard steps one
+  cell/tick toward a cell adjacent to the guarded actor whenever the
+  Chebyshev gap exceeds `leash` (2), and goes idle if the guarded
+  actor disappears. Command + Python shim + env order plumbing with
+  target/ownership validation. Bench: `guard` tool schema +
+  `_to_commands` dispatch, congruence test kept 1:1 (wildcard count
+  17→18). Integ test `openra-train/tests/env_guard.rs`.
+  Honest gap: C# Guard layers AttackFollow (re-engages the guarded
+  actor's attackers) on top — not asserted; opportunistic combat
+  falls back to normal stance auto-engage (documented in test header).
+
+- **S7 — SET_PRIMARY** (task #10 cont.) ✅
+  C# `PrimaryBuilding`. World gains `primary_buildings: HashSet<u32>`;
+  `set_primary_building` enforces one primary per (owner, type)
+  (designating clears same-type siblings). `find_spawn_location` and
+  `find_rally_point_for_unit` now sort candidates primary-first so
+  produced units spawn from / rally through the primary. New
+  observation field `OwnBuilding.is_primary` (struct + SyncHash +
+  PyDict). Command + Python shim + env order plumbing
+  (ownership-validated). Bench: `set_primary` tool schema +
+  units-only `_to_commands` dispatch, congruence 1:1 (wildcard count
+  18→19). Integ test `openra-train/tests/env_set_primary.rs`: with
+  two barracks, SET_PRIMARY on the far one routes the next produced
+  E1 there and sets the flag; switching clears the old primary;
+  non-owned id warns.
+  Honest gap: C# also routes the production EXIT cell through the
+  primary — we assert spawn-building preference + the flag only.

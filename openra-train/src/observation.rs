@@ -99,6 +99,10 @@ pub struct OwnBuilding {
     pub cell_x: i32,
     pub cell_y: i32,
     pub hp_pct: f32,
+    /// C# `PrimaryBuilding` — true when this is the designated primary
+    /// producer for its type (SET_PRIMARY). Newly produced units of
+    /// that category spawn from / rally through it.
+    pub is_primary: bool,
 }
 
 /// S9 — a queued production item (parity with C# RlProductionInfo).
@@ -238,6 +242,7 @@ impl Observation {
             bytes_of_str(&ob.building_type, &mut h);
             bytes_of_i32(ob.cell_x, &mut h);
             bytes_of_i32(ob.cell_y, &mut h);
+            bytes_of_i32(ob.is_primary as i32, &mut h);
         }
         for p in &self.production {
             bytes_of_str(&p.item, &mut h);
@@ -349,7 +354,7 @@ mod py {
             econ.set_item("resource_capacity", self.economy.resource_capacity)?;
             d.set_item("economy", econ)?;
 
-            // S9 own_buildings: [{id, type, cell_x, cell_y, hp_pct}]
+            // S9 own_buildings: [{id, type, cell_x, cell_y, hp_pct, is_primary}]
             let own_b = PyList::empty_bound(py);
             for ob in &self.own_buildings {
                 let e = PyDict::new_bound(py);
@@ -358,6 +363,7 @@ mod py {
                 e.set_item("cell_x", ob.cell_x)?;
                 e.set_item("cell_y", ob.cell_y)?;
                 e.set_item("hp_pct", ob.hp_pct)?;
+                e.set_item("is_primary", ob.is_primary)?;
                 own_b.append(e)?;
             }
             d.set_item("own_buildings", own_b)?;

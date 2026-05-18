@@ -289,6 +289,11 @@ pub struct World {
     repairing: HashSet<u32>,
     /// Rally points per building actor ID.
     rally_points: HashMap<u32, (i32, i32)>,
+    /// Building actor IDs flagged PRIMARY for production
+    /// (C# `PrimaryBuilding`). At most one per (owner, building-type):
+    /// produced units of that category spawn from / rally through the
+    /// primary. Missing ⇒ fall back to first-found building.
+    primary_buildings: HashSet<u32>,
     /// Engagement stance per actor id: 0=HoldFire, 1=ReturnFire,
     /// 2=Defend, 3=AttackAnything. Missing = engage (current default).
     stances: HashMap<u32, u8>,
@@ -881,6 +886,11 @@ impl World {
                     }
                 }
             }
+            "SetPrimary" => {
+                if let Some(subject_id) = order.subject_id {
+                    self.set_primary_building(subject_id);
+                }
+            }
             "ActivateSuperweapon" => {
                 // target_string = "weapon_type,x,y" (e.g. "iron,15,20")
                 if let Some(target) = &order.target_string {
@@ -1181,6 +1191,35 @@ impl World {
                 speed,
             });
         }
+    }
+
+    /// Flag a building as the PRIMARY producer for its type. C#
+    /// `PrimaryBuilding.SetPrimaryProducer`: only one primary per
+    /// (owner, building-type) — designating a new one clears the flag
+    /// from every same-type sibling owned by the same player.
+    fn set_primary_building(&mut self, building_id: u32) {
+        let (owner, btype) = match self.actors.get(&building_id) {
+            Some(a) if a.kind == ActorKind::Building => (
+                a.owner_id,
+                a.actor_type.clone().unwrap_or_default(),
+            ),
+            _ => return,
+        };
+        // Clear primary on same-owner, same-type siblings.
+        let siblings: Vec<u32> = self
+            .actors
+            .values()
+            .filter(|a| {
+                a.kind == ActorKind::Building
+                    && a.owner_id == owner
+                    && a.actor_type.as_deref() == Some(btype.as_str())
+            })
+            .map(|a| a.id)
+            .collect();
+        for sid in siblings {
+            self.primary_buildings.remove(&sid);
+        }
+        self.primary_buildings.insert(building_id);
     }
 
     /// Handle PlaceBuilding order: create building actor and occupy terrain.
@@ -3039,22 +3078,41 @@ impl World {
         let is_infantry = self.rules.actor(unit_type)
             .map(|s| s.kind == ActorKind::Infantry)
             .unwrap_or(false);
-        for actor in self.actors.values() {
-            if actor.owner_id != Some(owner_player_id) { continue; }
-            if actor.kind != ActorKind::Building { continue; }
-            let btype = actor.actor_type.as_deref().unwrap_or("");
-            let is_right = if is_infantry {
-                matches!(btype, "tent" | "barr")
-            } else {
-                matches!(btype, "weap" | "weap.ukraine" | "hpad" | "afld" | "spen" | "syrd")
-            };
-            if is_right {
-                if let Some(&rally) = self.rally_points.get(&actor.id) {
-                    return Some(rally);
-                }
+        let mut candidates: Vec<&Actor> = self
+            .actors
+            .values()
+            .filter(|actor| {
+                actor.owner_id == Some(owner_player_id)
+                    && actor.kind == ActorKind::Building
+                    && {
+                        let btype = actor.actor_type.as_deref().unwrap_or("");
+                        if is_infantry {
+                            matches!(btype, "tent" | "barr")
+                        } else {
+                            matches!(
+                                btype,
+                                "weap" | "weap.ukraine" | "hpad" | "afld"
+                                    | "spen" | "syrd"
+                            )
+                        }
+                    }
+            })
+            .collect();
+        // Primary building's rally point wins (C# parity).
+        candidates.sort_by_key(|a| {
+            (!self.primary_buildings.contains(&a.id), a.id)
+        });
+        for actor in candidates {
+            if let Some(&rally) = self.rally_points.get(&actor.id) {
+                return Some(rally);
             }
         }
         None
+    }
+
+    /// Whether a building actor is currently flagged PRIMARY.
+    pub fn is_primary_building(&self, building_id: u32) -> bool {
+        self.primary_buildings.contains(&building_id)
     }
 
     /// S1: total resource-storage capacity from a player's refineries
@@ -3171,21 +3229,39 @@ impl World {
             .map(|s| s.kind == ActorKind::Infantry)
             .unwrap_or(false);
 
-        // Find production building for this unit type
-        for actor in self.actors.values() {
-            if actor.owner_id != Some(owner_player_id) { continue; }
-            if actor.kind != ActorKind::Building { continue; }
+        // Collect all production buildings of the right type. C#
+        // `PrimaryBuilding`: if one of them is flagged primary, it
+        // produces; otherwise fall back to first-found (BTreeMap order
+        // ⇒ deterministic). We sort primary-first then by id.
+        let mut candidates: Vec<&Actor> = self
+            .actors
+            .values()
+            .filter(|actor| {
+                actor.owner_id == Some(owner_player_id)
+                    && actor.kind == ActorKind::Building
+                    && {
+                        let btype = actor.actor_type.as_deref().unwrap_or("");
+                        if is_infantry {
+                            matches!(btype, "tent" | "barr")
+                        } else if unit_type == "harv" {
+                            matches!(btype, "proc" | "weap" | "weap.ukraine")
+                        } else {
+                            matches!(
+                                btype,
+                                "weap" | "weap.ukraine" | "hpad" | "afld"
+                                    | "spen" | "syrd"
+                            )
+                        }
+                    }
+            })
+            .collect();
+        candidates.sort_by_key(|a| {
+            (!self.primary_buildings.contains(&a.id), a.id)
+        });
 
+        for actor in candidates {
             let btype = actor.actor_type.as_deref().unwrap_or("");
-            let is_right_building = if is_infantry {
-                matches!(btype, "tent" | "barr")
-            } else if unit_type == "harv" {
-                matches!(btype, "proc" | "weap" | "weap.ukraine")
-            } else {
-                matches!(btype, "weap" | "weap.ukraine" | "hpad" | "afld" | "spen" | "syrd")
-            };
-
-            if is_right_building {
+            {
                 if let Some((bx, by)) = actor.location {
                     let (fw, fh) = self.rules.actor(btype)
                         .map(|s| s.footprint)
@@ -4356,6 +4432,7 @@ pub fn build_world(
         bots,
         repairing: HashSet::new(),
         rally_points: HashMap::new(),
+        primary_buildings: HashSet::new(),
         stances: HashMap::new(),
         superweapon_timers: HashMap::new(),
         invulnerable: HashMap::new(),
