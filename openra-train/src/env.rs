@@ -50,6 +50,10 @@ pub const INTERRUPT_SIGNAL_NAMES: &[&str] = &[
     "enemy_building_spotted",
     "engage_start",
     "own_unit_destroyed",
+    // Fires when a newly-produced agent unit or completed building
+    // appears (queue item finished / construction complete) — lets the
+    // agent re-plan the moment capacity arrives.
+    "production_complete",
 ];
 
 /// Per-episode tracking state for interrupt detection. Resets on
@@ -71,6 +75,13 @@ pub struct InterruptState {
     /// target they were attacking. The dedup key is
     /// `(own_actor_id, target_actor_id)` — different target = new event.
     prev_attacking_pairs: HashSet<(u32, u32)>,
+    /// Agent-owned actor IDs (units + buildings) alive at the previous
+    /// check. A newly-appeared ID = a finished production / completed
+    /// construction → `production_complete`.
+    prev_own_actor_ids: HashSet<u32>,
+    /// False until the first check populates the baseline (so starting
+    /// actors don't all false-fire `production_complete`).
+    production_baseline_set: bool,
     /// Per-(signal, dedup_key) last-fire tick. Suppresses re-fire if
     /// `current_tick - last_fire_tick < cooldown_ticks`.
     last_fire_tick: HashMap<(String, u64), i32>,
@@ -426,6 +437,7 @@ impl Env {
         let mut cur_visible_enemy_buildings: HashSet<u32> = HashSet::new();
         let mut cur_attacking_pairs: HashSet<(u32, u32)> = HashSet::new();
         let mut cur_own_unit_ids: HashSet<u32> = HashSet::new();
+        let mut cur_own_actor_ids: HashSet<u32> = HashSet::new();
 
         for a in &snap.actors {
             if matches!(
@@ -460,6 +472,19 @@ impl Env {
                         | ActorKind::Mcv
                 ) {
                     cur_own_unit_ids.insert(a.id);
+                }
+                // Units + buildings count toward production_complete
+                // (a finished unit OR a completed structure).
+                if matches!(
+                    a.kind,
+                    ActorKind::Infantry
+                        | ActorKind::Vehicle
+                        | ActorKind::Aircraft
+                        | ActorKind::Ship
+                        | ActorKind::Mcv
+                        | ActorKind::Building
+                ) {
+                    cur_own_actor_ids.insert(a.id);
                 }
                 if let Some(tid) = a.target_id {
                     cur_attacking_pairs.insert((a.id, tid));
@@ -514,6 +539,29 @@ impl Env {
             }
         }
 
+        if fired.is_none()
+            && signals.contains("production_complete")
+            && self.interrupt_state.production_baseline_set
+        {
+            let new_ids: Vec<u32> = cur_own_actor_ids
+                .iter()
+                .filter(|id| !self.interrupt_state.prev_own_actor_ids.contains(id))
+                .copied()
+                .collect();
+            for id in new_ids {
+                let key = id as u64;
+                if self
+                    .interrupt_state
+                    .cooldown_ok("production_complete", key, now, cooldown)
+                {
+                    self.interrupt_state
+                        .mark_fired("production_complete", key, now);
+                    fired = Some(format!("production_complete: id {}", id));
+                    break;
+                }
+            }
+        }
+
         if fired.is_none() && signals.contains("enemy_unit_spotted") {
             for &id in &cur_visible_enemy_units {
                 if !self
@@ -564,6 +612,8 @@ impl Env {
         self.interrupt_state.prev_visible_enemy_building_ids = cur_visible_enemy_buildings;
         self.interrupt_state.prev_own_unit_ids = cur_own_unit_ids;
         self.interrupt_state.prev_attacking_pairs = cur_attacking_pairs;
+        self.interrupt_state.prev_own_actor_ids = cur_own_actor_ids;
+        self.interrupt_state.production_baseline_set = true;
 
         fired
     }
