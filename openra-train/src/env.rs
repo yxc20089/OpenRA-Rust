@@ -1377,6 +1377,7 @@ impl Env {
                         target,
                         activity: a.activity.clone(),
                         attacking_target_id,
+                        actor_type: a.actor_type.clone(),
                     },
                 ));
                 unit_hp.push((id_str, pct));

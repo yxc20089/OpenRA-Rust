@@ -43,6 +43,10 @@ pub struct UnitPos {
     /// render "attacking 1023" instead of the misleading
     /// "moving to (55,10)" (which is the target's cell, not a path).
     pub attacking_target_id: Option<String>,
+    /// The unit's actor type (e.g. "2tnk", "e1"). Parity with
+    /// enemy_positions — lets the briefing show what the agent
+    /// commands and `unit_type_count_*` win predicates work.
+    pub actor_type: String,
 }
 
 #[derive(Debug, Clone)]
@@ -281,6 +285,10 @@ mod py {
                 let entry = PyDict::new_bound(py);
                 entry.set_item("cell_x", pos.cell_x)?;
                 entry.set_item("cell_y", pos.cell_y)?;
+                // Own-unit type so the briefing and `unit_type_count_*`
+                // win predicates can see what the agent commands
+                // (parity with enemy_positions' actor_type below).
+                entry.set_item("actor_type", &pos.actor_type)?;
                 if let Some((tx, ty)) = pos.target {
                     let target = PyList::empty_bound(py);
                     target.append(tx)?;
