@@ -897,6 +897,19 @@ impl Env {
         // advances the tick counter.
         set_test_unpaused(&mut world);
 
+        // Attach a scripted opponent controller if the scenario set
+        // `enemy: {bot: ...}` (else enemy stays stance-only reactive).
+        if let Some(bt) = self.map_def.enemy_bot.as_deref() {
+            match openra_sim::scripted_bot::ScriptedBehavior::parse(bt) {
+                Some(b) => world.add_scripted_bot(
+                    self.enemy_player_id,
+                    self.agent_player_id,
+                    b,
+                ),
+                None => eprintln!("unknown enemy.bot {bt:?} — ignored"),
+            }
+        }
+
         // Run one no-op frame so shroud reveals are recomputed with
         // the injected actors.
         world.process_frame(&[]);
@@ -1927,6 +1940,7 @@ pub fn build_test_env_with_no_enemies(map_size: (i32, i32), seed: u64) -> Env {
         }],
         spawn_mcvs: true,
         starting_cash: 5000,
+        enemy_bot: None,
     };
     let mut env = Env {
         scenario_path: PathBuf::from("<test>"),

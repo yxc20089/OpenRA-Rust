@@ -386,6 +386,9 @@ pub struct MapDef {
     /// constraint). Defaults to 5000 (OpenRA skirmish default) when the
     /// scenario omits `starting_cash:`.
     pub starting_cash: i32,
+    /// Scripted opponent behaviour for the enemy side, if the
+    /// scenario set `enemy: {bot: ...}` (else None ⇒ stance-only).
+    pub enemy_bot: Option<String>,
 }
 
 impl MapDef {
@@ -577,6 +580,7 @@ pub fn load_rush_hour_map_with_spawn(
         actors,
         spawn_mcvs: scenario.spawn_mcvs.unwrap_or(true),
         starting_cash: scenario.starting_cash.unwrap_or(5000),
+        enemy_bot: scenario.enemy_bot,
     })
 }
 
@@ -597,6 +601,9 @@ struct ScenarioYaml {
     /// engine default (5000, the OpenRA skirmish default). Contributors
     /// set this to gate economy/production difficulty.
     starting_cash: Option<i32>,
+    /// Optional scripted opponent behaviour for the enemy side
+    /// (`enemy: {bot: hunt|rusher|patrol|turtle}`).
+    enemy_bot: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -656,14 +663,15 @@ fn parse_scenario_yaml(text: &str) -> io::Result<ScenarioYaml> {
                     continue;
                 }
                 "agent" => {
-                    let (faction, ni) = read_block_faction(&lines, i + 1);
+                    let (faction, _bot, ni) = read_block_faction(&lines, i + 1);
                     out.agent_faction = faction;
                     i = ni;
                     continue;
                 }
                 "enemy" => {
-                    let (faction, ni) = read_block_faction(&lines, i + 1);
+                    let (faction, bot, ni) = read_block_faction(&lines, i + 1);
                     out.enemy_faction = faction;
+                    out.enemy_bot = bot;
                     i = ni;
                     continue;
                 }
@@ -739,9 +747,10 @@ fn leading_spaces(line: &str) -> usize {
 
 /// Inside a `agent:` or `enemy:` top-level block, read indented `faction:` line.
 /// Returns `(faction_string, next_line_index)`.
-fn read_block_faction(lines: &[&str], start: usize) -> (String, usize) {
+fn read_block_faction(lines: &[&str], start: usize) -> (String, Option<String>, usize) {
     let mut i = start;
     let mut faction = String::new();
+    let mut bot: Option<String> = None;
     while i < lines.len() {
         let raw = lines[i];
         let trimmed = strip_yaml_comment(raw).trim_end();
@@ -752,14 +761,23 @@ fn read_block_faction(lines: &[&str], start: usize) -> (String, usize) {
         if leading_spaces(raw) == 0 {
             break;
         }
-        if let Some((k, v)) = split_key_value(trimmed)
-            && k == "faction"
-        {
-            faction = v.to_string();
+        if let Some((k, v)) = split_key_value(trimmed) {
+            match k {
+                "faction" => faction = v.to_string(),
+                // `bot_type` survives the bench's training-schema
+                // serialization; `bot` is an ergonomic alias.
+                "bot" | "bot_type" => {
+                    let v = v.trim().trim_matches('"').trim_matches('\'').to_string();
+                    if !v.is_empty() {
+                        bot = Some(v);
+                    }
+                }
+                _ => {}
+            }
         }
         i += 1;
     }
-    (faction, i)
+    (faction, bot, i)
 }
 
 /// Parse the `actors:` list. Each list item starts with `- type: NAME` at

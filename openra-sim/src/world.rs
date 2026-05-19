@@ -285,6 +285,8 @@ pub struct World {
     pub rules: GameRules,
     /// AI bots controlling their respective players.
     bots: Vec<Bot>,
+    /// Scripted opponent controllers (bench enemy.bot behaviours).
+    scripted_bots: Vec<crate::scripted_bot::ScriptedBot>,
     /// Buildings currently being repaired (toggled by RepairBuilding order).
     repairing: HashSet<u32>,
     /// Rally points per building actor ID.
@@ -693,6 +695,14 @@ impl World {
         if !self.bots.is_empty() && !self.paused {
             let bot_orders = self.tick_bots();
             for order in &bot_orders {
+                self.process_order(order);
+            }
+        }
+
+        // 1c. Scripted opponent (bench enemy.bot) orders.
+        if !self.scripted_bots.is_empty() && !self.paused {
+            let sb_orders = self.tick_scripted_bots();
+            for order in &sb_orders {
                 self.process_order(order);
             }
         }
@@ -1947,6 +1957,30 @@ impl World {
         }
         self.bots = bots;
         all_orders
+    }
+
+    fn tick_scripted_bots(&mut self) -> Vec<GameOrder> {
+        let mut sbs = std::mem::take(&mut self.scripted_bots);
+        let mut all = Vec::new();
+        for sb in &mut sbs {
+            all.extend(sb.tick(self));
+        }
+        self.scripted_bots = sbs;
+        all
+    }
+
+    /// Attach a scripted opponent controller for `player_id`.
+    pub fn add_scripted_bot(
+        &mut self,
+        player_id: u32,
+        target_player_id: u32,
+        behavior: crate::scripted_bot::ScriptedBehavior,
+    ) {
+        self.scripted_bots.push(crate::scripted_bot::ScriptedBot::new(
+            player_id,
+            target_player_id,
+            behavior,
+        ));
     }
 
     /// Tick all actors (activities and ITick traits).
@@ -4655,6 +4689,7 @@ pub fn build_world(
         shroud,
         rules: rules.unwrap_or_else(GameRules::defaults),
         bots,
+        scripted_bots: Vec::new(),
         repairing: HashSet::new(),
         rally_points: HashMap::new(),
         cargo: HashMap::new(),
