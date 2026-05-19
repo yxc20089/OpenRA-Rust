@@ -29,6 +29,13 @@ pub enum ScriptedBehavior {
     Patrol,
     /// Hold the spawn position; Defend stance (return fire), no moves.
     Turtle,
+    /// LEASHED defender: holds its post (spawn cell); lunges at the
+    /// nearest agent unit only while a foe is within `AGGRO_RADIUS` of
+    /// the post, and is recalled the instant it strays past
+    /// `LEASH_RADIUS` or no foe is near — so a decoy that comes close
+    /// transiently pulls the guard off post (opening a gap), and it
+    /// snaps back. The faithful "guards you can bait aside" behaviour.
+    Guard,
 }
 
 impl ScriptedBehavior {
@@ -38,6 +45,7 @@ impl ScriptedBehavior {
             "rusher" | "rush" => Some(Self::Rusher),
             "patrol" => Some(Self::Patrol),
             "turtle" => Some(Self::Turtle),
+            "guard" => Some(Self::Guard),
             _ => None,
         }
     }
@@ -64,6 +72,10 @@ pub struct ScriptedBot {
 }
 
 const PATROL_RADIUS: i32 = 8;
+/// Guard: engage a foe only while it is within this many cells of the
+/// guard's post; recall to post past LEASH or when none are near.
+const GUARD_AGGRO: i64 = 16;
+const GUARD_LEASH: i64 = 18;
 
 impl ScriptedBot {
     pub fn new(
@@ -76,6 +88,7 @@ impl ScriptedBot {
             ScriptedBehavior::Hunt => 16,
             ScriptedBehavior::Patrol => 24,
             ScriptedBehavior::Turtle => 64,
+            ScriptedBehavior::Guard => 10,
         };
         ScriptedBot {
             player_id,
@@ -151,7 +164,9 @@ impl ScriptedBot {
             // Patrol/Turtle defend their ground (auto-fire on
             // intruders); Hunt/Rusher attack anything.
             let st = match self.behavior {
-                ScriptedBehavior::Patrol | ScriptedBehavior::Turtle => 2,
+                ScriptedBehavior::Patrol
+                | ScriptedBehavior::Turtle
+                | ScriptedBehavior::Guard => 2,
                 ScriptedBehavior::Hunt | ScriptedBehavior::Rusher => 3,
             };
             orders.extend(self.stance_all(&units, st));
@@ -225,9 +240,53 @@ impl ScriptedBot {
                     }
                 }
             }
+            ScriptedBehavior::Guard => {
+                let foes = self.foes(world);
+                for &(id, ux, uy) in &units {
+                    let (hx, hy) = *self.spawn_cell.get(&id).unwrap_or(&(ux, uy));
+                    // Nearest foe to this guard's POST (not to the
+                    // guard) — what it would defend against.
+                    let near_home = nearest(&foes, hx, hy);
+                    let strayed = d2(ux, uy, hx, hy) > GUARD_LEASH * GUARD_LEASH;
+                    let engage = near_home
+                        .filter(|&(_, fx, fy)| {
+                            d2(fx, fy, hx, hy) <= GUARD_AGGRO * GUARD_AGGRO
+                        });
+                    match engage {
+                        // A foe is close to the post and we're still on
+                        // the leash → lunge at it (Defend stance also
+                        // auto-fires in range).
+                        Some((tid, _, _)) if !strayed => {
+                            orders.push(GameOrder {
+                                order_string: "Attack".to_string(),
+                                subject_id: Some(id),
+                                target_string: None,
+                                extra_data: Some(tid),
+                            });
+                        }
+                        // No foe near the post, or we've strayed past
+                        // the leash → snap back to post (this is what
+                        // re-opens the gap a decoy pulled it off of).
+                        _ => {
+                            orders.push(GameOrder {
+                                order_string: "Move".to_string(),
+                                subject_id: Some(id),
+                                target_string: Some(format!("{},{}", hx, hy)),
+                                extra_data: None,
+                            });
+                        }
+                    }
+                }
+            }
         }
         orders
     }
+}
+
+fn d2(ax: i32, ay: i32, bx: i32, by: i32) -> i64 {
+    let dx = (ax - bx) as i64;
+    let dy = (ay - by) as i64;
+    dx * dx + dy * dy
 }
 
 fn nearest(foes: &[(u32, i32, i32)], x: i32, y: i32) -> Option<(u32, i32, i32)> {
