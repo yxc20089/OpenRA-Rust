@@ -137,7 +137,7 @@ impl GameRules {
                 .map(|s| parse_range(s) / 1024)
                 .unwrap_or(if is_building { 5 } else { 4 });
 
-            let kind = classify_actor(info);
+            let kind = classify_actor(&key, info);
 
             let build_palette_order = info.trait_info("Buildable")
                 .and_then(|t| t.get_i32("BuildPaletteOrder"))
@@ -291,7 +291,12 @@ impl GameRules {
         actor!("v2rl", ActorKind::Vehicle, 150000, 71, 700, 0, 1, 1, false);
         actor!("arty", ActorKind::Vehicle, 75000, 85, 600, 0, 1, 1, false);
         actor!("harv", ActorKind::Vehicle, 60000, 56, 1400, 0, 1, 1, false);
-        actor!("mcv", ActorKind::Vehicle, 60000, 56, 2500, 0, 1, 1, false);
+        // MCV uses ActorKind::Mcv so the world.rs DeployTransform
+        // handler (gated on `actor.kind == ActorKind::Mcv`) fires.
+        // The from_ruleset() path also routes MCV through Mcv via the
+        // name-based special-case in classify_actor; keeping the
+        // hard-coded fallback consistent.
+        actor!("mcv", ActorKind::Mcv, 60000, 56, 2500, 0, 1, 1, false);
         actor!("apc", ActorKind::Vehicle, 200000, 113, 800, 0, 1, 1, false);
         actor!("jeep", ActorKind::Vehicle, 150000, 113, 600, 0, 1, 1, false);
         actor!("mnly", ActorKind::Vehicle, 55000, 85, 500, 0, 1, 1, false);
@@ -466,7 +471,16 @@ fn parse_building_dimensions(info: &openra_data::rules::ActorInfo) -> (i32, i32)
 }
 
 /// Classify an actor into ActorKind based on its traits.
-fn classify_actor(info: &openra_data::rules::ActorInfo) -> ActorKind {
+fn classify_actor(name: &str, info: &openra_data::rules::ActorInfo) -> ActorKind {
+    // MCV is its own ActorKind (not a generic Vehicle) so the
+    // world.rs DeployTransform handler — gated on
+    // `actor.kind == ActorKind::Mcv` — fires for scenario-declared
+    // MCVs. Without this special-case, classify_actor's locomotor
+    // check returns Vehicle for MCV and `Command::deploy` silently
+    // no-ops on the scenario MCV (caught in bench MCV-deploy smoke).
+    if name.eq_ignore_ascii_case("mcv") {
+        return ActorKind::Mcv;
+    }
     if info.has_trait("Building") {
         ActorKind::Building
     } else if info.has_trait("Aircraft") {

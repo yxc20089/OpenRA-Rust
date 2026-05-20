@@ -1873,6 +1873,13 @@ fn load_rules_with_fallback() -> (GameRules, data_rules::Rules) {
 
 fn kind_for_unit_type(t: &str) -> ActorKind {
     match t {
+        // MCV is its own kind — the world.rs DeployTransform handler
+        // gates on `actor.kind == ActorKind::Mcv`, so a scenario-YAML
+        // mcv that fell through to ActorKind::Infantry would silently
+        // refuse to deploy. (Auto-seeded MCVs via spawn_mcvs:true get
+        // their kind set explicitly in world.rs:4572; this fallback
+        // is the path scenario-declared `{type: mcv}` actors take.)
+        "mcv" => ActorKind::Mcv,
         "1tnk" | "2tnk" | "3tnk" | "4tnk" | "harv" | "jeep" | "apc" | "arty" | "ftrk" => {
             ActorKind::Vehicle
         }
