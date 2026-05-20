@@ -36,6 +36,15 @@ pub enum ScriptedBehavior {
     /// transiently pulls the guard off post (opening a gap), and it
     /// snaps back. The faithful "guards you can bait aside" behaviour.
     Guard,
+    /// Worker-priority HARASSER: each unit attacks the nearest agent
+    /// `harv` (harvester) it can find — falling back to the nearest
+    /// combat actor only when no harvesters are alive. Fast cadence,
+    /// AttackAnything stance. The faithful "worker harass" idiom: a
+    /// defender that ignores the live economy and chases off-map
+    /// loses harvesters one by one; a defender that rings the ore
+    /// patch with fire support kills the raider on contact and
+    /// throughput is sustained.
+    Raider,
 }
 
 impl ScriptedBehavior {
@@ -46,6 +55,7 @@ impl ScriptedBehavior {
             "patrol" => Some(Self::Patrol),
             "turtle" => Some(Self::Turtle),
             "guard" => Some(Self::Guard),
+            "raider" => Some(Self::Raider),
             _ => None,
         }
     }
@@ -89,6 +99,7 @@ impl ScriptedBot {
             ScriptedBehavior::Patrol => 24,
             ScriptedBehavior::Turtle => 64,
             ScriptedBehavior::Guard => 10,
+            ScriptedBehavior::Raider => 12,
         };
         ScriptedBot {
             player_id,
@@ -113,6 +124,23 @@ impl ScriptedBot {
                         | Some(ActorKind::Vehicle)
                         | Some(ActorKind::Mcv)
                 )
+            })
+            .filter_map(|id| world.actor_location(id).map(|(x, y)| (id, x, y)))
+            .collect()
+    }
+
+    /// Just the agent's harvesters with position — for Raider's
+    /// worker-priority targeting. Ground truth, fog-independent.
+    /// Matches `actor_type == "harv"` (the RA harvester actor id).
+    fn harv_foes(&self, world: &World) -> Vec<(u32, i32, i32)> {
+        world
+            .actor_ids_for_player(self.target_player_id)
+            .into_iter()
+            .filter(|id| {
+                world
+                    .actor_type_name(*id)
+                    .map(|t| t.eq_ignore_ascii_case("harv"))
+                    .unwrap_or(false)
             })
             .filter_map(|id| world.actor_location(id).map(|(x, y)| (id, x, y)))
             .collect()
@@ -167,7 +195,9 @@ impl ScriptedBot {
                 ScriptedBehavior::Patrol
                 | ScriptedBehavior::Turtle
                 | ScriptedBehavior::Guard => 2,
-                ScriptedBehavior::Hunt | ScriptedBehavior::Rusher => 3,
+                ScriptedBehavior::Hunt
+                | ScriptedBehavior::Rusher
+                | ScriptedBehavior::Raider => 3,
             };
             orders.extend(self.stance_all(&units, st));
             self.initialized = true;
@@ -237,6 +267,34 @@ impl ScriptedBot {
                                 extra_data: Some(tid),
                             });
                         }
+                    }
+                }
+            }
+            ScriptedBehavior::Raider => {
+                // Worker-priority: target harvesters first; fall back
+                // to nearest combat actor only when none are alive.
+                // Each raider picks its OWN nearest harv (so multiple
+                // raiders fan out across multiple harvesters, faithful
+                // to the SC2-style worker harass).
+                let harvs = self.harv_foes(world);
+                let fallback_foes = if harvs.is_empty() {
+                    self.foes(world)
+                } else {
+                    Vec::new()
+                };
+                for &(id, ux, uy) in &units {
+                    let target = if !harvs.is_empty() {
+                        nearest(&harvs, ux, uy)
+                    } else {
+                        nearest(&fallback_foes, ux, uy)
+                    };
+                    if let Some((tid, _, _)) = target {
+                        orders.push(GameOrder {
+                            order_string: "Attack".to_string(),
+                            subject_id: Some(id),
+                            target_string: None,
+                            extra_data: Some(tid),
+                        });
                     }
                 }
             }
