@@ -197,6 +197,16 @@ impl Env {
     /// without any `spawn_point:` fields collapses to `0` (no filter).
     /// `Some(n)` forces that spawn_point regardless of what the
     /// scenario declares — caller's responsibility to pass a valid one.
+    ///
+    /// Wave-9: the seed-axis source falls back to the enemy side when
+    /// the agent declares no spawn_points (e.g.
+    /// `adv-rps-counter-pick`, where the agent base is identical
+    /// every seed but the enemy composition rotates across
+    /// `spawn_point` groups). When the agent declares spawn_points,
+    /// those drive the round-robin (back-compat for every existing
+    /// pack) and the enemy filter activates independently on the
+    /// SAME chosen `spawn_point` (so a pack can co-vary agent corner
+    /// and enemy composition if it wants).
     pub fn new_with_spawn_point(
         scenario_path_or_alias: &str,
         seed: u64,
@@ -206,12 +216,18 @@ impl Env {
         let chosen_sp = match spawn_point {
             Some(n) => n,
             None => {
-                let sps = oramap::distinct_agent_spawn_points(&scenario_path)
+                let agent_sps = oramap::distinct_agent_spawn_points(&scenario_path)
                     .map_err(|e| EnvError::BadScenario(e.to_string()))?;
-                if sps.is_empty() {
-                    0
+                if !agent_sps.is_empty() {
+                    agent_sps[(seed as usize) % agent_sps.len()]
                 } else {
-                    sps[(seed as usize) % sps.len()]
+                    let enemy_sps = oramap::distinct_enemy_spawn_points(&scenario_path)
+                        .map_err(|e| EnvError::BadScenario(e.to_string()))?;
+                    if enemy_sps.is_empty() {
+                        0
+                    } else {
+                        enemy_sps[(seed as usize) % enemy_sps.len()]
+                    }
                 }
             }
         };

@@ -449,9 +449,12 @@ impl From<io::Error> for MapLoadError {
 ///    then to `~/Projects/OpenRA-RL-Training/scenarios/maps/rush-hour-arena.oramap`.
 ///    On total failure returns [`MapLoadError::MissingBaseMap`].
 /// 3. Expands the actor list: each entry's `count: N` is repeated N times
-///    (jitter is ignored — tests want a deterministic count). For agent
-///    actors, only entries matching the chosen `spawn_point` (default 0)
-///    are kept; enemy actors do not have spawn_points and are always kept.
+///    (jitter is ignored — tests want a deterministic count). The
+///    `spawn_point` filter activates PER OWNER: if any agent actor
+///    declares `spawn_point`, only matching agent actors pass; same for
+///    enemy actors (Wave 9 — per-owner activation, see
+///    [`expand_scenario_actors`]). Owners that don't use `spawn_point`
+///    at all pass through unchanged (back-compat).
 pub fn load_rush_hour_map(path: &Path) -> Result<MapDef, MapLoadError> {
     load_rush_hour_map_with_spawn(path, 0)
 }
@@ -469,6 +472,29 @@ pub fn distinct_agent_spawn_points(path: &Path) -> Result<Vec<i32>, MapLoadError
         .actors
         .iter()
         .filter(|a| a.owner == "agent")
+        .filter_map(|a| a.spawn_point)
+        .collect();
+    sps.sort_unstable();
+    sps.dedup();
+    Ok(sps)
+}
+
+/// Distinct `spawn_point` values used by ENEMY actors in the scenario,
+/// sorted ascending. Parallels [`distinct_agent_spawn_points`]: an
+/// empty result means the scenario does not vary enemy composition by
+/// spawn_point (every enemy actor passes through on every requested
+/// spawn — pre-Wave-9 back-compat). When non-empty, the env can
+/// round-robin the seed axis over enemy compositions even when the
+/// agent base is fixed. The two owners activate INDEPENDENTLY in
+/// [`expand_scenario_actors`].
+pub fn distinct_enemy_spawn_points(path: &Path) -> Result<Vec<i32>, MapLoadError> {
+    let scenario_text = std::fs::read_to_string(path)?;
+    let scenario = parse_scenario_yaml(&scenario_text)
+        .map_err(|e| MapLoadError::BadScenario(e.to_string()))?;
+    let mut sps: Vec<i32> = scenario
+        .actors
+        .iter()
+        .filter(|a| a.owner == "enemy")
         .filter_map(|a| a.spawn_point)
         .collect();
     sps.sort_unstable();
@@ -989,24 +1015,49 @@ fn read_xy_list(lines: &[&str], start: usize, expected_indent: usize) -> ((i32, 
     (xy, i)
 }
 
-/// Expand `count: N` into N copies and apply spawn_point filter for agent
-/// actors. Enemy actors are kept regardless of spawn_point.
+/// Expand `count: N` into N copies and apply the spawn_point filter
+/// PER OWNER. The agent and enemy sides activate the filter
+/// independently:
 ///
-/// Phase 7: when *no* agent actor has a spawn_point set (i.e. the
-/// scenario doesn't use the multi-spawn pattern at all — e.g. the
-/// scout-* strategy scenarios), we keep every agent actor without
-/// filtering. This preserves the rush-hour multi-spawn semantics while
-/// allowing simpler scenarios to omit the `spawn_point:` field.
+/// - Phase 7 (agent): when no agent actor declares `spawn_point`, the
+///   agent filter is inactive and every agent actor passes through.
+///   When ANY agent actor declares `spawn_point`, ONLY agent actors
+///   whose `spawn_point` matches the requested one are kept — agent
+///   actors without `spawn_point` are filtered out (the established
+///   "duplicate base/garrison across both spawn groups" idiom).
+/// - Wave 9 (enemy): the same logic applies to enemy actors. When no
+///   enemy actor declares `spawn_point`, every enemy actor passes
+///   through (pre-Wave-9 back-compat). When ANY enemy actor declares
+///   `spawn_point`, ONLY enemy actors whose `spawn_point` matches the
+///   requested one are kept; "persistent every-seed" enemy actors
+///   (e.g. a far-corner `fact` marker that prevents engine
+///   auto-`done`) must be duplicated across every spawn group, just
+///   like the agent side.
+///
+/// The two owners are independent: a scenario can fix the agent base
+/// across all seeds (no agent declares `spawn_point` → agent filter
+/// off) while rotating the enemy archetype (enemies declare
+/// `spawn_point` → enemy filter on). This is the contract the
+/// `adv-rps-counter-pick` pack relies on.
 fn expand_scenario_actors(raw: &[RawScenarioActor], spawn_point: i32) -> Vec<ScenarioActor> {
     let any_agent_has_spawn = raw
         .iter()
         .any(|r| r.owner == "agent" && r.spawn_point.is_some());
+    let any_enemy_has_spawn = raw
+        .iter()
+        .any(|r| r.owner == "enemy" && r.spawn_point.is_some());
     let mut out = Vec::new();
     for r in raw {
-        // Filter agent actors by spawn_point selection ONLY if the
-        // scenario actually uses spawn points. Enemy actors don't have
-        // spawn_point set (None) and pass through unconditionally.
+        // Per-owner spawn_point filter. An owner's filter activates
+        // when at least one actor of that owner declared
+        // `spawn_point`. Then every actor of that owner must declare
+        // a matching `spawn_point` to pass — the "persistent
+        // every-seed" idiom requires duplicating the actor across
+        // every spawn group at identical coords.
         if r.owner == "agent" && any_agent_has_spawn && r.spawn_point != Some(spawn_point) {
+            continue;
+        }
+        if r.owner == "enemy" && any_enemy_has_spawn && r.spawn_point != Some(spawn_point) {
             continue;
         }
         let n = r.count.max(1);
