@@ -389,6 +389,64 @@ pub struct MapDef {
     /// Scripted opponent behaviour for the enemy side, if the
     /// scenario set `enemy: {bot: ...}` (else None ⇒ stance-only).
     pub enemy_bot: Option<String>,
+    /// Scripted mid-episode events (spawn waves, region destroys,
+    /// deadline shorteners). Empty when the scenario omits a
+    /// `scheduled_events:` block. The list preserves declaration order;
+    /// downstream consumers (the env per-tick firing path) typically
+    /// fire each event exactly once when `world_tick >= event.tick`.
+    pub scheduled_events: Vec<ScheduledEvent>,
+}
+
+/// One scripted mid-episode event. Parsed from a top-level
+/// `scheduled_events:` block in the scenario YAML.
+#[derive(Debug, Clone)]
+pub struct ScheduledEvent {
+    /// Absolute world tick at which to fire. Compared against
+    /// `world.world_tick` (engine advances `NetFrameInterval == 3` per
+    /// processed frame), so values are roughly 30 ticks per second.
+    pub tick: u32,
+    /// What to do when the event fires.
+    pub kind: ScheduledEventKind,
+}
+
+/// Discriminated union of supported scheduled-event payloads. Adding a
+/// new variant requires (a) parsing it in `read_scheduled_events`, (b)
+/// handling it in the env's per-tick scheduled-event firing path
+/// (`Env::fire_scheduled_events`), and (c) covering it in the parsing
+/// test (`openra-data/tests/test_scheduled_events.rs`).
+#[derive(Debug, Clone)]
+pub enum ScheduledEventKind {
+    /// Inject one or more new actors into the running world. Each
+    /// `ScenarioActor` is expanded into a single actor at its declared
+    /// `position`; `count: N` is pre-expanded at parse time (matches
+    /// the initial-actors path in `expand_scenario_actors`).
+    SpawnActors { actors: Vec<ScenarioActor> },
+    /// Remove every actor that matches the supplied filter. Intended
+    /// for mid-episode base-teardown / "the defenders retreat" scripts.
+    DestroyActors { filter: ActorFilter },
+    /// Shrink the episode's hard deadline. `new_max_ticks` is the new
+    /// absolute cap; the env ignores any value higher than the current
+    /// cap (deadline never *grows*).
+    ShortenDeadline { new_max_ticks: u32 },
+}
+
+/// Filter for `DestroyActors` (and any future "find-and-act" variants).
+/// All declared sub-filters AND together. `owner` matches the scenario
+/// owner tag (`"agent"` or `"enemy"`). `region` is an inclusive
+/// Euclidean radius around a cell.
+#[derive(Debug, Clone, Default)]
+pub struct ActorFilter {
+    pub owner: Option<String>,
+    pub region: Option<RegionFilter>,
+}
+
+/// Circular region filter — actors whose cell `(cx, cy)` satisfies
+/// `(cx - x)^2 + (cy - y)^2 <= radius^2` match.
+#[derive(Debug, Clone, Copy)]
+pub struct RegionFilter {
+    pub x: i32,
+    pub y: i32,
+    pub radius: i32,
 }
 
 impl MapDef {
@@ -607,6 +665,7 @@ pub fn load_rush_hour_map_with_spawn(
         spawn_mcvs: scenario.spawn_mcvs.unwrap_or(true),
         starting_cash: scenario.starting_cash.unwrap_or(5000),
         enemy_bot: scenario.enemy_bot,
+        scheduled_events: scenario.scheduled_events,
     })
 }
 
@@ -630,6 +689,8 @@ struct ScenarioYaml {
     /// Optional scripted opponent behaviour for the enemy side
     /// (`enemy: {bot: hunt|rusher|patrol|turtle}`).
     enemy_bot: Option<String>,
+    /// Parsed `scheduled_events:` block (empty when omitted).
+    scheduled_events: Vec<ScheduledEvent>,
 }
 
 #[derive(Debug, Clone)]
@@ -720,6 +781,14 @@ fn parse_scenario_yaml(text: &str) -> io::Result<ScenarioYaml> {
                         .parse()
                         .ok();
                     i += 1;
+                    continue;
+                }
+                "scheduled_events" => {
+                    let detected_indent = detect_list_indent(&lines, i + 1).unwrap_or(0);
+                    let (events, ni) =
+                        read_scheduled_events(&lines, i + 1, detected_indent);
+                    out.scheduled_events = events;
+                    i = ni;
                     continue;
                 }
                 "spawn_mcvs" => {
@@ -1071,6 +1140,218 @@ fn expand_scenario_actors(raw: &[RawScenarioActor], spawn_point: i32) -> Vec<Sce
         }
     }
     out
+}
+
+/// Parse the `scheduled_events:` list. Each list item is a dict with
+/// `tick:` + `type:` + a type-dependent payload. Unknown `type:` values
+/// are tolerated (skipped) so adding a new event kind in YAML doesn't
+/// break older engine builds. Returns the parsed events (in declaration
+/// order) and the index of the first line past the block.
+fn read_scheduled_events(
+    lines: &[&str],
+    start: usize,
+    list_indent: usize,
+) -> (Vec<ScheduledEvent>, usize) {
+    let mut events = Vec::new();
+    let mut i = start;
+
+    while i < lines.len() {
+        let raw = lines[i];
+        let trimmed = strip_yaml_comment(raw).trim_end();
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+        let indent = leading_spaces(raw);
+        let trim_lead = trimmed.trim_start();
+
+        if indent < list_indent {
+            break;
+        }
+        if indent == list_indent && !trim_lead.starts_with("- ") {
+            break;
+        }
+
+        if let Some(rest) = trim_lead.strip_prefix("- ") {
+            // Start a new event. The first key may be `tick:` or `type:`.
+            let mut ev_tick: Option<u32> = None;
+            let mut ev_type: Option<String> = None;
+            let mut spawn_actors: Vec<ScenarioActor> = Vec::new();
+            let mut filter: ActorFilter = ActorFilter::default();
+            let mut new_max_ticks: Option<u32> = None;
+
+            if let Some((k, v)) = split_key_value(rest) {
+                match k {
+                    "tick" => ev_tick = v.parse().ok(),
+                    "type" => ev_type = Some(strip_quotes(v).to_string()),
+                    _ => {}
+                }
+            }
+            i += 1;
+
+            // Body lines indented strictly more than `list_indent`.
+            while i < lines.len() {
+                let sub = lines[i];
+                let sub_trim = strip_yaml_comment(sub).trim_end();
+                if sub_trim.is_empty() {
+                    i += 1;
+                    continue;
+                }
+                let sub_indent = leading_spaces(sub);
+                if sub_indent <= list_indent {
+                    break;
+                }
+                let sub_lead = sub_trim.trim_start();
+                match split_key_value(sub_lead) {
+                    Some(("tick", v)) => {
+                        ev_tick = v.parse().ok();
+                        i += 1;
+                    }
+                    Some(("type", v)) => {
+                        ev_type = Some(strip_quotes(v).to_string());
+                        i += 1;
+                    }
+                    Some(("new_max_ticks", v)) => {
+                        new_max_ticks = v.parse().ok();
+                        i += 1;
+                    }
+                    Some(("actors", "")) => {
+                        let nested_indent = detect_list_indent(lines, i + 1)
+                            .unwrap_or(sub_indent + 2);
+                        let (raw_actors, ni) =
+                            read_actors_list(lines, i + 1, nested_indent);
+                        // Expand `count:` exactly like the initial-spawn
+                        // path. `spawn_point` isn't meaningful for a
+                        // scheduled-event injection (the seed-axis filter
+                        // is consumed once at episode start), so we drop
+                        // it here.
+                        for r in &raw_actors {
+                            let n = r.count.max(1);
+                            for _ in 0..n {
+                                spawn_actors.push(ScenarioActor {
+                                    actor_type: r.actor_type.clone(),
+                                    owner: r.owner.clone(),
+                                    position: r.position,
+                                    stance: r.stance,
+                                });
+                            }
+                        }
+                        i = ni;
+                    }
+                    Some(("filter", "")) => {
+                        let (parsed, ni) =
+                            read_actor_filter(lines, i + 1, sub_indent);
+                        filter = parsed;
+                        i = ni;
+                    }
+                    _ => {
+                        i += 1;
+                    }
+                }
+            }
+
+            // Assemble the event. Skip unknown / malformed entries.
+            if let (Some(tick), Some(t)) = (ev_tick, ev_type.as_deref()) {
+                let kind = match t {
+                    "spawn_actors" => Some(ScheduledEventKind::SpawnActors {
+                        actors: spawn_actors,
+                    }),
+                    "destroy_actors" => {
+                        Some(ScheduledEventKind::DestroyActors { filter })
+                    }
+                    "shorten_deadline" => new_max_ticks.map(|n| {
+                        ScheduledEventKind::ShortenDeadline { new_max_ticks: n }
+                    }),
+                    _ => None, // unknown event kind → tolerant skip
+                };
+                if let Some(k) = kind {
+                    events.push(ScheduledEvent { tick, kind: k });
+                }
+            }
+            continue;
+        }
+        i += 1;
+    }
+    (events, i)
+}
+
+/// Parse an `ActorFilter` block. Lines belong to the filter while their
+/// indent is strictly greater than `outer_indent` (the indent of the
+/// `filter:` key line itself). Returns the filter and the index of the
+/// first line past it.
+fn read_actor_filter(
+    lines: &[&str],
+    start: usize,
+    outer_indent: usize,
+) -> (ActorFilter, usize) {
+    let mut out = ActorFilter::default();
+    let mut i = start;
+    while i < lines.len() {
+        let raw = lines[i];
+        let trimmed = strip_yaml_comment(raw).trim_end();
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+        let indent = leading_spaces(raw);
+        if indent <= outer_indent {
+            break;
+        }
+        let lead = trimmed.trim_start();
+        match split_key_value(lead) {
+            Some(("owner", v)) => {
+                out.owner = Some(strip_quotes(v).to_string());
+                i += 1;
+            }
+            Some(("region", "")) => {
+                let (region, ni) = read_region_filter(lines, i + 1, indent);
+                out.region = region;
+                i = ni;
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    (out, i)
+}
+
+/// Parse a `region:` sub-block (`x:`, `y:`, `radius:` keys). Returns
+/// `None` when the block is empty or any required field is missing.
+fn read_region_filter(
+    lines: &[&str],
+    start: usize,
+    outer_indent: usize,
+) -> (Option<RegionFilter>, usize) {
+    let mut x: Option<i32> = None;
+    let mut y: Option<i32> = None;
+    let mut radius: Option<i32> = None;
+    let mut i = start;
+    while i < lines.len() {
+        let raw = lines[i];
+        let trimmed = strip_yaml_comment(raw).trim_end();
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+        let indent = leading_spaces(raw);
+        if indent <= outer_indent {
+            break;
+        }
+        let lead = trimmed.trim_start();
+        match split_key_value(lead) {
+            Some(("x", v)) => x = v.parse().ok(),
+            Some(("y", v)) => y = v.parse().ok(),
+            Some(("radius", v)) => radius = v.parse().ok(),
+            _ => {}
+        }
+        i += 1;
+    }
+    let region = match (x, y, radius) {
+        (Some(x), Some(y), Some(radius)) => Some(RegionFilter { x, y, radius }),
+        _ => None,
+    };
+    (region, i)
 }
 
 // Suppress an unused-import warning when miniyaml isn't referenced from

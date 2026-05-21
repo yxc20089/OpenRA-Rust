@@ -179,6 +179,16 @@ pub struct Env {
     enemy_started_with_buildings: bool,
     /// True iff the scenario placed any enemy actor (see is_terminal).
     enemy_started_present: bool,
+    /// Lazily-cached typed ruleset used by `attach_typed_components` for
+    /// scheduled-event SpawnActors injections. `None` until the first
+    /// scheduled-spawn fires (most scenarios declare no scheduled events,
+    /// so we avoid the I/O cost on the hot reset path).
+    typed_rules_cache: Option<openra_data::rules::Rules>,
+    /// Per-event "already fired" flags, parallel to
+    /// `map_def.scheduled_events`. Cleared and resized on `reset()`.
+    /// Each event fires exactly once when `world.world_tick` first
+    /// reaches its declared trigger.
+    fired_scheduled_events: Vec<bool>,
 }
 
 impl Env {
@@ -261,6 +271,8 @@ impl Env {
             cooldown_ticks: DEFAULT_INTERRUPT_COOLDOWN_TICKS,
             enemy_started_with_buildings: false,
             enemy_started_present: false,
+            typed_rules_cache: None,
+            fired_scheduled_events: Vec::new(),
         })
     }
 
@@ -301,6 +313,11 @@ impl Env {
         self.explored_cells.clear();
         self.last_warnings.clear();
         self.interrupt_state.clear();
+        // Reset the per-episode scheduled-event fired flags. Each event
+        // fires exactly once per episode, so resizing here is sufficient
+        // to re-arm them for the new run.
+        self.fired_scheduled_events =
+            vec![false; self.map_def.scheduled_events.len()];
         // Snapshot whether the enemy starts with any MustBeDestroyed
         // building. Decides the terminal-condition policy for the rest
         // of the episode (see `is_terminal`). Done after build_world
@@ -1233,6 +1250,167 @@ impl Env {
             // use the post-tick state.
             world.update_typed_shroud_all_players();
         }
+        // Fire any scheduled events that have reached their tick. We do
+        // this AFTER process_frame so SpawnActors land in the just-
+        // advanced world (and the next process_frame's shroud refresh
+        // sees them). For consistency with the initial-spawn path we
+        // refresh the typed shroud once more if any event fired.
+        if self.fire_scheduled_events()
+            && let Some(world) = self.world.as_mut()
+        {
+            world.update_typed_shroud_all_players();
+        }
+    }
+
+    /// Walk `map_def.scheduled_events`, firing each entry whose `tick`
+    /// has been reached and that hasn't fired yet in this episode.
+    /// Returns `true` if at least one event fired.
+    ///
+    /// SpawnActors injects new actors using the same path as the
+    /// initial-actors loop in `build_world_for_episode` (Mobile/Health
+    /// traits for vehicles, Building/Health for structures, optional
+    /// stance, typed Vehicle/Turret components for tanks).
+    ///
+    /// DestroyActors removes every actor matching the filter via
+    /// `world::remove_test_actor` (also clears terrain occupancy).
+    ///
+    /// ShortenDeadline clamps `self.max_ticks` downward only — the
+    /// deadline never grows, matching the design intent.
+    fn fire_scheduled_events(&mut self) -> bool {
+        if self.map_def.scheduled_events.is_empty() {
+            return false;
+        }
+        let world_tick = match &self.world {
+            Some(w) => w.world_tick,
+            None => return false,
+        };
+        let mut any_fired = false;
+        // Snapshot events to fire (indices) so we can release the
+        // immutable borrow on `self` before mutating.
+        let mut to_fire: Vec<usize> = Vec::new();
+        for (idx, ev) in self.map_def.scheduled_events.iter().enumerate() {
+            if self
+                .fired_scheduled_events
+                .get(idx)
+                .copied()
+                .unwrap_or(true)
+            {
+                continue;
+            }
+            if world_tick >= ev.tick {
+                to_fire.push(idx);
+            }
+        }
+        for idx in to_fire {
+            // Clone the kind so we can drop the borrow on `self.map_def`.
+            let kind = self.map_def.scheduled_events[idx].kind.clone();
+            self.fired_scheduled_events[idx] = true;
+            any_fired = true;
+            match kind {
+                openra_data::oramap::ScheduledEventKind::SpawnActors {
+                    actors,
+                } => {
+                    self.apply_spawn_actors(&actors);
+                }
+                openra_data::oramap::ScheduledEventKind::DestroyActors {
+                    filter,
+                } => {
+                    self.apply_destroy_actors(&filter);
+                }
+                openra_data::oramap::ScheduledEventKind::ShortenDeadline {
+                    new_max_ticks,
+                } => {
+                    if new_max_ticks < self.max_ticks {
+                        self.max_ticks = new_max_ticks.max(1);
+                    }
+                }
+            }
+        }
+        any_fired
+    }
+
+    /// Inject the supplied actors into the live world. Mirrors the
+    /// "scenario actors" loop in `build_world_for_episode`.
+    fn apply_spawn_actors(&mut self, actors: &[ScenarioActor]) {
+        let agent_pid = self.agent_player_id;
+        let enemy_pid = self.enemy_player_id;
+        let world = match self.world.as_mut() {
+            Some(w) => w,
+            None => return,
+        };
+        // Lazily resolve a typed ruleset so newly-spawned vehicles get
+        // Vehicle/Turret components (otherwise turreted tanks would
+        // never aim at targets). Cached across the episode.
+        if self.typed_rules_cache.is_none() {
+            let (_, typed_rules) = load_rules_with_fallback();
+            self.typed_rules_cache = Some(typed_rules);
+        }
+        let typed_rules = self.typed_rules_cache.as_ref().expect("cached above");
+        let mut next_id = scenario_id_seed(world);
+        for sa in actors {
+            let owner = match sa.owner.as_str() {
+                "agent" => agent_pid,
+                "enemy" => enemy_pid,
+                _ => continue,
+            };
+            let actor = build_scenario_actor(next_id, sa, owner, world);
+            world::insert_test_actor(world, actor);
+            if let Some(s) = sa.stance {
+                world::set_actor_stance(world, next_id, s);
+            }
+            attach_typed_components(world, next_id, &sa.actor_type, typed_rules);
+            next_id += 1;
+        }
+    }
+
+    /// Remove every actor matching `filter` from the world.
+    fn apply_destroy_actors(
+        &mut self,
+        filter: &openra_data::oramap::ActorFilter,
+    ) {
+        let agent_pid = self.agent_player_id;
+        let enemy_pid = self.enemy_player_id;
+        let world = match self.world.as_mut() {
+            Some(w) => w,
+            None => return,
+        };
+        // Resolve owner-id filter (if any). Unknown owner tags drop the
+        // whole event silently — matches the lenient parsing policy.
+        let owner_pid: Option<u32> = match filter.owner.as_deref() {
+            None => None,
+            Some("agent") => Some(agent_pid),
+            Some("enemy") => Some(enemy_pid),
+            Some(_) => return,
+        };
+        // Enumerate candidate ids. With an owner filter we can restrict
+        // to that player's actors; otherwise we sweep every owned actor.
+        let candidate_ids: Vec<u32> = match owner_pid {
+            Some(pid) => world.actor_ids_for_player(pid),
+            None => {
+                let mut v = world.actor_ids_for_player(agent_pid);
+                v.extend(world.actor_ids_for_player(enemy_pid));
+                v
+            }
+        };
+        let region = filter.region;
+        let mut to_remove: Vec<u32> = Vec::new();
+        for aid in candidate_ids {
+            if let Some(r) = region {
+                let (ax, ay) = match world.actor_location(aid) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                let dx = ax - r.x;
+                let dy = ay - r.y;
+                if dx * dx + dy * dy > r.radius * r.radius {
+                    continue;
+                }
+            }
+            to_remove.push(aid);
+        }
+        for id in to_remove {
+            world::remove_test_actor(world, id);
+        }
     }
 
     /// Return the most recent observation snapshot. Useful for tests
@@ -1965,6 +2143,7 @@ pub fn build_test_env_with_no_enemies(map_size: (i32, i32), seed: u64) -> Env {
         spawn_mcvs: true,
         starting_cash: 5000,
         enemy_bot: None,
+        scheduled_events: Vec::new(),
     };
     let mut env = Env {
         scenario_path: PathBuf::from("<test>"),
@@ -1984,6 +2163,8 @@ pub fn build_test_env_with_no_enemies(map_size: (i32, i32), seed: u64) -> Env {
         cooldown_ticks: DEFAULT_INTERRUPT_COOLDOWN_TICKS,
         enemy_started_with_buildings: false,
         enemy_started_present: false,
+        typed_rules_cache: None,
+        fired_scheduled_events: Vec::new(),
     };
     env.reset();
     env
