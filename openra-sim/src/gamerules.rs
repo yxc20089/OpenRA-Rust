@@ -420,6 +420,62 @@ impl GameRules {
         self.weapons.get(name)
     }
 
+    /// Effective per-hit damage of a weapon against a given armor class,
+    /// after applying the weapon's `Versus` multiplier. This is the
+    /// armor-class damage model: `damage × versus[armor] / 100`. A
+    /// missing `Versus` entry defaults to 100% (no modifier), matching
+    /// C# `Warhead.DamageVersus`.
+    pub fn effective_damage(weapon: &WeaponStats, target_armor: ArmorType) -> i32 {
+        let pct = weapon.versus.get(&target_armor).copied().unwrap_or(100);
+        let scaled = (weapon.damage as i64) * (pct as i64) / 100;
+        scaled.max(0) as i32
+    }
+
+    /// Select the best armament for an attacker firing at a target with
+    /// the given `target_armor` class. OpenRA infantry/vehicles can
+    /// carry multiple armaments (e.g. e3 has RedEye anti-air PRIMARY +
+    /// Dragon anti-ground SECONDARY); the engine must pick the weapon
+    /// that deals the most effective damage to *this* target rather
+    /// than blindly using `weapons[0]`.
+    ///
+    /// Effective damage already folds in the per-armor-class `Versus`
+    /// multiplier, so an anti-armor warhead (Dragon: 5000 base, Heavy
+    /// 100%) is correctly preferred over an anti-air missile (RedEye:
+    /// 2400 base, no Heavy entry ⇒ 100%) when shooting a heavy tank,
+    /// and the anti-air weapon is preferred against aircraft armor.
+    ///
+    /// Returns `(weapon_name, &WeaponStats)`. Falls back to the first
+    /// listed weapon when no weapon has positive effective damage (so
+    /// degenerate rulesets still fire something), and to `None` only
+    /// when the attacker has no weapons at all.
+    pub fn best_weapon_against(
+        &self,
+        attacker_type: &str,
+        target_armor: ArmorType,
+    ) -> Option<(&str, &WeaponStats)> {
+        let stats = self.actor(attacker_type)?;
+        let mut best: Option<(&str, &WeaponStats, i32)> = None;
+        for wname in &stats.weapons {
+            let Some(w) = self.weapon(wname) else { continue };
+            let eff = Self::effective_damage(w, target_armor);
+            match best {
+                Some((_, _, beff)) if beff >= eff => {}
+                _ => best = Some((wname.as_str(), w, eff)),
+            }
+        }
+        if let Some((n, w, eff)) = best {
+            if eff > 0 {
+                return Some((n, w));
+            }
+        }
+        // No weapon has positive effective damage — fall back to the
+        // first listed weapon so the attacker still behaves.
+        stats
+            .weapons
+            .first()
+            .and_then(|n| self.weapon(n).map(|w| (n.as_str(), w)))
+    }
+
     /// Get production cost for an item.
     pub fn cost(&self, name: &str) -> i32 {
         self.actors.get(name).map(|a| a.cost).unwrap_or(0)
