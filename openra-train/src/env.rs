@@ -352,7 +352,7 @@ impl Env {
         self.last_warnings.clear();
 
         // Apply all commands, building up a flat order list.
-        let orders = self.build_orders(commands);
+        let orders = self.build_orders(commands, self.agent_player_id);
 
         // Issue orders, then run N ticks. We issue all orders on the
         // *first* frame so subsequent ticks just advance state.
@@ -371,6 +371,62 @@ impl Env {
         StepResult {
             obs,
             reward: 0.0,
+            done,
+            warnings: self.last_warnings.clone(),
+        }
+    }
+
+    /// Advance the shared world one decision step with commands from
+    /// BOTH players — the engine entry point for agent-vs-agent 1v1.
+    ///
+    /// Orders for each side are built independently (each scoped to its
+    /// own unit ownership via `build_orders`) and applied into the SAME
+    /// first frame, then `ticks_per_step` frames run — so neither side
+    /// moves "first". Returns the post-step observation for EACH
+    /// player, each from its own fog-of-war view. `done` is true once
+    /// either base falls (or the deadline hits); the caller inspects
+    /// each side's surviving buildings to decide the winner.
+    pub fn step_1v1(
+        &mut self,
+        agent_commands: &[Command],
+        enemy_commands: &[Command],
+    ) -> Step1v1Result {
+        self.last_warnings.clear();
+
+        let mut orders = self.build_orders(agent_commands, self.agent_player_id);
+        let enemy_orders =
+            self.build_orders(enemy_commands, self.enemy_player_id);
+        orders.extend(enemy_orders);
+
+        if self.world.is_some() {
+            self.tick_world_with_orders(&orders);
+            for _ in 1..self.ticks_per_step {
+                self.tick_world_with_orders(&[]);
+            }
+        }
+
+        self.refresh_explored_cells();
+        self.update_kill_counter();
+
+        // Agent side reuses the cached single-controller state.
+        let agent_obs = self.observation();
+        // Enemy side: scan its own shroud + kill tally fresh.
+        let enemy_kills = match &self.world {
+            Some(w) => w.kills_for_player(self.enemy_player_id) as i32,
+            None => 0,
+        };
+        let enemy_explored = self.explored_cells_for(self.enemy_player_id);
+        let enemy_obs = self.observation_for(
+            self.enemy_player_id,
+            self.agent_player_id,
+            &enemy_explored,
+            enemy_kills,
+        );
+
+        let done = self.is_terminal();
+        Step1v1Result {
+            agent_obs,
+            enemy_obs,
             done,
             warnings: self.last_warnings.clone(),
         }
@@ -395,7 +451,7 @@ impl Env {
         enabled_signals_override: Option<HashSet<String>>,
     ) -> StepUntilEventResult {
         self.last_warnings.clear();
-        let orders = self.build_orders(commands);
+        let orders = self.build_orders(commands, self.agent_player_id);
 
         // Clone into an owned set so we can call `&mut self` methods
         // (tick_world_with_orders, check_interrupts) without holding an
@@ -950,15 +1006,27 @@ impl Env {
     }
 
     /// Translate `[Command]` into raw `GameOrder`s.
-    fn build_orders(&mut self, commands: &[Command]) -> Vec<GameOrder> {
+    /// Translate a player's `Command`s into engine `GameOrder`s.
+    ///
+    /// `issuing_player` is the player on whose behalf the commands are
+    /// issued — every unit-ownership check and every player-subject
+    /// order (Surrender / StartProduction / PlaceBuilding) is scoped to
+    /// it. The single-controller `step` passes `agent_player_id`; the
+    /// 1v1 path (`step_1v1`) calls this once per side so both players
+    /// issue orders into the same frame.
+    fn build_orders(
+        &mut self,
+        commands: &[Command],
+        issuing_player: u32,
+    ) -> Vec<GameOrder> {
         let mut orders = Vec::new();
         let world = match &self.world {
             Some(w) => w,
             None => return orders,
         };
 
-        let agent_owned: HashSet<u32> = world
-            .actor_ids_for_player(self.agent_player_id)
+        let issuer_owned: HashSet<u32> = world
+            .actor_ids_for_player(issuing_player)
             .into_iter()
             .collect();
 
@@ -968,7 +1036,7 @@ impl Env {
                 Command::Surrender => {
                     orders.push(GameOrder {
                         order_string: "Surrender".into(),
-                        subject_id: Some(self.agent_player_id),
+                        subject_id: Some(issuing_player),
                         target_string: None,
                         extra_data: None,
                     });
@@ -977,7 +1045,7 @@ impl Env {
                     let s = (*stance).clamp(0, 3) as u32;
                     for id in unit_ids {
                         if let Some(aid) =
-                            resolve_owned(id, &agent_owned, &mut self.last_warnings)
+                            resolve_owned(id, &issuer_owned, &mut self.last_warnings)
                         {
                             orders.push(GameOrder {
                                 order_string: "SetStance".into(),
@@ -991,7 +1059,7 @@ impl Env {
                 Command::Patrol { unit_ids } => {
                     for id in unit_ids {
                         if let Some(aid) =
-                            resolve_owned(id, &agent_owned, &mut self.last_warnings)
+                            resolve_owned(id, &issuer_owned, &mut self.last_warnings)
                         {
                             orders.push(GameOrder {
                                 order_string: "Patrol".into(),
@@ -1016,9 +1084,9 @@ impl Env {
                                 continue;
                             }
                         };
-                        if !agent_owned.contains(&aid) {
+                        if !issuer_owned.contains(&aid) {
                             self.last_warnings
-                                .push(format!("unit {aid} not owned by player_0"));
+                                .push(format!("unit {aid} not owned by issuing player"));
                             continue;
                         }
                         orders.push(GameOrder {
@@ -1050,9 +1118,9 @@ impl Env {
                                 continue;
                             }
                         };
-                        if !agent_owned.contains(&aid) {
+                        if !issuer_owned.contains(&aid) {
                             self.last_warnings
-                                .push(format!("unit {aid} not owned by player_0"));
+                                .push(format!("unit {aid} not owned by issuing player"));
                             continue;
                         }
                         orders.push(GameOrder {
@@ -1074,7 +1142,7 @@ impl Env {
                     };
                     for id in unit_ids {
                         if let Some(aid) =
-                            resolve_owned(id, &agent_owned, &mut self.last_warnings)
+                            resolve_owned(id, &issuer_owned, &mut self.last_warnings)
                         {
                             orders.push(GameOrder {
                                 order_string: "Guard".into(),
@@ -1088,7 +1156,7 @@ impl Env {
                 Command::SetPrimary { unit_ids } => {
                     for id in unit_ids {
                         if let Some(aid) =
-                            resolve_owned(id, &agent_owned, &mut self.last_warnings)
+                            resolve_owned(id, &issuer_owned, &mut self.last_warnings)
                         {
                             orders.push(GameOrder {
                                 order_string: "SetPrimary".into(),
@@ -1113,7 +1181,7 @@ impl Env {
                     let mut accepted = 0usize;
                     for id in unit_ids {
                         if let Some(aid) =
-                            resolve_owned(id, &agent_owned, &mut self.last_warnings)
+                            resolve_owned(id, &issuer_owned, &mut self.last_warnings)
                         {
                             if already + accepted >= cap {
                                 self.last_warnings.push(format!(
@@ -1135,7 +1203,7 @@ impl Env {
                 Command::Unload { unit_ids } => {
                     for id in unit_ids {
                         if let Some(aid) =
-                            resolve_owned(id, &agent_owned, &mut self.last_warnings)
+                            resolve_owned(id, &issuer_owned, &mut self.last_warnings)
                         {
                             orders.push(GameOrder {
                                 order_string: "Unload".into(),
@@ -1149,7 +1217,7 @@ impl Env {
                 Command::AttackMove { unit_ids, target_x, target_y } => {
                     for id in unit_ids {
                         if let Some(aid) =
-                            resolve_owned(id, &agent_owned, &mut self.last_warnings)
+                            resolve_owned(id, &issuer_owned, &mut self.last_warnings)
                         {
                             orders.push(GameOrder {
                                 order_string: "AttackMove".into(),
@@ -1163,7 +1231,7 @@ impl Env {
                 Command::Harvest { unit_ids, target_x, target_y } => {
                     for id in unit_ids {
                         if let Some(aid) =
-                            resolve_owned(id, &agent_owned, &mut self.last_warnings)
+                            resolve_owned(id, &issuer_owned, &mut self.last_warnings)
                         {
                             orders.push(GameOrder {
                                 order_string: "Harvest".into(),
@@ -1177,7 +1245,7 @@ impl Env {
                 Command::SetRallyPoint { unit_ids, target_x, target_y } => {
                     for id in unit_ids {
                         if let Some(aid) =
-                            resolve_owned(id, &agent_owned, &mut self.last_warnings)
+                            resolve_owned(id, &issuer_owned, &mut self.last_warnings)
                         {
                             orders.push(GameOrder {
                                 order_string: "SetRallyPoint".into(),
@@ -1203,7 +1271,7 @@ impl Env {
                     };
                     for id in unit_ids {
                         if let Some(aid) =
-                            resolve_owned(id, &agent_owned, &mut self.last_warnings)
+                            resolve_owned(id, &issuer_owned, &mut self.last_warnings)
                         {
                             orders.push(GameOrder {
                                 order_string: order_string.into(),
@@ -1217,7 +1285,7 @@ impl Env {
                 Command::Build { item } => {
                     orders.push(GameOrder {
                         order_string: "StartProduction".into(),
-                        subject_id: Some(self.agent_player_id),
+                        subject_id: Some(issuing_player),
                         target_string: Some(item.clone()),
                         extra_data: None,
                     });
@@ -1225,7 +1293,7 @@ impl Env {
                 Command::CancelProduction { item } => {
                     orders.push(GameOrder {
                         order_string: "CancelProduction".into(),
-                        subject_id: Some(self.agent_player_id),
+                        subject_id: Some(issuing_player),
                         target_string: Some(item.clone()),
                         extra_data: None,
                     });
@@ -1233,7 +1301,7 @@ impl Env {
                 Command::PlaceBuilding { item, target_x, target_y } => {
                     orders.push(GameOrder {
                         order_string: "PlaceBuilding".into(),
-                        subject_id: Some(self.agent_player_id),
+                        subject_id: Some(issuing_player),
                         target_string: Some(format!("{item},{target_x},{target_y}")),
                         extra_data: None,
                     });
@@ -1494,7 +1562,51 @@ impl Env {
         (t, (h, w, c))
     }
 
+    /// Single-controller observation: the agent player's view.
     fn observation(&self) -> Observation {
+        self.observation_for(
+            self.agent_player_id,
+            self.enemy_player_id,
+            &self.explored_cells,
+            self.units_killed,
+        )
+    }
+
+    /// Observation from the ENEMY player's perspective at the CURRENT
+    /// state, without advancing the world. The 1v1 harness uses this to
+    /// seed the enemy controller's first observation — `reset()` only
+    /// surfaces the agent's view, so without this the harness would
+    /// have to waste a decision turn on an idle bootstrap step.
+    pub fn enemy_observation(&self) -> Observation {
+        let enemy_kills = match &self.world {
+            Some(w) => w.kills_for_player(self.enemy_player_id) as i32,
+            None => 0,
+        };
+        let enemy_explored = self.explored_cells_for(self.enemy_player_id);
+        self.observation_for(
+            self.enemy_player_id,
+            self.agent_player_id,
+            &enemy_explored,
+            enemy_kills,
+        )
+    }
+
+    /// Build an `Observation` from `viewer`'s perspective: `viewer`'s
+    /// actors as own units, `opponent`'s actors fog-limited to
+    /// `viewer`'s shroud, and economy / production / buildings for
+    /// `viewer`. `explored` and `units_killed` are passed in so the
+    /// single-controller path reuses its cached agent state byte-for-
+    /// byte, while the 1v1 path supplies the opponent's freshly-scanned
+    /// values. NOTE: the `spatial` tensor is left agent-perspective —
+    /// it is consumed only by the RL `step` path, never by the 1v1 LLM
+    /// controllers, which read the text/minimap observation fields.
+    fn observation_for(
+        &self,
+        viewer: u32,
+        opponent: u32,
+        explored: &HashSet<(i32, i32)>,
+        units_killed: i32,
+    ) -> Observation {
         let world = match &self.world {
             Some(w) => w,
             None => {
@@ -1545,7 +1657,7 @@ impl Env {
             } else {
                 1.0
             };
-            if a.owner == self.agent_player_id {
+            if a.owner == viewer {
                 if matches!(a.kind, ActorKind::Building) {
                     // Own buildings — Phase 7 surfaces them too, though
                     // strategy scenarios don't pre-place any agent
@@ -1575,8 +1687,8 @@ impl Env {
                     },
                 ));
                 unit_hp.push((id_str, pct));
-            } else if a.owner == self.enemy_player_id {
-                if !self.is_visible_to_agent(world, a.x, a.y) {
+            } else if a.owner == opponent {
+                if !self.is_visible_to(world, viewer, a.x, a.y) {
                     continue;
                 }
                 if matches!(a.kind, ActorKind::Building) {
@@ -1600,7 +1712,7 @@ impl Env {
         }
 
         let explored_percent = if self.map_total_cells > 0 {
-            (self.explored_cells.len() as f32 / self.map_total_cells as f32) * 100.0
+            (explored.len() as f32 / self.map_total_cells as f32) * 100.0
         } else {
             0.0
         };
@@ -1610,12 +1722,12 @@ impl Env {
         // re-deriving from briefing-time unit positions (which misses
         // cells units transited between briefings).
         let explored_cells: Vec<(i32, i32)> =
-            self.explored_cells.iter().copied().collect();
+            explored.iter().copied().collect();
 
         // S9 — economy / own buildings / production for the agent.
         let mut economy = crate::observation::EconomyObs::default();
         let mut production: Vec<crate::observation::ProductionObs> = Vec::new();
-        if let Some(ps) = snap.players.iter().find(|p| p.index == self.agent_player_id)
+        if let Some(ps) = snap.players.iter().find(|p| p.index == viewer)
         {
             economy.cash = ps.cash;
             economy.power_provided = ps.power_provided;
@@ -1632,7 +1744,7 @@ impl Env {
         }
         let mut own_buildings: Vec<crate::observation::OwnBuilding> = Vec::new();
         for a in &snap.actors {
-            if a.owner != self.agent_player_id {
+            if a.owner != viewer {
                 continue;
             }
             if a.actor_type.to_ascii_lowercase().starts_with("harv") {
@@ -1663,7 +1775,7 @@ impl Env {
             enemy_positions,
             enemy_hp,
             enemy_buildings,
-            units_killed: self.units_killed,
+            units_killed,
             game_tick: world.world_tick as i32,
             explored_percent,
             explored_cells,
@@ -1714,13 +1826,55 @@ impl Env {
         }
     }
 
-    /// Cell visibility via the typed shroud's `is_visible` flag —
-    /// only counts cells currently in sight of any agent unit.
-    fn is_visible_to_agent(&self, world: &World, cx: i32, cy: i32) -> bool {
-        match world.typed_shroud(self.agent_player_id) {
+    /// Cell visibility via a player's typed shroud `is_visible` flag —
+    /// only counts cells currently in sight of one of `player`'s units.
+    fn is_visible_to(
+        &self,
+        world: &World,
+        player: u32,
+        cx: i32,
+        cy: i32,
+    ) -> bool {
+        match world.typed_shroud(player) {
             Some(s) => s.is_visible(cx, cy),
             None => false,
         }
+    }
+
+    /// Cell visibility for the agent player (single-controller path).
+    fn is_visible_to_agent(&self, world: &World, cx: i32, cy: i32) -> bool {
+        self.is_visible_to(world, self.agent_player_id, cx, cy)
+    }
+
+    /// The set of cells `viewer` has ever explored, scanned over the
+    /// playable rectangle (mirrors `refresh_explored_cells`'s bounds
+    /// logic). Used by the 1v1 path to build the opponent controller's
+    /// observation from its own fog-of-war history.
+    fn explored_cells_for(&self, viewer: u32) -> HashSet<(i32, i32)> {
+        let mut out: HashSet<(i32, i32)> = HashSet::new();
+        let world = match &self.world {
+            Some(w) => w,
+            None => return out,
+        };
+        let shroud = match world.typed_shroud(viewer) {
+            Some(s) => s,
+            None => return out,
+        };
+        let (bx, by, bw, bh) = self.map_def.bounds;
+        let (mw, mh) = self.map_def.map_size;
+        let (x_lo, x_hi, y_lo, y_hi) = if bw > 0 && bh > 0 {
+            (bx, bx + bw, by, by + bh)
+        } else {
+            (0, mw, 0, mh)
+        };
+        for y in y_lo..y_hi {
+            for x in x_lo..x_hi {
+                if shroud.is_explored(x, y) {
+                    out.insert((x, y));
+                }
+            }
+        }
+        out
     }
 
     /// Read the agent's kill tally directly from the World combat
@@ -1789,6 +1943,21 @@ pub struct StepResult {
     pub warnings: Vec<String>,
 }
 
+/// Result of `Env::step_1v1` — one decision step advanced with
+/// commands from BOTH players, returning each side's own fog-of-war
+/// observation. `done` is true once either base is eliminated (or the
+/// deadline is hit); the harness reads which side still has buildings
+/// to decide the winner.
+#[derive(Debug, Clone)]
+pub struct Step1v1Result {
+    /// Observation from the agent player's perspective.
+    pub agent_obs: Observation,
+    /// Observation from the enemy player's perspective.
+    pub enemy_obs: Observation,
+    pub done: bool,
+    pub warnings: Vec<String>,
+}
+
 /// Result of `Env::step_until_event` — same shape as `StepResult` plus
 /// fields describing whether (and why) the advance returned early.
 #[derive(Debug, Clone)]
@@ -1818,7 +1987,7 @@ fn parse_actor_id(s: &str) -> Option<u32> {
 /// violation. Shared by every unit-targeted command in `build_orders`.
 fn resolve_owned(
     id_str: &str,
-    agent_owned: &HashSet<u32>,
+    issuer_owned: &HashSet<u32>,
     warnings: &mut Vec<String>,
 ) -> Option<u32> {
     match parse_actor_id(id_str) {
@@ -1826,9 +1995,9 @@ fn resolve_owned(
             warnings.push(format!("invalid unit_id {id_str:?}"));
             None
         }
-        Some(aid) if agent_owned.contains(&aid) => Some(aid),
+        Some(aid) if issuer_owned.contains(&aid) => Some(aid),
         Some(aid) => {
-            warnings.push(format!("unit {aid} not owned by player_0"));
+            warnings.push(format!("unit {aid} not owned by issuing player"));
             None
         }
     }
@@ -2260,6 +2429,44 @@ mod py {
             Ok((obs, result.reward, result.done, info))
         }
 
+        /// Advance one decision step with commands from BOTH players —
+        /// the agent-vs-agent 1v1 entry point. Returns
+        /// `(agent_obs, enemy_obs, done, info)`, each observation from
+        /// that player's own fog-of-war view; `info["warnings"]`
+        /// carries order-rejection warnings from either side.
+        fn step_1v1<'py>(
+            &mut self,
+            py: Python<'py>,
+            agent_commands: Vec<PyRef<PyCommand>>,
+            enemy_commands: Vec<PyRef<PyCommand>>,
+        ) -> PyResult<(
+            Bound<'py, PyDict>,
+            Bound<'py, PyDict>,
+            bool,
+            Bound<'py, PyDict>,
+        )> {
+            let a_cmds: Vec<Command> = agent_commands
+                .into_iter()
+                .map(|c| c.inner.clone())
+                .collect();
+            let e_cmds: Vec<Command> = enemy_commands
+                .into_iter()
+                .map(|c| c.inner.clone())
+                .collect();
+            let result = self.inner.step_1v1(&a_cmds, &e_cmds);
+
+            let agent_obs = result.agent_obs.to_pydict(py)?;
+            let enemy_obs = result.enemy_obs.to_pydict(py)?;
+            let info = PyDict::new_bound(py);
+            let warnings = PyList::empty_bound(py);
+            for w in &result.warnings {
+                warnings.append(w)?;
+            }
+            info.set_item("warnings", warnings)?;
+            info.set_item("game_tick", result.agent_obs.game_tick)?;
+            Ok((agent_obs, enemy_obs, result.done, info))
+        }
+
         /// Advance up to `max_ticks`, returning early if an enabled
         /// interrupt signal fires. Returns
         /// `(obs, reward, done, info, interrupted, interrupt_reason, ticks_advanced)`.
@@ -2334,6 +2541,16 @@ mod py {
 
         fn render(&self) -> String {
             self.inner.render()
+        }
+
+        /// Observation from the enemy player's perspective at the
+        /// current state (no step). Seeds the enemy controller's first
+        /// observation in the 1v1 harness.
+        fn enemy_observation<'py>(
+            &self,
+            py: Python<'py>,
+        ) -> PyResult<Bound<'py, PyDict>> {
+            self.inner.enemy_observation().to_pydict(py)
         }
 
         #[getter]
