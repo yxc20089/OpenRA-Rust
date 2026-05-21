@@ -323,6 +323,12 @@ pub struct ScenarioActor {
     /// 0=HoldFire, 1=ReturnFire, 2=Defend, 3=AttackAnything.
     /// `None` means "use the engine default" (AttackAnything).
     pub stance: Option<u8>,
+    /// Optional initial health as a PERCENTAGE of the actor type's
+    /// max HP (1-100). `None` ⇒ spawn at full HP. Used by scenarios
+    /// that pre-place damaged buildings (repair-triage, disaster
+    /// recovery). The spawned actor's `Health` trait is seeded with
+    /// `max_hp * health / 100` (clamped to ≥1).
+    pub health: Option<u8>,
 }
 
 impl ScenarioActor {
@@ -701,6 +707,8 @@ struct RawScenarioActor {
     count: i32,
     spawn_point: Option<i32>,
     stance: Option<u8>,
+    /// Optional initial health percentage (1-100). See `ScenarioActor::health`.
+    health: Option<u8>,
 }
 
 /// Parse the discovery-style scenario YAML.
@@ -922,6 +930,7 @@ fn read_actors_list(
                 count: 1,
                 spawn_point: None,
                 stance: None,
+                health: None,
             };
             if let Some((k, v)) = split_key_value(rest)
                 && k == "type"
@@ -959,6 +968,15 @@ fn read_actors_list(
                     }
                     Some(("stance", v)) => {
                         actor.stance = v.trim().parse::<u8>().ok().map(|s| s.min(3));
+                    }
+                    Some(("health", v)) => {
+                        // HP percentage, 1-100. Clamp into range; values
+                        // outside (or unparseable) are treated as "full".
+                        actor.health = v
+                            .trim()
+                            .parse::<i32>()
+                            .ok()
+                            .map(|h| h.clamp(1, 100) as u8);
                     }
                     Some(("position", "")) => {
                         // 2-element list on the next two lines, at indent
@@ -1136,6 +1154,7 @@ fn expand_scenario_actors(raw: &[RawScenarioActor], spawn_point: i32) -> Vec<Sce
                 owner: r.owner.clone(),
                 position: r.position,
                 stance: r.stance,
+                health: r.health,
             });
         }
     }
@@ -1233,6 +1252,7 @@ fn read_scheduled_events(
                                     owner: r.owner.clone(),
                                     position: r.position,
                                     stance: r.stance,
+                                    health: r.health,
                                 });
                             }
                         }
