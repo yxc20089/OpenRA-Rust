@@ -1969,7 +1969,18 @@ fn build_scenario_actor(id: u32, sa: &ScenarioActor, owner: u32, world: &World) 
         Some(s) => s.kind,
         None => kind_for_unit_type(&sa.actor_type),
     };
-    let hp = stats.map(|s| s.hp).unwrap_or(50000);
+    let max_hp = stats.map(|s| s.hp).unwrap_or(50000);
+    // A scenario may pre-place a damaged actor via `health: N` (an HP
+    // percentage, 1-100). Scale the spawned `Health` trait accordingly;
+    // `None` ⇒ spawn at full HP. The result is clamped to ≥1 so a
+    // rounding-to-zero never spawns an already-dead actor.
+    let hp = match sa.health {
+        Some(pct) => {
+            let scaled = (max_hp as i64 * pct.clamp(1, 100) as i64) / 100;
+            (scaled.max(1) as i32).min(max_hp)
+        }
+        None => max_hp,
+    };
     let cell = CPos::new(sa.position.0, sa.position.1);
 
     if is_building || matches!(kind, ActorKind::Building) {
@@ -2139,6 +2150,7 @@ pub fn build_test_env_with_no_enemies(map_size: (i32, i32), seed: u64) -> Env {
             owner: "agent".into(),
             position: (5, 5),
             stance: None,
+            health: None,
         }],
         spawn_mcvs: true,
         starting_cash: 5000,
