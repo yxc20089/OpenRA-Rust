@@ -370,6 +370,15 @@ pub struct World {
     /// simultaneous Move orders to the same target spread to nearby
     /// unoccupied cells instead of all stacking on one cell.
     pending_move_destinations: HashSet<(i32, i32)>,
+    /// Per-actor weapon-reload countdown for OPPORTUNISTIC fire while
+    /// the actor is executing a `Move` activity. A unit transiting
+    /// enemy weapon range is a normal combatant — it both takes fire
+    /// and shoots back at in-range hostiles WITHOUT abandoning its
+    /// move (faithful to C# AttackMove / opportunistic AutoTarget).
+    /// Keyed by actor id; entries are pruned when the actor stops
+    /// moving or dies. Without this, a unit on a long `move` order
+    /// crossed a kill zone untouched — "sprint-invincibility".
+    move_fire_cooldown: HashMap<u32, i32>,
 }
 
 /// Typed components attached to a single actor. Lookup is via
@@ -2854,6 +2863,134 @@ impl World {
                 }
             }
         }
+        // ── Opportunistic fire while MOVING ───────────────────────────
+        // A unit executing a `Move` activity is still a combatant: it
+        // shoots in-range hostiles in passing WITHOUT abandoning its
+        // move (faithful to C# AttackMove / opportunistic AutoTarget).
+        // The stance-driven auto-engage scan above only considers IDLE
+        // units, so without this pass a unit on a long `move` order
+        // crossed an enemy kill zone untouched while never returning
+        // fire — "sprint-invincibility". The shots feed the SAME
+        // instant/projectile pipeline as `Activity::Attack`; the
+        // per-actor reload lives in `move_fire_cooldown`. Targets are
+        // resolved in-range only, so a moving shooter never diverts
+        // into a chase — it keeps gliding down its path.
+        //
+        // Determinism: iterate the BTreeMap-ordered actor list; ties
+        // on target distance break by lowest enemy id.
+        let mut move_fire_attackers: Vec<(u32, u32)> = Vec::new(); // (attacker, target)
+        {
+            // First, tick down every moving unit's cooldown and prune
+            // entries for actors that are no longer moving.
+            let moving_ids: Vec<u32> = self
+                .actors
+                .iter()
+                .filter(|(_, a)| matches!(a.activity, Some(Activity::Move { .. })))
+                .map(|(id, _)| *id)
+                .collect();
+            let moving_set: std::collections::HashSet<u32> =
+                moving_ids.iter().copied().collect();
+            self.move_fire_cooldown.retain(|id, _| moving_set.contains(id));
+            for cd in self.move_fire_cooldown.values_mut() {
+                if *cd > 0 {
+                    *cd -= 1;
+                }
+            }
+            for id in moving_ids {
+                // Cooldown gates firing — a unit mid-reload skips.
+                if self.move_fire_cooldown.get(&id).copied().unwrap_or(0) > 0 {
+                    continue;
+                }
+                let stance = self.stances.get(&id).copied().unwrap_or(2);
+                // HoldFire never opportunistically fires.
+                if stance == 0 {
+                    continue;
+                }
+                // ReturnFire only after itself taking recent hostile fire.
+                if stance == 1 {
+                    let licensed = self
+                        .recently_received_fire
+                        .get(&id)
+                        .map(|t| world_tick_now.saturating_sub(*t) <= RETURN_FIRE_WINDOW)
+                        .unwrap_or(false);
+                    if !licensed {
+                        continue;
+                    }
+                }
+                let (my_loc, my_owner) = match self.actors.get(&id) {
+                    Some(a) => match (a.location, a.owner_id) {
+                        (Some(l), Some(o)) => (l, o),
+                        _ => continue,
+                    },
+                    None => continue,
+                };
+                // Longest weapon reach across this actor's armaments.
+                let range_cells = self
+                    .actors
+                    .get(&id)
+                    .and_then(|a| a.actor_type.as_deref())
+                    .and_then(|at| self.rules.actor(at))
+                    .map(|stats| {
+                        stats
+                            .weapons
+                            .iter()
+                            .filter_map(|wname| self.rules.weapon(wname))
+                            .map(|w| w.range / 1024)
+                            .max()
+                            .unwrap_or(0)
+                    })
+                    .unwrap_or(0);
+                if range_cells <= 0 {
+                    continue;
+                }
+                let mut best: Option<(u32, i32)> = None;
+                for (eid, enemy) in &self.actors {
+                    if *eid == id {
+                        continue;
+                    }
+                    let eloc = match enemy.location {
+                        Some(l) => l,
+                        None => continue,
+                    };
+                    let eowner = match enemy.owner_id {
+                        Some(o) => o,
+                        None => continue,
+                    };
+                    if eowner == my_owner {
+                        continue;
+                    }
+                    if !matches!(
+                        enemy.kind,
+                        ActorKind::Infantry
+                            | ActorKind::Vehicle
+                            | ActorKind::Mcv
+                            | ActorKind::Building
+                    ) {
+                        continue;
+                    }
+                    let dead = enemy
+                        .traits
+                        .iter()
+                        .any(|t| matches!(t, TraitState::Health { hp } if *hp <= 0));
+                    if dead {
+                        continue;
+                    }
+                    let dx = (eloc.0 - my_loc.0).abs();
+                    let dy = (eloc.1 - my_loc.1).abs();
+                    let dist = dx.max(dy);
+                    if dist > range_cells {
+                        continue;
+                    }
+                    if best.map_or(true, |(_, d)| dist < d) {
+                        best = Some((*eid, dist));
+                    }
+                }
+                if let Some((tid, _)) = best {
+                    move_fire_attackers.push((id, tid));
+                }
+            }
+        }
+
         // Second pass: check range and fire. Phase 8 splits this into
         // instant-hit damage (M1Carbine, tank cannons, DogJaw, TurretGun,
         // TeslaZap) vs projectile spawning (RedEye, Dragon, Hellfire,
@@ -2862,6 +2999,46 @@ impl World {
         let mut attacks: Vec<(u32, u32, i32)> = Vec::new();
         let mut spawn_projectiles: Vec<(u32, u32, i32, i32, i32, BTreeMap<crate::gamerules::ArmorType, i32>)> = Vec::new(); // (attacker, target, damage, speed, splash, versus)
         let mut chase_targets: Vec<(u32, (i32, i32))> = Vec::new();
+
+        // Resolve the opportunistic move-fire shots collected above.
+        // Each is in-range by construction; pick the best weapon vs the
+        // target's armor, route instant vs projectile like the Attack
+        // pipeline, and arm the per-actor `move_fire_cooldown`.
+        for (attacker_id, target_id) in &move_fire_attackers {
+            let target_armor = self.target_armor_of(*target_id);
+            let weapon = self
+                .actors
+                .get(attacker_id)
+                .and_then(|a| a.actor_type.as_deref())
+                .and_then(|at| self.rules.best_weapon_against(at, target_armor))
+                .map(|(_, w)| w);
+            let (damage, reload, proj_speed, splash, versus) = match weapon {
+                Some(w) => (
+                    w.damage,
+                    w.reload_delay.max(1),
+                    w.projectile_speed,
+                    w.splash_radius,
+                    w.versus.clone(),
+                ),
+                None => continue,
+            };
+            if damage <= 0 {
+                continue;
+            }
+            if proj_speed > 0 {
+                spawn_projectiles.push((
+                    *attacker_id,
+                    *target_id,
+                    damage,
+                    proj_speed,
+                    splash,
+                    versus,
+                ));
+            } else {
+                attacks.push((*attacker_id, *target_id, damage));
+            }
+            self.move_fire_cooldown.insert(*attacker_id, reload);
+        }
         for (attacker_id, target_id, damage, weapon_range) in ready_attackers {
             let attacker_loc = self.actors.get(&attacker_id).and_then(|a| a.location);
             let target_loc = self.actors.get(&target_id).and_then(|a| a.location);
@@ -3116,23 +3293,83 @@ impl World {
             // Pathfind toward target
             if let Some(path) = pathfinder::find_path(&self.terrain, from, chase_dest, Some(attacker_id)) {
                 if path.len() > 1 {
-                    let _speed = self.actor_speed(attacker_id);
-                    // Save attack params, switch to Move, then restore Attack after move completes
-                    // For simplicity: just move one cell closer each tick by updating location directly
+                    // Advance toward the next path cell at the actor's
+                    // real movement speed (world units/tick), lerping the
+                    // Mobile center_position exactly like a normal Move
+                    // activity. Previously the chase warped a FULL CELL
+                    // per tick — for infantry (~43 u/tick ≈ 0.04 cell)
+                    // that is a ~24x teleport, so an `attack_unit` on an
+                    // out-of-sight target crossed the whole map in one
+                    // decision frame instead of pathing normally.
+                    let speed = self.actor_speed(attacker_id);
                     let next_cell = path[1];
-                    if self.terrain.occupant(next_cell.0, next_cell.1) == 0 || self.terrain.occupant(next_cell.0, next_cell.1) == attacker_id {
-                        self.terrain.clear_occupant(from.0, from.1);
-                        self.terrain.set_occupant(next_cell.0, next_cell.1, attacker_id);
+                    let occ = self.terrain.occupant(next_cell.0, next_cell.1);
+                    if occ == 0 || occ == attacker_id {
+                        let next_center = center_of_cell(next_cell.0, next_cell.1);
+                        let mut arrived = false;
                         if let Some(actor) = self.actors.get_mut(&attacker_id) {
-                            actor.location = Some(next_cell);
-                            // Update Mobile trait center_position
                             for t in &mut actor.traits {
-                                if let TraitState::Mobile { center_position, from_cell, to_cell, .. } = t {
-                                    *center_position = center_of_cell(next_cell.0, next_cell.1);
-                                    *from_cell = CPos::new(next_cell.0, next_cell.1);
+                                if let TraitState::Mobile {
+                                    center_position, from_cell, to_cell, ..
+                                } = t
+                                {
+                                    let from_center =
+                                        center_of_cell(from.0, from.1);
                                     *to_cell = CPos::new(next_cell.0, next_cell.1);
+                                    let total_dx =
+                                        (next_center.x - from_center.x) as i64;
+                                    let total_dy =
+                                        (next_center.y - from_center.y) as i64;
+                                    let total_dist = (((total_dx * total_dx
+                                        + total_dy * total_dy)
+                                        as f64)
+                                        .sqrt())
+                                        as i32;
+                                    if total_dist == 0 {
+                                        *center_position = next_center;
+                                        arrived = true;
+                                    } else {
+                                        let prog_dx = (center_position.x
+                                            - from_center.x)
+                                            as i64;
+                                        let prog_dy = (center_position.y
+                                            - from_center.y)
+                                            as i64;
+                                        let progress = (((prog_dx * prog_dx
+                                            + prog_dy * prog_dy)
+                                            as f64)
+                                            .sqrt())
+                                            as i32;
+                                        let new_progress = progress + speed;
+                                        if new_progress >= total_dist {
+                                            *center_position = next_center;
+                                            *from_cell =
+                                                CPos::new(next_cell.0, next_cell.1);
+                                            arrived = true;
+                                        } else {
+                                            center_position.x = from_center.x
+                                                + (total_dx * new_progress as i64
+                                                    / total_dist as i64)
+                                                    as i32;
+                                            center_position.y = from_center.y
+                                                + (total_dy * new_progress as i64
+                                                    / total_dist as i64)
+                                                    as i32;
+                                        }
+                                    }
                                     break;
                                 }
+                            }
+                        }
+                        // Only commit the discrete cell + occupancy once
+                        // the interpolated position actually reaches the
+                        // next cell center.
+                        if arrived {
+                            self.terrain.clear_occupant(from.0, from.1);
+                            self.terrain
+                                .set_occupant(next_cell.0, next_cell.1, attacker_id);
+                            if let Some(actor) = self.actors.get_mut(&attacker_id) {
+                                actor.location = Some(next_cell);
                             }
                         }
                     }
@@ -5034,6 +5271,7 @@ pub fn build_world(
         typed_components: BTreeMap::new(),
         combat_reveal_cells: BTreeMap::new(),
         pending_move_destinations: HashSet::new(),
+        move_fire_cooldown: HashMap::new(),
     };
 
     // Initial shroud reveal around starting units
