@@ -3116,23 +3116,83 @@ impl World {
             // Pathfind toward target
             if let Some(path) = pathfinder::find_path(&self.terrain, from, chase_dest, Some(attacker_id)) {
                 if path.len() > 1 {
-                    let _speed = self.actor_speed(attacker_id);
-                    // Save attack params, switch to Move, then restore Attack after move completes
-                    // For simplicity: just move one cell closer each tick by updating location directly
+                    // Advance toward the next path cell at the actor's
+                    // real movement speed (world units/tick), lerping the
+                    // Mobile center_position exactly like a normal Move
+                    // activity. Previously the chase warped a FULL CELL
+                    // per tick — for infantry (~43 u/tick ≈ 0.04 cell)
+                    // that is a ~24x teleport, so an `attack_unit` on an
+                    // out-of-sight target crossed the whole map in one
+                    // decision frame instead of pathing normally.
+                    let speed = self.actor_speed(attacker_id);
                     let next_cell = path[1];
-                    if self.terrain.occupant(next_cell.0, next_cell.1) == 0 || self.terrain.occupant(next_cell.0, next_cell.1) == attacker_id {
-                        self.terrain.clear_occupant(from.0, from.1);
-                        self.terrain.set_occupant(next_cell.0, next_cell.1, attacker_id);
+                    let occ = self.terrain.occupant(next_cell.0, next_cell.1);
+                    if occ == 0 || occ == attacker_id {
+                        let next_center = center_of_cell(next_cell.0, next_cell.1);
+                        let mut arrived = false;
                         if let Some(actor) = self.actors.get_mut(&attacker_id) {
-                            actor.location = Some(next_cell);
-                            // Update Mobile trait center_position
                             for t in &mut actor.traits {
-                                if let TraitState::Mobile { center_position, from_cell, to_cell, .. } = t {
-                                    *center_position = center_of_cell(next_cell.0, next_cell.1);
-                                    *from_cell = CPos::new(next_cell.0, next_cell.1);
+                                if let TraitState::Mobile {
+                                    center_position, from_cell, to_cell, ..
+                                } = t
+                                {
+                                    let from_center =
+                                        center_of_cell(from.0, from.1);
                                     *to_cell = CPos::new(next_cell.0, next_cell.1);
+                                    let total_dx =
+                                        (next_center.x - from_center.x) as i64;
+                                    let total_dy =
+                                        (next_center.y - from_center.y) as i64;
+                                    let total_dist = (((total_dx * total_dx
+                                        + total_dy * total_dy)
+                                        as f64)
+                                        .sqrt())
+                                        as i32;
+                                    if total_dist == 0 {
+                                        *center_position = next_center;
+                                        arrived = true;
+                                    } else {
+                                        let prog_dx = (center_position.x
+                                            - from_center.x)
+                                            as i64;
+                                        let prog_dy = (center_position.y
+                                            - from_center.y)
+                                            as i64;
+                                        let progress = (((prog_dx * prog_dx
+                                            + prog_dy * prog_dy)
+                                            as f64)
+                                            .sqrt())
+                                            as i32;
+                                        let new_progress = progress + speed;
+                                        if new_progress >= total_dist {
+                                            *center_position = next_center;
+                                            *from_cell =
+                                                CPos::new(next_cell.0, next_cell.1);
+                                            arrived = true;
+                                        } else {
+                                            center_position.x = from_center.x
+                                                + (total_dx * new_progress as i64
+                                                    / total_dist as i64)
+                                                    as i32;
+                                            center_position.y = from_center.y
+                                                + (total_dy * new_progress as i64
+                                                    / total_dist as i64)
+                                                    as i32;
+                                        }
+                                    }
                                     break;
                                 }
+                            }
+                        }
+                        // Only commit the discrete cell + occupancy once
+                        // the interpolated position actually reaches the
+                        // next cell center.
+                        if arrived {
+                            self.terrain.clear_occupant(from.0, from.1);
+                            self.terrain
+                                .set_occupant(next_cell.0, next_cell.1, attacker_id);
+                            if let Some(actor) = self.actors.get_mut(&attacker_id) {
+                                actor.location = Some(next_cell);
                             }
                         }
                     }
