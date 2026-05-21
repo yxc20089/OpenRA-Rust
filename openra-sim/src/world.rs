@@ -1234,6 +1234,19 @@ impl World {
         }
     }
 
+    /// Resolve a target actor's armor class for armor-class damage
+    /// lookups. Defaults to `ArmorType::None` when the target is gone
+    /// or has no `Armor` trait (matching the C# "no Armor ⇒ none"
+    /// fallback).
+    fn target_armor_of(&self, target_id: u32) -> crate::gamerules::ArmorType {
+        self.actors
+            .get(&target_id)
+            .and_then(|a| a.actor_type.as_deref())
+            .and_then(|t| self.rules.actor(t))
+            .map(|stats| stats.armor_type)
+            .unwrap_or(crate::gamerules::ArmorType::None)
+    }
+
     /// Handle an Attack order: set attack activity with weapon stats from rules.
     fn order_attack(&mut self, actor_id: u32, target_id: u32, auto_acquired: bool) {
         // Faithful HoldFire: an *auto-acquired* engagement is suppressed
@@ -1244,12 +1257,16 @@ impl World {
         if auto_acquired && self.stances.get(&actor_id).copied().unwrap_or(3) == 0 {
             return;
         }
-        // Look up attacker's primary weapon from rules
+        // Look up the attacker's best weapon *against this target*.
+        // OpenRA actors can carry multiple armaments (e.g. e3 has an
+        // anti-air RedEye and an anti-ground Dragon); the combat model
+        // must pick the armament that deals the most effective damage
+        // to the target's armor class, not blindly `weapons[0]`.
+        let target_armor = self.target_armor_of(target_id);
         let weapon = self.actors.get(&actor_id)
             .and_then(|a| a.actor_type.as_deref())
-            .and_then(|at| self.rules.actor(at))
-            .and_then(|stats| stats.weapons.first())
-            .and_then(|wname| self.rules.weapon(wname))
+            .and_then(|at| self.rules.best_weapon_against(at, target_armor))
+            .map(|(_, w)| w)
             .or_else(|| self.rules.weapon("default"));
 
         let (damage, range_cells, reload, burst) = match weapon {
@@ -2434,12 +2451,21 @@ impl World {
                 Some(o) => o,
                 None => continue,
             };
-            // Resolve this actor's primary weapon range (cells)
+            // Resolve this actor's *maximum* weapon range (cells)
+            // across every armament. A multi-weapon actor (e3: RedEye
+            // 7c + Dragon 5c) must scan for candidates out to its
+            // longest reach; the exact weapon — and its range — is
+            // re-resolved per-target in `order_attack` via
+            // `best_weapon_against`.
             let range_cells = actor.actor_type.as_deref()
                 .and_then(|at| self.rules.actor(at))
-                .and_then(|stats| stats.weapons.first())
-                .and_then(|wname| self.rules.weapon(wname))
-                .map(|w| w.range / 1024)
+                .map(|stats| {
+                    stats.weapons.iter()
+                        .filter_map(|wname| self.rules.weapon(wname))
+                        .map(|w| w.range / 1024)
+                        .max()
+                        .unwrap_or(0)
+                })
                 .unwrap_or(0);
             if range_cells <= 0 {
                 continue;
@@ -2723,7 +2749,17 @@ impl World {
                 }
             }
             if let Some((tid, _)) = best {
-                new_defense_attacks.push((actor.id, tid, damage, range_cells, reload, burst));
+                // Re-resolve the building's armament against the chosen
+                // target's armor class so a multi-weapon defense
+                // commits the base damage of the weapon it will
+                // actually fire. Single-weapon defenses are unaffected.
+                let target_armor = self.target_armor_of(tid);
+                let dmg = self
+                    .rules
+                    .best_weapon_against(actor_type, target_armor)
+                    .map(|(_, w)| w.damage)
+                    .unwrap_or(damage);
+                new_defense_attacks.push((actor.id, tid, dmg, range_cells, reload, burst));
             }
         }
         for (aid, tid, damage, range_cells, reload, burst) in new_defense_attacks {
@@ -2777,17 +2813,19 @@ impl World {
                 let dy = (aloc.1 - tloc.1).abs();
                 let dist = dx.max(dy);
                 if dist <= weapon_range {
-                    // Resolve attacker's primary weapon for projectile
-                    // metadata. Buildings (gun, tsla) and instant-hit
-                    // weapons fall through to the immediate-damage path.
+                    // Resolve the attacker's weapon for projectile
+                    // metadata. The armament must be re-resolved
+                    // against *this* target's armor class so a
+                    // multi-weapon actor (e3: RedEye + Dragon) carries
+                    // the projectile/splash/versus table of the same
+                    // weapon whose damage was committed in `order_attack`.
+                    let proj_target_armor = self.target_armor_of(target_id);
                     let (proj_speed, splash, versus_table) = self
                         .actors
                         .get(&attacker_id)
                         .and_then(|a| a.actor_type.as_deref())
-                        .and_then(|t| self.rules.actor(t))
-                        .and_then(|stats| stats.weapons.first())
-                        .and_then(|wname| self.rules.weapon(wname))
-                        .map(|w| (w.projectile_speed, w.splash_radius, w.versus.clone()))
+                        .and_then(|t| self.rules.best_weapon_against(t, proj_target_armor))
+                        .map(|(_, w)| (w.projectile_speed, w.splash_radius, w.versus.clone()))
                         .unwrap_or((0, 0, BTreeMap::new()));
                     if proj_speed > 0 {
                         spawn_projectiles.push((attacker_id, target_id, damage, proj_speed, splash, versus_table));
@@ -2864,13 +2902,15 @@ impl World {
         for (attacker_id, target_id, damage) in &attacks {
             if self.invulnerable.contains_key(target_id) { continue; }
             // Look up the attacker's weapon `versus` table and the
-            // target's armor class.
+            // target's armor class. The armament is re-resolved
+            // against this target's armor so a multi-weapon actor
+            // applies the `Versus` table of the same weapon whose
+            // damage was committed in `order_attack`.
+            let instant_target_armor = self.target_armor_of(*target_id);
             let versus_table = self.actors.get(attacker_id)
                 .and_then(|a| a.actor_type.as_deref())
-                .and_then(|t| self.rules.actor(t))
-                .and_then(|stats| stats.weapons.first())
-                .and_then(|wname| self.rules.weapon(wname))
-                .map(|w| w.versus.clone())
+                .and_then(|t| self.rules.best_weapon_against(t, instant_target_armor))
+                .map(|(_, w)| w.versus.clone())
                 .unwrap_or_default();
             let target_armor_str = self.actors.get(target_id)
                 .and_then(|a| a.actor_type.as_deref())
