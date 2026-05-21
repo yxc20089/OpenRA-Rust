@@ -1526,6 +1526,63 @@ impl World {
         }
     }
 
+    /// Map a production-building type to the unit-producing queue it
+    /// services, or `None` if the building does not produce mobile units
+    /// (e.g. `fact`, which feeds the Building/Defense queues).
+    fn production_building_pq(building_type: &str) -> Option<PqType> {
+        match building_type {
+            "weap" | "weap.ukraine" => Some(PqType::Vehicle),
+            "tent" | "barr" => Some(PqType::Infantry),
+            "hpad" | "afld" => Some(PqType::Aircraft),
+            "spen" | "syrd" => Some(PqType::Ship),
+            _ => None,
+        }
+    }
+
+    /// Count a player's completed, undamaged-enough production buildings
+    /// that service the given queue type. This is the OpenRA-parity
+    /// throughput multiplier: with two war factories the Vehicle queue
+    /// advances twice per tick, so two factories roughly double output.
+    ///
+    /// Returns at least 1 (so a queue with an order but — transiently —
+    /// no surviving factory still drains at the base rate rather than
+    /// stalling). A building counts only if it is alive (HP > 0).
+    fn production_building_count(&self, player_id: u32, pq: PqType) -> u32 {
+        // Only unit-producing queues parallelise on building count.
+        // Building / Defense are fed by the construction yard and keep
+        // single-stream semantics.
+        if !matches!(
+            pq,
+            PqType::Vehicle | PqType::Infantry | PqType::Aircraft | PqType::Ship
+        ) {
+            return 1;
+        }
+        let count = self
+            .actors
+            .values()
+            .filter(|a| {
+                a.owner_id == Some(player_id) && a.kind == ActorKind::Building
+            })
+            .filter(|a| {
+                a.actor_type
+                    .as_deref()
+                    .and_then(Self::production_building_pq)
+                    == Some(pq)
+            })
+            .filter(|a| {
+                // Building must be alive.
+                a.traits.iter().any(|t| {
+                    if let TraitState::Health { hp } = t {
+                        *hp > 0
+                    } else {
+                        false
+                    }
+                }) || a.traits.iter().all(|t| !matches!(t, TraitState::Health { .. }))
+            })
+            .count() as u32;
+        count.max(1)
+    }
+
     /// Tick all harvesters through their harvest cycle.
     /// Activate a superweapon effect.
     fn activate_superweapon(&mut self, weapon_type: &str, owner: u32, target_x: i32, target_y: i32) {
@@ -3185,12 +3242,37 @@ impl World {
                 continue; // 50% production speed when low power
             }
             let mut cash = self.actors.get(&pid).map(|a| a.cash()).unwrap_or(0);
+            // Per-queue parallel-production multiplier: each completed,
+            // alive production building of a category contributes one
+            // unit of throughput, so two war factories advance the
+            // Vehicle queue twice per tick (OpenRA parity — concurrent
+            // factories). Building / Defense queues stay single-stream.
+            let pq_factory_count: HashMap<PqType, u32> = self
+                .production
+                .get(&pid)
+                .map(|queues| {
+                    queues
+                        .keys()
+                        .map(|&pq| (pq, self.production_building_count(pid, pq)))
+                        .collect()
+                })
+                .unwrap_or_default();
             if let Some(queues) = self.production.get_mut(&pid) {
                 // Tick each queue type independently
-                for (_pq, items) in queues.iter_mut() {
-                    // Find first item that isn't a completed building waiting for placement
-                    let tick_idx = items.iter().position(|i| !i.is_done());
-                    if let Some(idx) = tick_idx {
+                for (pq, items) in queues.iter_mut() {
+                    let advances = pq_factory_count.get(pq).copied().unwrap_or(1).max(1);
+                    // Advance the queue `advances` times this tick: N
+                    // factories of this category each contribute one
+                    // tick of build progress. Completions mid-loop let
+                    // a later factory pick up the next queued item.
+                    for _ in 0..advances {
+                        // Find first item that isn't a completed building
+                        // waiting for placement.
+                        let tick_idx = items.iter().position(|i| !i.is_done());
+                        let idx = match tick_idx {
+                            Some(idx) => idx,
+                            None => break, // nothing left to build
+                        };
                         let item = &mut items[idx];
                         let consumed = item.tick(cash);
                         if consumed > 0 {
@@ -3207,6 +3289,10 @@ impl World {
                                 completed_items.push((pid, name));
                             } else {
                                 eprintln!("PRODUCTION: building {} ready to place for player {}", name, pid);
+                                // A finished building blocks the queue
+                                // until placed — stop advancing it even
+                                // with multiple factories.
+                                break;
                             }
                         }
                     }
@@ -4614,6 +4700,16 @@ pub fn remove_test_actor(world: &mut World, id: u32) -> Option<Actor> {
 #[doc(hidden)]
 pub fn all_actor_ids(world: &World) -> Vec<u32> {
     world.actors.keys().copied().collect()
+}
+
+/// Test-only: set a player actor's cash. Used by production-throughput
+/// tests that need to remove the money bottleneck so build TIME is the
+/// only constraint being measured.
+#[doc(hidden)]
+pub fn set_test_cash(world: &mut World, player_id: u32, cash: i32) {
+    if let Some(player) = world.actors.get_mut(&player_id) {
+        player.set_cash(cash);
+    }
 }
 
 /// Set an actor's initial engagement stance (0=HoldFire, 1=ReturnFire,
