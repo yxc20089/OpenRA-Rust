@@ -289,6 +289,11 @@ pub struct World {
     scripted_bots: Vec<crate::scripted_bot::ScriptedBot>,
     /// Buildings currently being repaired (toggled by RepairBuilding order).
     repairing: HashSet<u32>,
+    /// Buildings whose power output is currently SHED (PowerDown toggle).
+    /// A powered-down building contributes ZERO to its owner's
+    /// `power_provided` / `power_drained` totals until toggled back on.
+    /// Mirrors C# `CanPowerDown` (Cnc/Ra). Used by `compute_player_power`.
+    powered_down: HashSet<u32>,
     /// Rally points per building actor ID.
     rally_points: HashMap<u32, (i32, i32)>,
     /// Cargo: transport actor id → boarded passenger Actors (stashed
@@ -302,6 +307,27 @@ pub struct World {
     /// Engagement stance per actor id: 0=HoldFire, 1=ReturnFire,
     /// 2=Defend, 3=AttackAnything. Missing = engage (current default).
     stances: HashMap<u32, u8>,
+    /// World-tick at which each actor last received damage from a
+    /// hostile attacker. Used to gate stance:1 (ReturnFire) auto-
+    /// engagement: a unit on stance:1 only opens fire on enemies if
+    /// it itself has been attacked within `RETURN_FIRE_WINDOW` ticks.
+    /// Without this, stance:1 collapsed into stance:2 (auto-engage
+    /// any in-range enemy whether or not we're under attack).
+    recently_received_fire: HashMap<u32, u32>,
+    /// Actor IDs licensed to HUNT — i.e. stance:3 units that ALSO
+    /// advance toward visible-but-out-of-range enemies. Hunt is the
+    /// strict superset of in-range auto-engage: a hunting unit
+    /// pursues anything on the map it can reach. We track this as
+    /// a separate opt-in (set only when the agent issues the
+    /// `SetStance` order with stance=3, NOT just because the
+    /// scenario YAML declared `stance: 3` at spawn) because many
+    /// existing bench packs declare enemy units as `stance: 3`
+    /// meaning "auto-engage in range" and would lose their
+    /// stand-and-fire semantics if the engine started chasing them
+    /// across the map. Agent-issued stance:3 (via `set_stance`) is
+    /// the new "actively hunt" verb; scenario-declared stance:3 is
+    /// the legacy "engage what wanders into range" default.
+    hunt_enabled: HashSet<u32>,
     /// Superweapon charge timers: (building_type, owner_player_id) → ticks_remaining.
     superweapon_timers: HashMap<(String, u32), i32>,
     /// Actors with invulnerability ticks remaining (Iron Curtain).
@@ -401,6 +427,45 @@ impl World {
 
     pub fn actor_type_name(&self, actor_id: u32) -> Option<&str> {
         self.actors.get(&actor_id).and_then(|a| a.actor_type.as_deref())
+    }
+
+    /// Owner-player id for an actor, or `None` for neutral / world props.
+    /// Public accessor exposed for scheduled-event filters and other
+    /// query paths that don't have a borrow on the raw `Actor`.
+    pub fn actor_owner_id(&self, actor_id: u32) -> Option<u32> {
+        self.actors.get(&actor_id).and_then(|a| a.owner_id)
+    }
+
+    /// Recompute (power_provided, power_drained) for a player by
+    /// iterating their currently-alive Building actors and summing
+    /// each one's `power` from the ruleset (positive => provided,
+    /// negative => drained). Buildings in `powered_down` contribute
+    /// zero.
+    ///
+    /// This is the authoritative source — the per-actor PowerManager
+    /// trait stored on the player is NOT consulted, because that
+    /// trait is only updated by `order_place_building` and so misses
+    /// pre-placed scenario actors (the entire reason scenarios using
+    /// `power_surplus_gte` / `power_provided_gte` were inert before
+    /// this fix). Caller is responsible for ignoring dead actors —
+    /// they are removed from `self.actors` so iteration already
+    /// skips them.
+    pub fn compute_player_power(&self, player_id: u32) -> (i32, i32) {
+        let mut provided = 0i32;
+        let mut drained = 0i32;
+        for actor in self.actors.values() {
+            if actor.owner_id != Some(player_id) { continue; }
+            if actor.kind != ActorKind::Building { continue; }
+            if self.powered_down.contains(&actor.id) { continue; }
+            let atype = match actor.actor_type.as_deref() {
+                Some(t) => t,
+                None => continue,
+            };
+            let p = self.rules.actor(atype).map(|s| s.power).unwrap_or(0);
+            if p > 0 { provided += p; }
+            else if p < 0 { drained += -p; }
+        }
+        (provided, drained)
     }
 
     /// Get building types owned by a player.
@@ -563,16 +628,11 @@ impl World {
             let cash = actor.map(|a| a.cash()).unwrap_or(0);
             let resources = actor.map(|a| a.resources()).unwrap_or(0);
             let resource_capacity = self.player_storage_capacity(pid);
-            let (power_provided, power_drained) = actor
-                .map(|a| {
-                    for t in &a.traits {
-                        if let TraitState::PowerManager { power_provided, power_drained } = t {
-                            return (*power_provided, *power_drained);
-                        }
-                    }
-                    (0, 0)
-                })
-                .unwrap_or((0, 0));
+            // Recompute from live buildings (excludes powered-down ones)
+            // so pre-placed scenario actors and the PowerDown toggle are
+            // reflected. The legacy PowerManager trait on the player is
+            // not consulted — see `compute_player_power` docs.
+            let (power_provided, power_drained) = self.compute_player_power(pid);
             let production_queue = self.production.get(&pid).map(|queues| {
                 let mut all_items: Vec<ProductionSnapshot> = Vec::new();
                 for (_pq, items) in queues {
@@ -887,7 +947,24 @@ impl World {
                 }
             }
             "PowerDown" => {
-                // Toggle power on a building (not yet tracked per-building)
+                // Toggle the building's power contribution. Validated:
+                // subject must be an alive Building actor; the toggle
+                // adds/removes the id from `powered_down`, and the next
+                // `compute_player_power` call reflects the new state in
+                // both the snapshot and the low-power-slowdown gate.
+                if let Some(subject_id) = order.subject_id {
+                    let is_building = matches!(
+                        self.actors.get(&subject_id).map(|a| a.kind),
+                        Some(ActorKind::Building),
+                    );
+                    if is_building {
+                        if self.powered_down.contains(&subject_id) {
+                            self.powered_down.remove(&subject_id);
+                        } else {
+                            self.powered_down.insert(subject_id);
+                        }
+                    }
+                }
             }
             "RepairBuilding" => {
                 if let Some(subject_id) = order.subject_id {
@@ -2276,14 +2353,78 @@ impl World {
             }
         }
 
+        // ── Stance-driven defensive auto-engagement + hunt ────────────
+        // Three stance gates, each driving its own engagement policy:
+        //
+        //   stance:0 HoldFire       — never auto-engage.
+        //   stance:1 ReturnFire     — auto-engage ONLY if this actor has
+        //                              been damaged by a hostile within
+        //                              the last RETURN_FIRE_WINDOW ticks
+        //                              (tracked by recently_received_fire).
+        //                              Picks the closest in-range enemy.
+        //   stance:2 Defend         — auto-engage closest in-range enemy
+        //                              (don't pursue past current range).
+        //   stance:3 AttackAnything — auto-engage closest in-range enemy;
+        //                              if none, but a hostile is visible
+        //                              within sight range, ADVANCE toward
+        //                              it ("hunt"). This is the only
+        //                              stance that opens new engagements
+        //                              by moving.
+        //
+        // RETURN_FIRE_WINDOW: how long after taking a hit a stance:1
+        // unit stays "primed". Chosen so a single salvo unlocks a full
+        // retaliatory engagement cycle (cannon reload ≈30-50 inner
+        // ticks); too short and the return fire fizzles before the
+        // weapon cools.
+        const RETURN_FIRE_WINDOW: u32 = 60;
+        // HUNT_RADIUS: stance:3 hunters chase enemies up to this many
+        // cells away. The radius is large by design — "AttackAnything"
+        // means "advance on any hostile I can find" — so a single
+        // hunter can clear a map of scattered enemies by chaining one
+        // hunt move per kill. (The per-unit RevealsShroud sight is not
+        // checked here on purpose: stance:3 hunters use shared / fact
+        // intel, not just their own line of sight, otherwise a tank
+        // wouldn't pursue an enemy fleeing through fog.) We still cap
+        // at a moderate radius to keep the scan O(N·M) bounded; larger
+        // maps would just need the constant raised. 128 cells covers
+        // the rush-hour-arena longest axis.
+        const HUNT_RADIUS: i32 = 128;
         let mut engage_pairs: Vec<(u32, u32)> = Vec::new();
+        let mut hunt_moves: Vec<(u32, (i32, i32))> = Vec::new();
+        let world_tick_now = self.world_tick;
         for (id, actor) in &self.actors {
             if actor.activity.is_some() {
                 continue;
             }
+            // Default-when-missing is Defend (2), not AttackAnything (3):
+            // hunting (advance toward visible enemies) is an opt-in
+            // behaviour the scenario must explicitly request via
+            // `set_stance(actor, 3)`. Without this gate, every idle
+            // unit would wander after distant enemies and break
+            // existing bench packs whose policies assume "an idle unit
+            // stays put unless explicitly ordered to move" (e.g. the
+            // rush-hour Stop semantics, the def-pre-position-mobile-
+            // reserve idiom). Stance:0 still blocks all engagement;
+            // stance:1 still requires a recent hit; stance:2 / missing
+            // engage in-range; stance:3 ALSO hunts.
+            let stance = self.stances.get(id).copied().unwrap_or(2);
             // HoldFire stance suppresses defensive auto-engage.
-            if self.stances.get(id).copied().unwrap_or(3) == 0 {
+            if stance == 0 {
                 continue;
+            }
+            // ReturnFire (stance:1) requires having been recently hit
+            // by a hostile. Without a fresh hit, the unit holds fire
+            // even on enemies in range — pinning the "I won't shoot
+            // first" semantics that distinguish stance:1 from stance:2.
+            if stance == 1 {
+                let licensed = self
+                    .recently_received_fire
+                    .get(id)
+                    .map(|t| world_tick_now.saturating_sub(*t) <= RETURN_FIRE_WINDOW)
+                    .unwrap_or(false);
+                if !licensed {
+                    continue;
+                }
             }
             let my_loc = match actor.location {
                 Some(l) => l,
@@ -2303,11 +2444,20 @@ impl World {
             if range_cells <= 0 {
                 continue;
             }
-            // Find nearest enemy actor within firing range. Enemy = owned by
-            // a different playable owner; we exclude self-owner and the
-            // unowned (None) world-actors. Matches a pragmatic subset of C#
-            // diplomacy — sufficient for rush-hour's two-player scenario.
-            let mut best: Option<(u32, i32)> = None;
+            // Whether this actor can physically move (stance:3 hunt
+            // requires mobility — a static turret with stance:3 won't
+            // ever advance, but in the existing engine such turrets
+            // use ActorKind::Building and live on the defense-scan
+            // path above, not this scan).
+            let can_hunt = matches!(
+                actor.kind,
+                ActorKind::Infantry | ActorKind::Vehicle | ActorKind::Mcv
+            );
+            // First pass: nearest in-range enemy (firing target).
+            let mut best_in_range: Option<(u32, i32)> = None;
+            // Second pass: nearest visible-but-out-of-range enemy
+            // (hunt target). Only filled when stance:3 + can_hunt.
+            let mut best_hunt: Option<(u32, i32, (i32, i32))> = None;
             for (eid, enemy) in &self.actors {
                 if *eid == *id {
                     continue;
@@ -2336,13 +2486,23 @@ impl World {
                 let dy = (eloc.1 - my_loc.1).abs();
                 let dist = dx.max(dy); // Chebyshev (matches armament.rs)
                 if dist <= range_cells {
-                    if best.map_or(true, |(_, d)| dist < d) {
-                        best = Some((*eid, dist));
+                    if best_in_range.map_or(true, |(_, d)| dist < d) {
+                        best_in_range = Some((*eid, dist));
+                    }
+                } else if stance == 3 && can_hunt && dist <= HUNT_RADIUS {
+                    if best_hunt.map_or(true, |(_, d, _)| dist < d) {
+                        best_hunt = Some((*eid, dist, eloc));
                     }
                 }
             }
-            if let Some((target_id, _)) = best {
+            if let Some((target_id, _)) = best_in_range {
                 engage_pairs.push((*id, target_id));
+            } else if let Some((_, _, eloc)) = best_hunt {
+                // Stance:3 hunt — advance toward the visible enemy.
+                // We move to a cell just inside weapon range of the
+                // enemy so that, once arrived, the next-tick auto-
+                // engage scan above promotes us back into Attack.
+                hunt_moves.push((*id, eloc));
             }
         }
         // Apply: Move → Attack. After the target dies, the unit goes
@@ -2350,6 +2510,15 @@ impl World {
         for (attacker, target) in engage_pairs {
             // Idle opportunistic engagement — auto-acquired.
             self.order_attack(attacker, target, true);
+        }
+        // Apply hunt moves. order_move pathfinds toward the target
+        // cell; pathfinder stops at the nearest passable cell if the
+        // exact cell is occupied. The arriving unit goes idle on
+        // completion and gets re-scanned by this loop on the next
+        // tick — at which point the enemy is in weapon range and the
+        // in-range branch above fires the cannon.
+        for (hunter, target_cell) in hunt_moves {
+            self.order_move(hunter, target_cell);
         }
 
         // Tick Move activities: advance position along path.
@@ -2755,6 +2924,19 @@ impl World {
                     }
                 }
             }
+            // Stamp the victim with the world-tick of receiving fire so
+            // a stance:1 (ReturnFire) victim is licensed to engage in
+            // the next auto-engage scan. Only count hostile (different-
+            // owner) damage — friendly fire / splash from an allied
+            // unit must NOT unlock return fire (otherwise a stray
+            // allied splash would re-arm the whole formation).
+            let attacker_owner = self.actors.get(attacker_id).and_then(|a| a.owner_id);
+            let target_owner_now = self.actors.get(target_id).and_then(|a| a.owner_id);
+            if let (Some(ao), Some(to)) = (attacker_owner, target_owner_now) {
+                if ao != to {
+                    self.recently_received_fire.insert(*target_id, self.world_tick);
+                }
+            }
         }
         // Credit each kill to the attacker (Actor.kills) and the
         // attacker's owning player (kills_per_player). Done in
@@ -2952,15 +3134,13 @@ impl World {
         let player_ids: Vec<u32> = self.production.keys().copied().collect();
         let mut completed_items: Vec<(u32, String)> = Vec::new();
         for pid in player_ids {
-            // Low-power slowdown: skip every other tick if power_drained > power_provided
-            let is_low_power = self.actors.get(&pid).map(|a| {
-                for t in &a.traits {
-                    if let TraitState::PowerManager { power_provided, power_drained } = t {
-                        return *power_drained > *power_provided && *power_provided > 0;
-                    }
-                }
-                false
-            }).unwrap_or(false);
+            // Low-power slowdown: skip every other tick if power_drained > power_provided.
+            // Reads from the authoritative recompute (pre-placed buildings +
+            // PowerDown toggle honoured), NOT the stale PowerManager trait.
+            let is_low_power = {
+                let (provided, drained) = self.compute_player_power(pid);
+                drained > provided && provided > 0
+            };
             if is_low_power && self.world_tick % 2 == 0 {
                 continue; // 50% production speed when low power
             }
@@ -3163,6 +3343,16 @@ impl World {
                             }
                             break;
                         }
+                    }
+                }
+                // Stamp the victim for stance:1 ReturnFire gating
+                // (hostile damage only — friendly splash must not
+                // unlock return fire across the formation).
+                let attacker_owner = self.actors.get(&attacker_id).and_then(|a| a.owner_id);
+                let victim_owner_now = self.actors.get(victim_id).and_then(|a| a.owner_id);
+                if let (Some(ao), Some(vo)) = (attacker_owner, victim_owner_now) {
+                    if ao != vo {
+                        self.recently_received_fire.insert(*victim_id, self.world_tick);
                     }
                 }
             }
@@ -4691,10 +4881,13 @@ pub fn build_world(
         bots,
         scripted_bots: Vec::new(),
         repairing: HashSet::new(),
+        powered_down: HashSet::new(),
         rally_points: HashMap::new(),
         cargo: HashMap::new(),
         primary_buildings: HashSet::new(),
         stances: HashMap::new(),
+        recently_received_fire: HashMap::new(),
+        hunt_enabled: HashSet::new(),
         superweapon_timers: HashMap::new(),
         invulnerable: HashMap::new(),
         player_factions,
