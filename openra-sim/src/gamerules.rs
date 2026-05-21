@@ -123,10 +123,35 @@ impl GameRules {
                 .map(|s| s.split(',').map(|p| p.trim().to_lowercase()).collect())
                 .unwrap_or_default();
 
-            let weapon_names: Vec<String> = info.traits_of("Armament")
+            let mut weapon_names: Vec<String> = info.traits_of("Armament")
                 .iter()
                 .filter_map(|t| t.get("Weapon").map(|w| w.to_string()))
                 .collect();
+
+            // Engine-side default for garrison-only defenses. RA's `pbox`
+            // (pillbox) is a `AttackGarrisoned` defense — its offensive
+            // power comes from infantry loaded into its `Cargo`, so the
+            // C# YAML carries NO direct `Armament` trait. The engine does
+            // not model garrisoning, so the auto-target loop's
+            // `weapons.first()` returns `None` and a *built* pbox never
+            // fires (it just stands inert). To make the pillbox a real
+            // active direct-fire tower we attach its canonical RA
+            // anti-infantry weapon `M60mg` (the pillbox machine-gun:
+            // Damage 1000 × Burst 5, ReloadDelay 30, Range 4c0, anti-
+            // infantry `Versus None:150`) when the actor classifies as a
+            // ground turret but has no explicit Armament. This is weaker
+            // and shorter-ranged than the `gun` turret's `TurretGun`
+            // (Damage 6000, Range 6c512), matching the pbox's role as the
+            // cheap anti-infantry pillbox. Defenses that DO carry an
+            // explicit `Armament` (gun, ftur, tsla) are untouched.
+            if weapon_names.is_empty()
+                && matches!(
+                    crate::traits::classify_defense(&key),
+                    Some(crate::traits::DefenseKind::GroundTurret)
+                )
+            {
+                weapon_names.push("M60mg".to_string());
+            }
 
             // RA YAML stores Range as "Xc0" / "XcY" (cells + sub-cell). The
             // C# WDist parser is lenient: also accepts a bare integer in
