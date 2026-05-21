@@ -98,7 +98,9 @@ fn parses_three_event_kinds() {
     );
 
     // Event 0 — spawn_actors at tick 1500, expanded `count: 2` into
-    // two `3tnk` actors.
+    // two `3tnk` actors on DISTINCT cells (count: N no longer stacks
+    // units on the anchor — copy 0 keeps the declared position, copies
+    // 1.. spread to the nearest free cells in outward rings).
     let ev = &m.scheduled_events[0];
     assert_eq!(ev.tick, 1500);
     match &ev.kind {
@@ -107,9 +109,16 @@ fn parses_three_event_kinds() {
             for a in actors {
                 assert_eq!(a.actor_type, "3tnk");
                 assert_eq!(a.owner, "enemy");
-                assert_eq!(a.position, (80, 20));
                 assert_eq!(a.stance, Some(3));
             }
+            assert_eq!(
+                actors[0].position, (80, 20),
+                "copy 0 keeps the declared anchor"
+            );
+            assert_ne!(
+                actors[0].position, actors[1].position,
+                "count: 2 must spawn on two distinct cells, not stacked"
+            );
         }
         other => panic!("expected SpawnActors, got {other:?}"),
     }

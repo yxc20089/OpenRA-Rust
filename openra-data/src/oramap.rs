@@ -15,6 +15,7 @@
 //! (for the per-faction actor list).
 
 use crate::miniyaml;
+use std::collections::HashSet;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
@@ -1126,6 +1127,64 @@ fn read_xy_list(lines: &[&str], start: usize, expected_indent: usize) -> ((i32, 
 /// off) while rotating the enemy archetype (enemies declare
 /// `spawn_point` → enemy filter on). This is the contract the
 /// `adv-rps-counter-pick` pack relies on.
+/// Nearest cell to `(ax, ay)` not already in `used`, searched in
+/// outward Chebyshev rings (deterministic: row-major within each ring).
+/// Used to spread a `count:` group so its units do not spawn stacked.
+fn next_free_spiral(
+    ax: i32,
+    ay: i32,
+    used: &HashSet<(i32, i32)>,
+) -> (i32, i32) {
+    let mut r = 1i32;
+    while r <= 64 {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx.abs().max(dy.abs()) != r {
+                    continue;
+                }
+                let p = (ax + dx, ay + dy);
+                if !used.contains(&p) {
+                    return p;
+                }
+            }
+        }
+        r += 1;
+    }
+    (ax, ay)
+}
+
+/// Expand one raw actor's `count: N` into N `ScenarioActor`s. Copy 0
+/// keeps the declared `position` exactly — so single-count actors and
+/// the first unit of any group are unchanged — and copies 1..N are
+/// placed on the nearest free cells in outward rings around the anchor.
+/// `used` accumulates every placed cell so units of a group (and across
+/// groups) never spawn stacked on one cell. A tile-based RTS gives each
+/// ground unit its own cell; `count: N` previously copied `position`
+/// verbatim, piling all N units on the anchor.
+fn push_count_spread(
+    out: &mut Vec<ScenarioActor>,
+    used: &mut HashSet<(i32, i32)>,
+    r: &RawScenarioActor,
+) {
+    let n = r.count.max(1);
+    let (ax, ay) = r.position;
+    for k in 0..n {
+        let pos = if k == 0 {
+            (ax, ay)
+        } else {
+            next_free_spiral(ax, ay, used)
+        };
+        used.insert(pos);
+        out.push(ScenarioActor {
+            actor_type: r.actor_type.clone(),
+            owner: r.owner.clone(),
+            position: pos,
+            stance: r.stance,
+            health: r.health,
+        });
+    }
+}
+
 fn expand_scenario_actors(raw: &[RawScenarioActor], spawn_point: i32) -> Vec<ScenarioActor> {
     let any_agent_has_spawn = raw
         .iter()
@@ -1134,6 +1193,7 @@ fn expand_scenario_actors(raw: &[RawScenarioActor], spawn_point: i32) -> Vec<Sce
         .iter()
         .any(|r| r.owner == "enemy" && r.spawn_point.is_some());
     let mut out = Vec::new();
+    let mut used: HashSet<(i32, i32)> = HashSet::new();
     for r in raw {
         // Per-owner spawn_point filter. An owner's filter activates
         // when at least one actor of that owner declared
@@ -1147,16 +1207,9 @@ fn expand_scenario_actors(raw: &[RawScenarioActor], spawn_point: i32) -> Vec<Sce
         if r.owner == "enemy" && any_enemy_has_spawn && r.spawn_point != Some(spawn_point) {
             continue;
         }
-        let n = r.count.max(1);
-        for _ in 0..n {
-            out.push(ScenarioActor {
-                actor_type: r.actor_type.clone(),
-                owner: r.owner.clone(),
-                position: r.position,
-                stance: r.stance,
-                health: r.health,
-            });
-        }
+        // `count: N` expands to N actors on N distinct cells — units
+        // of a group no longer spawn stacked on the anchor.
+        push_count_spread(&mut out, &mut used, r);
     }
     out
 }
@@ -1240,21 +1293,16 @@ fn read_scheduled_events(
                         let (raw_actors, ni) =
                             read_actors_list(lines, i + 1, nested_indent);
                         // Expand `count:` exactly like the initial-spawn
-                        // path. `spawn_point` isn't meaningful for a
+                        // path — N actors on N distinct cells (no
+                        // stacking). `spawn_point` isn't meaningful for a
                         // scheduled-event injection (the seed-axis filter
                         // is consumed once at episode start), so we drop
                         // it here.
+                        let mut used: HashSet<(i32, i32)> = HashSet::new();
                         for r in &raw_actors {
-                            let n = r.count.max(1);
-                            for _ in 0..n {
-                                spawn_actors.push(ScenarioActor {
-                                    actor_type: r.actor_type.clone(),
-                                    owner: r.owner.clone(),
-                                    position: r.position,
-                                    stance: r.stance,
-                                    health: r.health,
-                                });
-                            }
+                            push_count_spread(
+                                &mut spawn_actors, &mut used, r,
+                            );
                         }
                         i = ni;
                     }

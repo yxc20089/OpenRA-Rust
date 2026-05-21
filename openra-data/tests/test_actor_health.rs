@@ -112,6 +112,13 @@ actors:
     for a in &agent_inf {
         assert_eq!(a.health, Some(100), "health: 250 clamps to 100");
     }
+    // count: N spawns N units on N DISTINCT cells — never stacked.
+    let cells: std::collections::HashSet<_> =
+        agent_inf.iter().map(|a| a.position).collect();
+    assert_eq!(
+        cells.len(), 3,
+        "count: 3 must spawn 3 distinct cells, got {cells:?}"
+    );
 
     let enemy = m
         .actors
