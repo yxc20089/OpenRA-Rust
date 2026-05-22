@@ -402,6 +402,13 @@ pub struct MapDef {
     /// downstream consumers (the env per-tick firing path) typically
     /// fire each event exactly once when `world_tick >= event.tick`.
     pub scheduled_events: Vec<ScheduledEvent>,
+    /// If true, the agent player observes the entire map with no fog of
+    /// war: every enemy actor is reported regardless of shroud, and
+    /// `explored_cells` covers the whole playable rectangle. Defaults to
+    /// `false` (normal fog). This is the no-fog half of the bench's
+    /// perception ablation grid (vision/structured × fog/no-fog) — a
+    /// perfect-information control cell, not a load-bearing scenario.
+    pub reveal_map: bool,
 }
 
 /// One scripted mid-episode event. Parsed from a top-level
@@ -673,6 +680,7 @@ pub fn load_rush_hour_map_with_spawn(
         starting_cash: scenario.starting_cash.unwrap_or(5000),
         enemy_bot: scenario.enemy_bot,
         scheduled_events: scenario.scheduled_events,
+        reveal_map: scenario.reveal_map.unwrap_or(false),
     })
 }
 
@@ -698,6 +706,10 @@ struct ScenarioYaml {
     enemy_bot: Option<String>,
     /// Parsed `scheduled_events:` block (empty when omitted).
     scheduled_events: Vec<ScheduledEvent>,
+    /// Top-level `reveal_map:` flag. None ⇒ default (false ⇒ normal fog
+    /// of war). Set `reveal_map: true` to disable fog for the agent
+    /// player — the no-fog cells of the perception ablation grid.
+    reveal_map: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -803,6 +815,16 @@ fn parse_scenario_yaml(text: &str) -> io::Result<ScenarioYaml> {
                 "spawn_mcvs" => {
                     let trimmed_v = v.trim().trim_matches(|c: char| c == '"' || c == '\'');
                     out.spawn_mcvs = match trimmed_v {
+                        "true" | "True" | "yes" | "1" => Some(true),
+                        "false" | "False" | "no" | "0" => Some(false),
+                        _ => None,
+                    };
+                    i += 1;
+                    continue;
+                }
+                "reveal_map" => {
+                    let trimmed_v = v.trim().trim_matches(|c: char| c == '"' || c == '\'');
+                    out.reveal_map = match trimmed_v {
                         "true" | "True" | "yes" | "1" => Some(true),
                         "false" | "False" | "no" | "0" => Some(false),
                         _ => None,

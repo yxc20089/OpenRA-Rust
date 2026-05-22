@@ -1796,6 +1796,9 @@ impl Env {
     /// flag is sticky — once a cell has been seen by any agent unit
     /// it stays explored, matching OpenRA's `Shroud.IsExplored`.
     fn refresh_explored_cells(&mut self) {
+        // `reveal_map` scenarios have no fog: the whole playable
+        // rectangle counts as explored regardless of the shroud.
+        let reveal = self.map_def.reveal_map;
         let world = match &self.world {
             Some(w) => w,
             None => return,
@@ -1819,7 +1822,7 @@ impl Env {
         };
         for y in y_lo..y_hi {
             for x in x_lo..x_hi {
-                if shroud.is_explored(x, y) {
+                if reveal || shroud.is_explored(x, y) {
                     self.explored_cells.insert((x, y));
                 }
             }
@@ -1828,6 +1831,10 @@ impl Env {
 
     /// Cell visibility via a player's typed shroud `is_visible` flag —
     /// only counts cells currently in sight of one of `player`'s units.
+    /// A `reveal_map: true` scenario disables fog for the AGENT player
+    /// only: every cell is visible to it (the no-fog cells of the
+    /// perception ablation grid). Other viewers (e.g. the 1v1 opponent
+    /// controller) keep their own shroud.
     fn is_visible_to(
         &self,
         world: &World,
@@ -1835,6 +1842,9 @@ impl Env {
         cx: i32,
         cy: i32,
     ) -> bool {
+        if self.map_def.reveal_map && player == self.agent_player_id {
+            return true;
+        }
         match world.typed_shroud(player) {
             Some(s) => s.is_visible(cx, cy),
             None => false,
@@ -2325,6 +2335,7 @@ pub fn build_test_env_with_no_enemies(map_size: (i32, i32), seed: u64) -> Env {
         starting_cash: 5000,
         enemy_bot: None,
         scheduled_events: Vec::new(),
+        reveal_map: false,
     };
     let mut env = Env {
         scenario_path: PathBuf::from("<test>"),
