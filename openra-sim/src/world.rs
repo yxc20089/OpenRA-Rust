@@ -2109,6 +2109,56 @@ impl World {
         true
     }
 
+    /// Auto-issue a Harvest activity to any owned, idle harvester
+    /// whose owner has a refinery (`proc`). This is the back-stop that
+    /// makes scenario-placed harvesters mine the moment the
+    /// refinery is up — `build_scenario_actor` injects them with
+    /// `activity: None`, so the harv would otherwise sit idle until
+    /// an explicit Harvest order arrived. The newly-spawned-via-
+    /// `spawn_unit` harvester path already starts in Harvest; this
+    /// method is the catch-all for every other code path (scenario
+    /// load, transport unload, deploy-then-build, etc.).
+    fn auto_route_idle_harvesters(&mut self) {
+        // Snapshot candidates: alive, kind == Vehicle, actor_type ==
+        // "harv", owner has a refinery, and current activity is None
+        // (Move/Attack/etc. counts as "busy" and must not be clobbered).
+        let candidates: Vec<u32> = self.actors.values()
+            .filter(|a| {
+                a.actor_type.as_deref() == Some("harv")
+                    && a.activity.is_none()
+                    && a.owner_id.is_some()
+            })
+            .map(|a| a.id)
+            .collect();
+        for hid in candidates {
+            let (owner, speed, loc) = {
+                let a = match self.actors.get(&hid) { Some(a) => a, None => continue };
+                (a.owner_id.unwrap(), self.actor_speed(hid), a.location)
+            };
+            if loc.is_none() {
+                continue;
+            }
+            let refinery_id = match self.find_refinery(owner) {
+                Some(id) => id,
+                None => continue, // no proc yet — stay idle
+            };
+            if let Some(actor) = self.actors.get_mut(&hid) {
+                actor.activity = Some(Activity::Harvest {
+                    state: HarvestState::FindingOre,
+                    refinery_id,
+                    carried_ore: 0,
+                    carried_gems: 0,
+                    capacity: 20,
+                    path: Vec::new(),
+                    path_index: 0,
+                    speed,
+                    harvest_ticks: 0,
+                    last_harvest_cell: None,
+                });
+            }
+        }
+    }
+
     fn tick_harvesters(&mut self) {
         let harvester_ids: Vec<u32> = self.actors.values()
             .filter(|a| matches!(a.activity, Some(Activity::Harvest { .. })))
@@ -2289,7 +2339,7 @@ impl World {
 
     /// Start a harvester moving to its refinery for delivery.
     fn harvester_start_delivery(&mut self, harvester_id: u32) {
-        let (refinery_id, from) = {
+        let (mut refinery_id, from, owner) = {
             let actor = match self.actors.get(&harvester_id) {
                 Some(a) => a,
                 None => return,
@@ -2299,8 +2349,32 @@ impl World {
             } else {
                 return;
             };
-            (rid, actor.location)
+            (rid, actor.location, actor.owner_id)
         };
+
+        // Self-healing refinery resolution. The harvester's stored
+        // `refinery_id` is set when its Harvest activity is first
+        // installed; if the player has since BUILT (scenario didn't
+        // pre-place) or LOST their refinery, the stored id is stale.
+        // Re-resolve to the owner's current `proc` so the harv keeps
+        // working as soon as a refinery exists.
+        let stale = refinery_id == 0
+            || !self.actors.get(&refinery_id)
+                .map(|a| a.kind == ActorKind::Building
+                    && a.actor_type.as_deref() == Some("proc"))
+                .unwrap_or(false);
+        if stale {
+            if let Some(pid) = owner {
+                if let Some(rid) = self.find_refinery(pid) {
+                    refinery_id = rid;
+                    if let Some(actor) = self.actors.get_mut(&harvester_id) {
+                        if let Some(Activity::Harvest { refinery_id: r, .. }) = &mut actor.activity {
+                            *r = refinery_id;
+                        }
+                    }
+                }
+            }
+        }
 
         // Find refinery location
         let refinery_loc = self.actors.get(&refinery_id).and_then(|a| a.location);
@@ -4284,6 +4358,15 @@ impl World {
         for id in expired_inv {
             self.invulnerable.remove(&id);
         }
+
+        // Resource-economy idiom: any idle, owned harvester whose
+        // owner has at least one refinery should auto-start a Harvest
+        // cycle (matches the C# AutoTarget-on-spawn behaviour for HARV).
+        // This is what makes a scenario-placed `harv` actually mine the
+        // moment the agent's `proc` is up — without it the harv stands
+        // inert because `build_scenario_actor` injects it with no
+        // Activity.
+        self.auto_route_idle_harvesters();
 
         // Tick Harvest activities.
         self.tick_harvesters();

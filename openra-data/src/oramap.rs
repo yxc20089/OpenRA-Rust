@@ -409,6 +409,27 @@ pub struct MapDef {
     /// perception ablation grid (vision/structured × fog/no-fog) — a
     /// perfect-information control cell, not a load-bearing scenario.
     pub reveal_map: bool,
+    /// Ore patches declared directly in the scenario YAML via the
+    /// top-level `ore_patches:` list. Each entry is materialised by the
+    /// env layer into a disk of ore cells on the terrain map so
+    /// harvesters can mine it. Scenarios that pre-place ore via the
+    /// `mine` map prop still work unchanged (the env layer continues to
+    /// handle that path); `ore_patches:` is the explicit, declarative
+    /// alternative that makes the bench's economy scenarios
+    /// load-bearing.
+    pub ore_patches: Vec<OrePatchDef>,
+}
+
+/// A scenario-declared ore patch. Materialised by the env layer at
+/// world-build time into a disk of harvestable ore centered at
+/// `(x, y)` with roughly `amount` density units spread across cells.
+/// `radius` controls the disk size (default 3, ≈28 cells).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrePatchDef {
+    pub x: i32,
+    pub y: i32,
+    pub amount: i32,
+    pub radius: i32,
 }
 
 /// One scripted mid-episode event. Parsed from a top-level
@@ -681,6 +702,7 @@ pub fn load_rush_hour_map_with_spawn(
         enemy_bot: scenario.enemy_bot,
         scheduled_events: scenario.scheduled_events,
         reveal_map: scenario.reveal_map.unwrap_or(false),
+        ore_patches: scenario.ore_patches,
     })
 }
 
@@ -710,6 +732,8 @@ struct ScenarioYaml {
     /// of war). Set `reveal_map: true` to disable fog for the agent
     /// player — the no-fog cells of the perception ablation grid.
     reveal_map: Option<bool>,
+    /// Parsed `ore_patches:` block (empty when omitted).
+    ore_patches: Vec<OrePatchDef>,
 }
 
 #[derive(Debug, Clone)]
@@ -809,6 +833,14 @@ fn parse_scenario_yaml(text: &str) -> io::Result<ScenarioYaml> {
                     let (events, ni) =
                         read_scheduled_events(&lines, i + 1, detected_indent);
                     out.scheduled_events = events;
+                    i = ni;
+                    continue;
+                }
+                "ore_patches" => {
+                    let detected_indent = detect_list_indent(&lines, i + 1).unwrap_or(0);
+                    let (patches, ni) =
+                        read_ore_patches(&lines, i + 1, detected_indent);
+                    out.ore_patches = patches;
                     i = ni;
                     continue;
                 }
@@ -1363,6 +1395,99 @@ fn read_scheduled_events(
         i += 1;
     }
     (events, i)
+}
+
+/// Parse the `ore_patches:` list. Each list item is a dict with
+/// `x:`, `y:`, `amount:` (required) and an optional `radius:`. Mirrors
+/// the shape of `scheduled_events:` / `spawn_mcvs:` (top-level YAML
+/// keys consumed by the env layer at world-build time). Returns the
+/// parsed patches (in declaration order) and the index of the first
+/// line past the block. Unknown sub-keys are tolerated.
+fn read_ore_patches(
+    lines: &[&str],
+    start: usize,
+    list_indent: usize,
+) -> (Vec<OrePatchDef>, usize) {
+    let mut patches = Vec::new();
+    let mut i = start;
+
+    while i < lines.len() {
+        let raw = lines[i];
+        let trimmed = strip_yaml_comment(raw).trim_end();
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+        let indent = leading_spaces(raw);
+        let trim_lead = trimmed.trim_start();
+
+        if indent < list_indent {
+            break;
+        }
+        if indent == list_indent && !trim_lead.starts_with("- ") {
+            break;
+        }
+
+        if let Some(rest) = trim_lead.strip_prefix("- ") {
+            // Start a new patch. Anchor defaults; required `x`, `y`,
+            // `amount` are validated at the end.
+            let mut p_x: Option<i32> = None;
+            let mut p_y: Option<i32> = None;
+            let mut p_amount: Option<i32> = None;
+            let mut p_radius: i32 = 3;
+
+            // First key on the `- ` line itself (PyYAML often writes
+            // `- x: 50`).
+            if let Some((k, v)) = split_key_value(rest) {
+                match k {
+                    "x" => p_x = v.parse().ok(),
+                    "y" => p_y = v.parse().ok(),
+                    "amount" => p_amount = v.parse().ok(),
+                    "radius" => {
+                        if let Ok(r) = v.parse::<i32>() {
+                            p_radius = r.max(0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+
+            // Body lines indented strictly more than `list_indent`.
+            while i < lines.len() {
+                let sub = lines[i];
+                let sub_trim = strip_yaml_comment(sub).trim_end();
+                if sub_trim.is_empty() {
+                    i += 1;
+                    continue;
+                }
+                let sub_indent = leading_spaces(sub);
+                if sub_indent <= list_indent {
+                    break;
+                }
+                let sub_lead = sub_trim.trim_start();
+                match split_key_value(sub_lead) {
+                    Some(("x", v)) => p_x = v.parse().ok(),
+                    Some(("y", v)) => p_y = v.parse().ok(),
+                    Some(("amount", v)) => p_amount = v.parse().ok(),
+                    Some(("radius", v)) => {
+                        if let Ok(r) = v.parse::<i32>() {
+                            p_radius = r.max(0);
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+
+            if let (Some(x), Some(y), Some(amount)) = (p_x, p_y, p_amount) {
+                patches.push(OrePatchDef { x, y, amount, radius: p_radius });
+            }
+            continue;
+        }
+        i += 1;
+    }
+    (patches, i)
 }
 
 /// Parse an `ActorFilter` block. Lines belong to the filter while their

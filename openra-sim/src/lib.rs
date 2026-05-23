@@ -13,6 +13,7 @@ pub mod math;
 pub mod order;
 pub mod pathfinder;
 pub mod projectile;
+pub mod resource;
 pub mod rng;
 pub mod scripted_bot;
 pub mod superweapon;

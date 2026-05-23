@@ -933,6 +933,23 @@ impl Env {
             world::remove_test_actor(&mut world, id);
         }
 
+        // Materialise scenario-declared ore patches into the live
+        // terrain BEFORE injecting scenario actors. This is the
+        // explicit, declarative path (`ore_patches:` in the YAML) —
+        // strictly additive on top of the legacy `mine`/`gmine` actor
+        // path handled below. Each patch is seeded as a disk of ore
+        // cells of density `clamp(amount / cells, 1, 12)` per cell,
+        // skipping impassable terrain.
+        for p in &self.map_def.ore_patches {
+            let patch = openra_sim::resource::OrePatch {
+                x: p.x,
+                y: p.y,
+                amount: p.amount,
+                radius: p.radius.max(0),
+            };
+            openra_sim::resource::seed_ore_patch(&mut world.terrain, patch);
+        }
+
         // Inject scenario actors. We allocate ids well above any id
         // assigned by `build_world` so nothing collides.
         let mut next_id = scenario_id_seed(&world);
@@ -1768,6 +1785,7 @@ impl Env {
                     map_info: crate::observation::MapInfo::default(),
                     spatial: Vec::new(),
                     spatial_shape: (0, 0, crate::observation::SPATIAL_CHANNELS),
+                    ore_cells: Vec::new(),
                 };
             }
         };
@@ -1915,6 +1933,12 @@ impl Env {
 
         let (spatial, spatial_shape) = self.build_spatial(world, &snap);
 
+        // Ore-layer perception: enumerate every cell currently holding
+        // ore/gems. Surfaced flat (no fog gating) — the economy idiom
+        // assumes the agent can see ore patches from turn 1 to choose
+        // where to drop the refinery.
+        let ore_cells = openra_sim::resource::enumerate_resource_cells(&world.terrain);
+
         Observation {
             unit_positions,
             unit_hp,
@@ -1934,6 +1958,7 @@ impl Env {
             },
             spatial,
             spatial_shape,
+            ore_cells,
         }
     }
 
@@ -2482,6 +2507,7 @@ pub fn build_test_env_with_no_enemies(map_size: (i32, i32), seed: u64) -> Env {
         enemy_bot: None,
         scheduled_events: Vec::new(),
         reveal_map: false,
+        ore_patches: Vec::new(),
     };
     let mut env = Env {
         scenario_path: PathBuf::from("<test>"),
