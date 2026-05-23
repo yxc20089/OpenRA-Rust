@@ -243,6 +243,14 @@ fn pq_type_name(pq: PqType) -> &'static str {
     }
 }
 
+/// Number of world ticks during which `auto_route_idle_harvesters`
+/// must NOT clobber a harvester that has received a user-issued
+/// `Harvest(unit_id, x, y)` order. 300 ticks ≈ 3 decision turns at
+/// 100 ticks/turn — enough for the harv to actually walk to a
+/// far-off patch before the auto-router is allowed to take over
+/// again. See Fix #4 in OpenRA-Bench's ENGINE_FOLLOWUPS.
+pub const USER_HARVEST_RESPECT_TICKS: u32 = 300;
+
 pub struct World {
     /// All actors keyed by ID. BTreeMap ensures deterministic iteration order.
     actors: BTreeMap<u32, Actor>,
@@ -362,6 +370,16 @@ pub struct World {
     /// Incremented in `tick_actors` whenever a player's attack reduces
     /// a target's HP ≤ 0. Read via `kills_for_player`.
     kills_per_player: BTreeMap<u32, u32>,
+    /// World-tick at which each harvester last received an explicit
+    /// user-issued `Harvest(unit_id, x, y)` order. Used to gate the
+    /// `auto_route_idle_harvesters` back-stop: a harvester whose
+    /// owner has issued a Harvest order within `USER_HARVEST_RESPECT_TICKS`
+    /// is left alone (the user's target patch is preserved across the
+    /// brief idle window between deliver-and-next-cycle, which would
+    /// otherwise see the auto-router clobber the user's chosen patch
+    /// with the nearest-to-proc patch). Without this, all per-patch
+    /// allocation policies collapsed to identical economy_value.
+    last_user_harvest_tick: HashMap<u32, u32>,
     /// Phase-8: in-flight projectiles (rockets / missiles). BTreeMap so
     /// per-tick advance and impact-resolution iterate in stable id
     /// order. Spawned by the combat loop when an attacker fires a
@@ -1370,14 +1388,24 @@ impl World {
 
     /// Handle a Harvest order: send a harvester to harvest at a location.
     fn order_harvest(&mut self, actor_id: u32, target: (i32, i32)) {
-        // Idempotent: a unit already harvesting must not have its
-        // in-progress run (accumulated ore / FSM state) wiped by a
-        // re-issued harvest order — agents/models re-send commands
-        // every turn, and clobbering here starves the harvester so it
-        // never reaches capacity and never delivers cash.
+        // Always stamp the user-order tick — even if we end up taking
+        // the idempotent fast-path below — so `auto_route_idle_harvesters`
+        // continues to respect this user choice across the brief idle
+        // window between cycles.
+        self.last_user_harvest_tick.insert(actor_id, self.world_tick);
+
+        // Idempotent-with-target-check: a unit already harvesting at
+        // (or toward) the same target must not have its in-progress
+        // run wiped — agents re-send the same Harvest command every
+        // turn. But if the target CHANGED, the user wants to redirect,
+        // and we must update `last_harvest_cell` so the next
+        // `FindingOre` scan looks near the NEW patch instead of
+        // bouncing back to whatever was closest before.
         if let Some(a) = self.actors.get(&actor_id) {
-            if matches!(a.activity, Some(Activity::Harvest { .. })) {
-                return;
+            if let Some(Activity::Harvest { last_harvest_cell, .. }) = &a.activity {
+                if *last_harvest_cell == Some(target) {
+                    return;
+                }
             }
         }
         let (speed, owner_id) = match self.actors.get(&actor_id) {
@@ -1386,11 +1414,19 @@ impl World {
         };
         let refinery_id = owner_id.and_then(|pid| self.find_refinery(pid)).unwrap_or(0);
         if let Some(actor) = self.actors.get_mut(&actor_id) {
+            // Preserve carried ore/gems on a redirect (the user is
+            // re-targeting an active harvester, not resetting it).
+            let (carried_ore, carried_gems) =
+                if let Some(Activity::Harvest { carried_ore, carried_gems, .. }) = &actor.activity {
+                    (*carried_ore, *carried_gems)
+                } else {
+                    (0, 0)
+                };
             actor.activity = Some(Activity::Harvest {
                 state: HarvestState::FindingOre,
                 refinery_id,
-                carried_ore: 0,
-                carried_gems: 0,
+                carried_ore,
+                carried_gems,
                 capacity: 20,
                 path: Vec::new(),
                 path_index: 0,
@@ -2206,6 +2242,21 @@ impl World {
             .map(|a| a.id)
             .collect();
         for hid in candidates {
+            // Respect a recent user-issued Harvest order. The user
+            // told us where to mine; the auto-router must not
+            // clobber that choice the moment the harv goes idle
+            // (between cycles). The 300-tick window (~3 decision
+            // turns at 100t/turn) is long enough for the harv to
+            // actually walk to a far-away patch — after that the
+            // user is presumed to have moved on and auto-route may
+            // resume.
+            if let Some(last) = self.last_user_harvest_tick.get(&hid).copied() {
+                if self.world_tick.saturating_sub(last)
+                    < crate::world::USER_HARVEST_RESPECT_TICKS
+                {
+                    continue;
+                }
+            }
             let (owner, speed, loc) = {
                 let a = match self.actors.get(&hid) { Some(a) => a, None => continue };
                 (a.owner_id.unwrap(), self.actor_speed(hid), a.location)
@@ -6489,6 +6540,7 @@ pub fn build_world(
         player_factions,
         typed_shroud: BTreeMap::new(),
         kills_per_player: BTreeMap::new(),
+        last_user_harvest_tick: HashMap::new(),
         pending_projectiles: BTreeMap::new(),
         next_projectile_id: 1,
         typed_components: BTreeMap::new(),
