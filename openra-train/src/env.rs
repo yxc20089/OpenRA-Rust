@@ -539,10 +539,16 @@ impl Env {
                 continue;
             }
             if a.owner == self.enemy_player_id {
-                if !self.is_visible_to_agent(world, a.x, a.y) {
+                let cell_visible = self.is_visible_to_agent(world, a.x, a.y);
+                let is_building = matches!(a.kind, ActorKind::Building);
+                // Spy infiltration permanently reveals enemy buildings
+                // to the agent even through fog (one-shot reveal scan).
+                let infiltrated = is_building
+                    && world.was_infiltration_revealed(self.agent_player_id, a.id);
+                if !cell_visible && !infiltrated {
                     continue;
                 }
-                if matches!(a.kind, ActorKind::Building) {
+                if is_building {
                     cur_visible_enemy_buildings.insert(a.id);
                 } else {
                     cur_visible_enemy_units.insert(a.id);
@@ -865,11 +871,21 @@ impl Env {
                     player_reference: "Multi0".into(),
                     faction: self.map_def.agent_faction.clone(),
                     is_bot: false,
+                    // Per-player starting-cash from
+                    // `agent: {cash: N}`; falls back to lobby
+                    // `starting_cash` when omitted.
+                    starting_cash: self.map_def.agent_starting_cash,
                 },
                 SlotInfo {
                     player_reference: "Multi1".into(),
                     faction: self.map_def.enemy_faction.clone(),
                     is_bot: false,
+                    // Per-player starting-cash from
+                    // `enemy: {cash: M}`; falls back to lobby
+                    // `starting_cash` when omitted. This is what makes
+                    // e.g. `spec-thief-steal-cash` load-bearing — the
+                    // enemy must hold credits the thief can steal.
+                    starting_cash: self.map_def.enemy_starting_cash,
                 },
             ],
         };
@@ -892,6 +908,19 @@ impl Env {
             0,
             self.map_def.spawn_mcvs,
         );
+
+        // Naval-MVP overlay: stamp scenario-declared `water_cells:` into
+        // the live terrain. Each cell becomes ground-impassable and
+        // ship-passable. Done AFTER `build_world` so the engine's
+        // `apply_temperat_passability` pass (which has no water concept,
+        // only "fully impassable") runs first; the overlay is the
+        // authoritative source for naval scenarios that use the YAML
+        // path. Out-of-bounds entries are silently ignored.
+        for &(wx, wy) in &self.map_def.water_cells {
+            if world.terrain.contains(wx, wy) {
+                world.terrain.set_water(wx, wy, true);
+            }
+        }
 
         // Resolve player ids: `build_world` allocates the World actor
         // (id 0), then non-playable players, then playable players, then
@@ -925,6 +954,23 @@ impl Env {
             .collect();
         for id in strip_ids {
             world::remove_test_actor(&mut world, id);
+        }
+
+        // Materialise scenario-declared ore patches into the live
+        // terrain BEFORE injecting scenario actors. This is the
+        // explicit, declarative path (`ore_patches:` in the YAML) —
+        // strictly additive on top of the legacy `mine`/`gmine` actor
+        // path handled below. Each patch is seeded as a disk of ore
+        // cells of density `clamp(amount / cells, 1, 12)` per cell,
+        // skipping impassable terrain.
+        for p in &self.map_def.ore_patches {
+            let patch = openra_sim::resource::OrePatch {
+                x: p.x,
+                y: p.y,
+                amount: p.amount,
+                radius: p.radius.max(0),
+            };
+            openra_sim::resource::seed_ore_patch(&mut world.terrain, patch);
         }
 
         // Inject scenario actors. We allocate ids well above any id
@@ -1306,6 +1352,142 @@ impl Env {
                         extra_data: None,
                     });
                 }
+                Command::C4Detonate { unit_ids, target_id } => {
+                    // Engine re-validates (subject must be `tanya`,
+                    // target must be an enemy Building), but we filter
+                    // here too so warnings surface early and don't get
+                    // silently dropped.
+                    let target_aid = match parse_actor_id(target_id) {
+                        Some(v) => v,
+                        None => {
+                            self.last_warnings
+                                .push(format!("invalid target_id {target_id:?}"));
+                            continue;
+                        }
+                    };
+                    // Target must be a building (alive); ownership check
+                    // (must be enemy) happens at the engine layer where
+                    // the issuer's actual owner id is in scope.
+                    let target_is_building = world
+                        .actor(target_aid)
+                        .map(|a| a.kind == openra_sim::actor::ActorKind::Building)
+                        .unwrap_or(false);
+                    if !target_is_building {
+                        self.last_warnings.push(format!(
+                            "C4Detonate target {target_aid} is not a building; dropped"
+                        ));
+                        continue;
+                    }
+                    for id in unit_ids {
+                        if let Some(aid) =
+                            resolve_owned(id, &issuer_owned, &mut self.last_warnings)
+                        {
+                            let is_tanya = world
+                                .actor(aid)
+                                .and_then(|a| a.actor_type.as_deref())
+                                == Some("tanya");
+                            if !is_tanya {
+                                self.last_warnings.push(format!(
+                                    "C4Detonate subject {aid} is not a tanya; dropped"
+                                ));
+                                continue;
+                            }
+                            orders.push(GameOrder {
+                                order_string: "C4Detonate".into(),
+                                subject_id: Some(aid),
+                                target_string: None,
+                                extra_data: Some(target_aid),
+                            });
+                        }
+                    }
+                }
+                Command::CaptureActor { unit_ids, target_id } => {
+                    // Engineer (e6) walks to an enemy building and
+                    // captures it. We accept any owned actor id here;
+                    // the engine-side `order_capture_actor` gates on
+                    // actor_type == "e6" and target being an enemy
+                    // Building, so non-engineer / friendly targets are
+                    // silently dropped at the engine.
+                    let target_aid = match parse_actor_id(target_id) {
+                        Some(v) => v,
+                        None => {
+                            self.last_warnings
+                                .push(format!("invalid target_id {target_id:?}"));
+                            continue;
+                        }
+                    };
+                    for id in unit_ids {
+                        if let Some(aid) =
+                            resolve_owned(id, &issuer_owned, &mut self.last_warnings)
+                        {
+                            orders.push(GameOrder {
+                                order_string: "CaptureActor".into(),
+                                subject_id: Some(aid),
+                                target_string: None,
+                                extra_data: Some(target_aid),
+                            });
+                        }
+                    }
+                }
+                Command::Infiltrate { unit_ids, target_id } => {
+                    let target_aid = match parse_actor_id(target_id) {
+                        Some(v) => v,
+                        None => {
+                            self.last_warnings
+                                .push(format!("invalid target_id {target_id:?}"));
+                            continue;
+                        }
+                    };
+                    // Engine validates owner / building / infiltrator
+                    // type at order time (`order_infiltrate`); the env
+                    // just resolves agent-owned subjects.
+                    for id in unit_ids {
+                        if let Some(aid) =
+                            resolve_owned(id, &issuer_owned, &mut self.last_warnings)
+                        {
+                            orders.push(GameOrder {
+                                order_string: "Infiltrate".into(),
+                                subject_id: Some(aid),
+                                target_string: None,
+                                extra_data: Some(target_aid),
+                            });
+                        }
+                    }
+                }
+                Command::FireSuperweapon { kind, target_cell, target_id } => {
+                    // Resolve and validate the (typed) actor id for
+                    // iron-curtain / chrono targets. Nuke ignores
+                    // `target_id`.
+                    let resolved_target: Option<u32> = match target_id {
+                        Some(id_str) => match parse_actor_id(id_str) {
+                            Some(v) => Some(v),
+                            None => {
+                                self.last_warnings.push(format!(
+                                    "FireSuperweapon: invalid target_id {id_str:?}"
+                                ));
+                                continue;
+                            }
+                        },
+                        None => None,
+                    };
+                    // Encode payload into target_string for the engine
+                    // order handler: "kind|tx,ty|tid" where any of tx,ty,
+                    // tid can be empty (`-`) when not provided.
+                    let cell_part = match target_cell {
+                        Some((x, y)) => format!("{x},{y}"),
+                        None => "-".into(),
+                    };
+                    let tid_part = match resolved_target {
+                        Some(v) => v.to_string(),
+                        None => "-".into(),
+                    };
+                    orders.push(GameOrder {
+                        order_string: "FireSuperweapon".into(),
+                        subject_id: Some(issuing_player),
+                        target_string: Some(format!("{kind}|{cell_part}|{tid_part}")),
+                        extra_data: None,
+                    });
+                }
             }
         }
         orders
@@ -1626,6 +1808,7 @@ impl Env {
                     map_info: crate::observation::MapInfo::default(),
                     spatial: Vec::new(),
                     spatial_shape: (0, 0, crate::observation::SPATIAL_CHANNELS),
+                    ore_cells: Vec::new(),
                 };
             }
         };
@@ -1688,10 +1871,14 @@ impl Env {
                 ));
                 unit_hp.push((id_str, pct));
             } else if a.owner == opponent {
-                if !self.is_visible_to(world, viewer, a.x, a.y) {
+                let cell_visible = self.is_visible_to(world, viewer, a.x, a.y);
+                let is_building = matches!(a.kind, ActorKind::Building);
+                let infiltrated = is_building
+                    && world.was_infiltration_revealed(viewer, a.id);
+                if !cell_visible && !infiltrated {
                     continue;
                 }
-                if matches!(a.kind, ActorKind::Building) {
+                if is_building {
                     enemy_buildings.push(EnemyBuilding {
                         cell_x: a.x,
                         cell_y: a.y,
@@ -1769,6 +1956,12 @@ impl Env {
 
         let (spatial, spatial_shape) = self.build_spatial(world, &snap);
 
+        // Ore-layer perception: enumerate every cell currently holding
+        // ore/gems. Surfaced flat (no fog gating) — the economy idiom
+        // assumes the agent can see ore patches from turn 1 to choose
+        // where to drop the refinery.
+        let ore_cells = openra_sim::resource::enumerate_resource_cells(&world.terrain);
+
         Observation {
             unit_positions,
             unit_hp,
@@ -1788,6 +1981,7 @@ impl Env {
             },
             spatial,
             spatial_shape,
+            ore_cells,
         }
     }
 
@@ -1796,6 +1990,9 @@ impl Env {
     /// flag is sticky — once a cell has been seen by any agent unit
     /// it stays explored, matching OpenRA's `Shroud.IsExplored`.
     fn refresh_explored_cells(&mut self) {
+        // `reveal_map` scenarios have no fog: the whole playable
+        // rectangle counts as explored regardless of the shroud.
+        let reveal = self.map_def.reveal_map;
         let world = match &self.world {
             Some(w) => w,
             None => return,
@@ -1819,7 +2016,7 @@ impl Env {
         };
         for y in y_lo..y_hi {
             for x in x_lo..x_hi {
-                if shroud.is_explored(x, y) {
+                if reveal || shroud.is_explored(x, y) {
                     self.explored_cells.insert((x, y));
                 }
             }
@@ -1828,6 +2025,10 @@ impl Env {
 
     /// Cell visibility via a player's typed shroud `is_visible` flag —
     /// only counts cells currently in sight of one of `player`'s units.
+    /// A `reveal_map: true` scenario disables fog for the AGENT player
+    /// only: every cell is visible to it (the no-fog cells of the
+    /// perception ablation grid). Other viewers (e.g. the 1v1 opponent
+    /// controller) keep their own shroud.
     fn is_visible_to(
         &self,
         world: &World,
@@ -1835,6 +2036,9 @@ impl Env {
         cx: i32,
         cy: i32,
     ) -> bool {
+        if self.map_def.reveal_map && player == self.agent_player_id {
+            return true;
+        }
         match world.typed_shroud(player) {
             Some(s) => s.is_visible(cx, cy),
             None => false,
@@ -2323,8 +2527,13 @@ pub fn build_test_env_with_no_enemies(map_size: (i32, i32), seed: u64) -> Env {
         }],
         spawn_mcvs: true,
         starting_cash: 5000,
+        agent_starting_cash: None,
+        enemy_starting_cash: None,
         enemy_bot: None,
         scheduled_events: Vec::new(),
+        reveal_map: false,
+        ore_patches: Vec::new(),
+        water_cells: Vec::new(),
     };
     let mut env = Env {
         scenario_path: PathBuf::from("<test>"),
@@ -2561,6 +2770,19 @@ mod py {
         #[getter]
         fn enemy_player_id(&self) -> u32 {
             self.inner.enemy_player_id()
+        }
+
+        /// Read a player's current cash balance. Bench tests use this
+        /// to cross-check the per-player starting-cash plumbing
+        /// (`agent: {cash:}` / `enemy: {cash:}`): the agent's own
+        /// cash already surfaces in the observation, but the enemy
+        /// player's cash isn't exposed elsewhere on the Python side.
+        /// Returns 0 for unknown ids (mirrors `World::player_cash`).
+        fn player_cash(&self, player_id: u32) -> i32 {
+            self.inner
+                .world()
+                .map(|w| w.player_cash(player_id))
+                .unwrap_or(0)
         }
 
         #[getter]

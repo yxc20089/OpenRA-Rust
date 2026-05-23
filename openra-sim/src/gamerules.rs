@@ -92,8 +92,14 @@ impl GameRules {
                 .and_then(|t| t.get_i32("HP"))
                 .unwrap_or(0);
 
+            // Ground units carry `Mobile.Speed`; aircraft carry
+            // `Aircraft.Speed` (they never have a Mobile trait). Read both
+            // so heli/hind/mig/yak pick up their real cruise speed from
+            // the vendored YAML instead of falling to 0 (which would
+            // freeze every aircraft on the map).
             let speed = info.trait_info("Mobile")
                 .and_then(|t| t.get_i32("Speed"))
+                .or_else(|| info.trait_info("Aircraft").and_then(|t| t.get_i32("Speed")))
                 .unwrap_or(0);
 
             let cost = info.trait_info("Valued")
@@ -293,6 +299,13 @@ impl GameRules {
         actor!("hbox", ActorKind::Building, 40000, 0, 600, 0, 1, 1, true);
         actor!("gun", ActorKind::Building, 40000, 0, 600, 0, 1, 1, true);
         actor!("ftur", ActorKind::Building, 40000, 0, 600, 0, 1, 1, true);
+        // Superweapon launchers. Each is a 2×2 building with high HP /
+        // high cost / heavy power draw, mirroring the C# RA balance.
+        // The actual superweapon effect / charge state lives in
+        // `superweapon.rs` and is dispatched from `world.rs::fire_superweapon`.
+        actor!("mslo", ActorKind::Building, 100000, 0, 5000, -200, 2, 2, true); // Nuclear Missile Silo
+        actor!("iron", ActorKind::Building, 100000, 0, 2800, -200, 2, 2, true); // Iron Curtain
+        actor!("pdox", ActorKind::Building, 100000, 0, 2800, -200, 2, 2, true); // Chronosphere
 
         // Infantry
         actor!("e1", ActorKind::Infantry, 50000, 43, 100, 0, 1, 1, false);
@@ -307,6 +320,29 @@ impl GameRules {
         actor!("dog", ActorKind::Infantry, 20000, 85, 200, 0, 1, 1, false);
         actor!("spy", ActorKind::Infantry, 25000, 56, 500, 0, 1, 1, false);
         actor!("thf", ActorKind::Infantry, 50000, 56, 500, 0, 1, 1, false);
+        // Tanya — Allied commando hero. Single high-HP, fast-moving
+        // infantry with a strong anti-infantry sidearm. HP ~3x e1,
+        // speed ~1.5x e1, damage ~5x M1Carbine, faster reload. The
+        // weapon (`TanyaPistol`) is registered below in the weapons
+        // table; her actor entry pre-binds it so the auto-engage /
+        // best_weapon_against paths resolve correctly when she is
+        // placed via `insert_test_actor` (no vendor YAML needed).
+        actors.insert("tanya".to_string(), ActorStats {
+            kind: ActorKind::Infantry,
+            hp: 150000,
+            speed: 64,
+            cost: 1200,
+            power: 0,
+            footprint: (1, 1),
+            armor_type: ArmorType::None,
+            is_building: false,
+            must_be_destroyed: false,
+            prerequisites: vec!["tent".to_string(), "atek".to_string()],
+            weapons: vec!["TanyaPistol".to_string()],
+            sight_range: 6,
+            provides_prerequisites: Vec::new(),
+            build_palette_order: 9999,
+        });
 
         // Vehicles
         actor!("1tnk", ActorKind::Vehicle, 160000, 113, 700, 0, 1, 1, false);
@@ -328,19 +364,28 @@ impl GameRules {
         actor!("ttnk", ActorKind::Vehicle, 100000, 71, 1500, 0, 1, 1, false);
         actor!("ctnk", ActorKind::Vehicle, 100000, 71, 2000, 0, 1, 1, false);
 
-        // Aircraft
-        actor!("heli", ActorKind::Aircraft, 100000, 0, 1200, 0, 1, 1, false);
-        actor!("hind", ActorKind::Aircraft, 100000, 0, 1200, 0, 1, 1, false);
-        actor!("mig", ActorKind::Aircraft, 100000, 0, 2000, 0, 1, 1, false);
-        actor!("yak", ActorKind::Aircraft, 100000, 0, 800, 0, 1, 1, false);
+        // Aircraft — MVP air units. Speed is set ~1.5x a Vehicle (128 vs 85)
+        // so a heli outpaces ground armour but doesn't trivialise scout
+        // distance, matching the heli-as-flanker scenario brief. Aircraft
+        // never gain a `Mobile` trait (they aren't ground units), so their
+        // Speed lives only here in gamerules and is consulted by
+        // World::actor_speed via the `rules.actor(type).speed` lookup.
+        actor!("heli", ActorKind::Aircraft, 120000, 128, 1200, 0, 1, 1, false);
+        actor!("hind", ActorKind::Aircraft, 100000, 128, 1200, 0, 1, 1, false);
+        actor!("mig", ActorKind::Aircraft, 100000, 180, 2000, 0, 1, 1, false);
+        actor!("yak", ActorKind::Aircraft, 100000, 149, 800, 0, 1, 1, false);
 
-        // Naval
-        actor!("ss", ActorKind::Ship, 100000, 0, 950, 0, 1, 1, false);
-        actor!("msub", ActorKind::Ship, 100000, 0, 1800, 0, 1, 1, false);
-        actor!("sub", ActorKind::Ship, 100000, 0, 950, 0, 1, 1, false);
-        actor!("dd", ActorKind::Ship, 100000, 0, 1000, 0, 1, 1, false);
-        actor!("ca", ActorKind::Ship, 100000, 0, 2000, 0, 1, 1, false);
-        actor!("pt", ActorKind::Ship, 100000, 0, 700, 0, 1, 1, false);
+        // Naval. Speeds approximate the vendored RA `Mobile.Speed`
+        // values (dd=92, ca=44, pt=89, lst=71, ss/sub=71, msub=85).
+        // HP / cost mirror the C# YAML so the bench's economy gates
+        // still bite when the vendored mod is absent.
+        actor!("ss", ActorKind::Ship, 60000, 71, 950, 0, 1, 1, false);
+        actor!("msub", ActorKind::Ship, 60000, 85, 1800, 0, 1, 1, false);
+        actor!("sub", ActorKind::Ship, 60000, 71, 950, 0, 1, 1, false);
+        actor!("dd", ActorKind::Ship, 40000, 92, 1000, 0, 1, 1, false);
+        actor!("ca", ActorKind::Ship, 80000, 44, 2400, 0, 1, 1, false);
+        actor!("pt", ActorKind::Ship, 15000, 89, 500, 0, 1, 1, false);
+        actor!("lst", ActorKind::Ship, 40000, 71, 700, 0, 1, 1, false);
 
         // Set prerequisites for units and buildings (matching OpenRA rules)
         // Infantry require barracks (tent/barr)
@@ -361,6 +406,30 @@ impl GameRules {
                 a.prerequisites = vec!["weap".to_string(), "dome".to_string()];
             }
         }
+        // Naval units require a naval yard (spen for soviet subs,
+        // syrd for allied surface ships). Matches the C# YAML
+        // `~spen` / `~syrd` prerequisites. The bench's MVP
+        // accepts spen as a generic naval producer regardless of
+        // faction; faction-specific gating lands when the
+        // `~tilde` prerequisite syntax is parsed.
+        for name in &["ss", "sub", "msub"] {
+            if let Some(a) = actors.get_mut(*name) {
+                a.prerequisites = vec!["spen".to_string()];
+            }
+        }
+        for name in &["dd", "ca", "pt", "lst"] {
+            if let Some(a) = actors.get_mut(*name) {
+                // dd / ca need radar dome in the C# YAML; pt and lst
+                // do not. Use the conservative path so the engine
+                // refuses to produce a dd before a dome exists.
+                if matches!(*name, "dd" | "ca") {
+                    a.prerequisites =
+                        vec!["spen".to_string(), "dome".to_string()];
+                } else {
+                    a.prerequisites = vec!["spen".to_string()];
+                }
+            }
+        }
         // Buildings prerequisites (matching OpenRA)
         if let Some(a) = actors.get_mut("tent") { a.prerequisites = vec!["powr".to_string()]; }
         if let Some(a) = actors.get_mut("barr") { a.prerequisites = vec!["powr".to_string()]; }
@@ -372,6 +441,10 @@ impl GameRules {
         if let Some(a) = actors.get_mut("afld") { a.prerequisites = vec!["dome".to_string()]; }
         if let Some(a) = actors.get_mut("atek") { a.prerequisites = vec!["weap".to_string(), "dome".to_string()]; }
         if let Some(a) = actors.get_mut("stek") { a.prerequisites = vec!["weap".to_string(), "dome".to_string()]; }
+        // Naval yards: spen (sub pen, soviet) and syrd (allied
+        // shipyard). Both gate on proc, matching the weap pattern.
+        if let Some(a) = actors.get_mut("spen") { a.prerequisites = vec!["proc".to_string()]; }
+        if let Some(a) = actors.get_mut("syrd") { a.prerequisites = vec!["proc".to_string()]; }
 
         // ProvidesPrerequisite for buildings (simplified defaults for testing)
         // FACT provides structures.allies / structures.soviet based on faction
@@ -410,7 +483,7 @@ impl GameRules {
             ];
         }
         // Other buildings provide themselves
-        for bname in &["proc","dome","fix","hpad","afld","spen","syrd","atek","stek","sam","agun","gap","tsla","pbox","hbox","gun","ftur"] {
+        for bname in &["proc","dome","fix","hpad","afld","spen","syrd","atek","stek","sam","agun","gap","tsla","pbox","hbox","gun","ftur","mslo","iron","pdox"] {
             if let Some(a) = actors.get_mut(*bname) {
                 if a.provides_prerequisites.is_empty() {
                     a.provides_prerequisites = vec![ProvidesPrereq { factions: vec![], prerequisite: bname.to_string(), requires_prerequisites: vec![] }];
@@ -431,6 +504,73 @@ impl GameRules {
             projectile_speed: 0,
             splash_radius: 0,
         });
+
+        // Tanya's sidearm — strong, fast-firing, single-target anti-
+        // infantry. Damage 5000 (5x M1Carbine), reload_delay 10 (2x
+        // faster than M1Carbine's 20), range 5 cells, instant-hit. A
+        // single tanya outpaces the burst output of multiple e1's at
+        // close range, which is the load-bearing "hero" property.
+        weapons.insert("TanyaPistol".to_string(), WeaponStats {
+            damage: 5000,
+            range: 5 * 1024,
+            reload_delay: 10,
+            burst: 1,
+            versus: BTreeMap::new(),
+            projectile_speed: 0,
+            splash_radius: 0,
+        });
+
+        // Aircraft armaments for the no-vendor defaults() path. Real
+        // gameplay loads HellfireAG / ChainGun from the vendored RA YAML
+        // via `from_ruleset`; these stubs let the defaults-only test path
+        // (and the test_aircraft regression) exercise heli combat without
+        // depending on the submodule. Versus None=150 gives bonus damage
+        // versus unarmored infantry (matching ChainGun anti-personnel).
+        let mut hellfire_ag_versus = BTreeMap::new();
+        hellfire_ag_versus.insert(ArmorType::None, 30);
+        hellfire_ag_versus.insert(ArmorType::Wood, 90);
+        hellfire_ag_versus.insert(ArmorType::Light, 90);
+        hellfire_ag_versus.insert(ArmorType::Heavy, 100);
+        hellfire_ag_versus.insert(ArmorType::Concrete, 100);
+        weapons.insert("HellfireAG".to_string(), WeaponStats {
+            damage: 6000,
+            range: 5 * 1024,
+            reload_delay: 34,
+            burst: 2,
+            versus: hellfire_ag_versus,
+            projectile_speed: 0, // model as InstantHit in defaults
+            splash_radius: 0,
+        });
+        let mut chaingun_versus = BTreeMap::new();
+        chaingun_versus.insert(ArmorType::None, 144);
+        weapons.insert("ChainGun".to_string(), WeaponStats {
+            damage: 1500,
+            range: 5 * 1024,
+            reload_delay: 10,
+            burst: 2,
+            versus: chaingun_versus,
+            projectile_speed: 0,
+            splash_radius: 0,
+        });
+
+        // Attach weapons to aircraft defaults so heli/hind/mig/yak can
+        // engage without depending on the vendored ruleset.
+        if let Some(a) = actors.get_mut("heli") {
+            a.weapons = vec!["HellfireAG".to_string()];
+            a.prerequisites = vec!["hpad".to_string()];
+        }
+        if let Some(a) = actors.get_mut("hind") {
+            a.weapons = vec!["ChainGun".to_string()];
+            a.prerequisites = vec!["hpad".to_string()];
+        }
+        if let Some(a) = actors.get_mut("mig") {
+            a.weapons = vec!["HellfireAG".to_string()];
+            a.prerequisites = vec!["afld".to_string()];
+        }
+        if let Some(a) = actors.get_mut("yak") {
+            a.weapons = vec!["ChainGun".to_string()];
+            a.prerequisites = vec!["afld".to_string()];
+        }
 
         GameRules { actors, weapons }
     }

@@ -29,12 +29,19 @@ pub struct LobbyInfo {
     pub occupied_slots: Vec<SlotInfo>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SlotInfo {
     pub player_reference: String,
     pub faction: String,
     /// Whether this slot is controlled by an AI bot.
     pub is_bot: bool,
+    /// Per-slot starting-cash override. When `Some(n)`, this slot's
+    /// player actor is initialised with `n` credits; when `None`, the
+    /// slot falls back to `LobbyInfo::starting_cash`. Plumbed in by the
+    /// scenario YAML's `agent: {cash: N}` / `enemy: {cash: M}` blocks
+    /// so e.g. a "thief steals from enemy" scenario can give the agent
+    /// 0 cash and the enemy 2000.
+    pub starting_cash: Option<i32>,
 }
 
 impl Default for LobbyInfo {
@@ -329,8 +336,19 @@ pub struct World {
     /// the legacy "engage what wanders into range" default.
     hunt_enabled: HashSet<u32>,
     /// Superweapon charge timers: (building_type, owner_player_id) → ticks_remaining.
+    /// Legacy string-keyed table for the existing ActivateSuperweapon
+    /// order path (kept for back-compat — `dome` GPS still uses it).
     superweapon_timers: HashMap<(String, u32), i32>,
+    /// Typed superweapon charge state for the Nuke / IronCurtain /
+    /// Chronosphere weapons (see `crate::superweapon`). Each entry is
+    /// keyed by (kind, owner_player_id); seeded when the player owns the
+    /// matching launcher building, ticks down on every World::tick, and
+    /// reset on fire.
+    pub superweapons: crate::superweapon::SuperweaponManager,
     /// Actors with invulnerability ticks remaining (Iron Curtain).
+    /// The HashMap is the de-facto `invulnerable_until_tick` for each
+    /// actor — entries are decremented every tick and removed at 0. The
+    /// damage application paths skip any actor present in this map.
     invulnerable: HashMap<u32, i32>,
     /// Player faction mapping: player_actor_id → faction name.
     player_factions: HashMap<u32, String>,
@@ -379,6 +397,13 @@ pub struct World {
     /// moving or dies. Without this, a unit on a long `move` order
     /// crossed a kill zone untouched — "sprint-invincibility".
     move_fire_cooldown: HashMap<u32, i32>,
+    /// Per-viewer (agent player) persistent set of enemy building ids
+    /// that have been revealed by a successful spy `Infiltrate`. The
+    /// observation layer (`env.rs::build_observation`) surfaces these
+    /// in `enemy_buildings_summary` regardless of current cell
+    /// visibility — a spy scan is a one-shot reveal that survives the
+    /// shroud-recompute each tick. Keyed by the VIEWING player id.
+    pub infiltration_revealed_buildings: BTreeMap<u32, std::collections::BTreeSet<u32>>,
 }
 
 /// Typed components attached to a single actor. Lookup is via
@@ -432,6 +457,14 @@ impl World {
     /// Get the kind of an actor.
     pub fn actor_kind(&self, actor_id: u32) -> Option<ActorKind> {
         self.actors.get(&actor_id).map(|a| a.kind)
+    }
+
+    /// True iff `actor_id` is a naval actor (ship). Used by the
+    /// pathfinder and movement-tick callsites to pick the water-only
+    /// passability gate. Returns `false` for unknown ids / non-naval
+    /// kinds.
+    pub fn actor_is_naval(&self, actor_id: u32) -> bool {
+        matches!(self.actor_kind(actor_id), Some(ActorKind::Ship))
     }
 
     pub fn actor_type_name(&self, actor_id: u32) -> Option<&str> {
@@ -507,9 +540,15 @@ impl World {
 
     /// Find the location of an enemy unit or building.
     /// Find nearest passable cell adjacent to a target location (for attacking buildings).
+    ///
+    /// Naval-aware: a ship looks for adjacent WATER cells; a ground
+    /// actor looks for adjacent non-water passable cells. This lets a
+    /// destroyer take up an adjacent firing position next to a shore
+    /// building without trying to step onto land.
     fn find_adjacent_passable(&self, target: (i32, i32), actor_id: u32) -> Option<(i32, i32)> {
-        // If target itself is passable, use it directly
-        if self.terrain.is_passable_for(target.0, target.1, actor_id) {
+        let naval = self.actor_is_naval(actor_id);
+        // If target itself is passable for this kind, use it directly.
+        if self.terrain.is_passable_for_kind(target.0, target.1, actor_id, naval) {
             return Some(target);
         }
         // Check all 8 neighbors
@@ -517,7 +556,7 @@ impl World {
         for (dx, dy) in &dirs {
             let nx = target.0 + dx;
             let ny = target.1 + dy;
-            if self.terrain.is_passable_for(nx, ny, actor_id) {
+            if self.terrain.is_passable_for_kind(nx, ny, actor_id, naval) {
                 return Some((nx, ny));
             }
         }
@@ -593,6 +632,9 @@ impl World {
                 Some(Activity::Attack { .. }) => "attacking",
                 Some(Activity::Guard { .. }) => "guarding",
                 Some(Activity::EnterTransport { .. }) => "entering",
+                Some(Activity::C4Plant { .. }) => "c4-planting",
+                Some(Activity::Capture { .. }) => "capturing",
+                Some(Activity::Infiltrate { .. }) => "infiltrating",
                 Some(Activity::Harvest { .. }) => "harvesting",
             }.to_string();
             let (facing, cx, cy) = actor.traits.iter().find_map(|t| {
@@ -910,6 +952,27 @@ impl World {
                     self.order_enter_transport(subject_id, target_actor_id);
                 }
             }
+            "C4Detonate" => {
+                if let (Some(subject_id), Some(target_actor_id)) =
+                    (order.subject_id, order.extra_data)
+                {
+                    self.order_c4_detonate(subject_id, target_actor_id);
+                }
+            }
+            "CaptureActor" => {
+                if let (Some(subject_id), Some(target_actor_id)) =
+                    (order.subject_id, order.extra_data)
+                {
+                    self.order_capture_actor(subject_id, target_actor_id);
+                }
+            }
+            "Infiltrate" => {
+                if let (Some(subject_id), Some(target_actor_id)) =
+                    (order.subject_id, order.extra_data)
+                {
+                    self.order_infiltrate(subject_id, target_actor_id);
+                }
+            }
             "Unload" => {
                 if let Some(subject_id) = order.subject_id {
                     self.order_unload(subject_id);
@@ -1037,6 +1100,59 @@ impl World {
                     self.stances.insert(subject_id, s);
                 }
             }
+            "FireSuperweapon" => {
+                // target_string format: "kind|tx,ty|tid" (tx/ty/tid may
+                // each be "-" to indicate "not provided").
+                let owner = match order.subject_id {
+                    Some(v) => v,
+                    None => return,
+                };
+                let payload = match &order.target_string {
+                    Some(s) => s.clone(),
+                    None => return,
+                };
+                let parts: Vec<&str> = payload.splitn(3, '|').collect();
+                if parts.len() < 3 {
+                    eprintln!("FireSuperweapon: malformed payload {payload:?}");
+                    return;
+                }
+                let kind = match crate::superweapon::SuperweaponKind::from_building_type(parts[0]) {
+                    Some(k) => k,
+                    None => {
+                        eprintln!("FireSuperweapon: unknown kind {:?}", parts[0]);
+                        return;
+                    }
+                };
+                let target_cell: Option<(i32, i32)> = if parts[1] == "-" {
+                    None
+                } else {
+                    let xy: Vec<&str> = parts[1].split(',').collect();
+                    if xy.len() == 2 {
+                        match (xy[0].parse::<i32>(), xy[1].parse::<i32>()) {
+                            (Ok(x), Ok(y)) => Some((x, y)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                };
+                let target_id: Option<u32> = if parts[2] == "-" {
+                    None
+                } else {
+                    parts[2].parse::<u32>().ok()
+                };
+                match self.fire_superweapon(kind, owner, target_cell, target_id) {
+                    Ok(n) => {
+                        eprintln!(
+                            "SUPERWEAPON FIRED: {} player={} cell={:?} target={:?} hit={}",
+                            kind.building_type(), owner, target_cell, target_id, n
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("FireSuperweapon rejected: {e}");
+                    }
+                }
+            }
             // C# parity: PATROL defined but unimplemented — accept
             // silently (no warn, no behaviour change).
             "Patrol" => {}
@@ -1057,11 +1173,22 @@ impl World {
         ignore_actor: Option<u32>,
         max_radius: i32,
     ) -> Option<(i32, i32)> {
+        // Naval-aware: a ship-owned move resolves to the nearest WATER
+        // cell; a ground-owned move resolves to the nearest non-water
+        // passable cell. Without this branch a destroyer commanded
+        // toward a coastal target snaps to the nearest land tile and
+        // its pathfind then fails because grass is impassable to ships.
+        let naval = ignore_actor.map_or(false, |id| self.actor_is_naval(id));
         let cell_ok = |x: i32, y: i32| -> bool {
             if !self.terrain.contains(x, y) {
                 return false;
             }
-            if !self.terrain.is_terrain_passable(x, y) {
+            let kind_ok = if naval {
+                self.terrain.is_terrain_passable_for_naval(x, y)
+            } else {
+                self.terrain.is_terrain_passable(x, y)
+            };
+            if !kind_ok {
                 return false;
             }
             if self.pending_move_destinations.contains(&(x, y)) {
@@ -1118,6 +1245,36 @@ impl World {
             Some(loc) => loc,
             None => return,
         };
+        // Aircraft MVP: helicopters / planes do not interact with the
+        // ground passability grid. They fly straight from current cell
+        // to target, ignoring impassable terrain AND ground-unit /
+        // building occupancy. We skip the unclaimed-cell resolver (which
+        // exists to prevent ground units stacking on the same destination
+        // cell) because multiple aircraft can share airspace freely.
+        let is_aircraft = self
+            .actors
+            .get(&actor_id)
+            .map(|a| a.kind == ActorKind::Aircraft)
+            .unwrap_or(false);
+        if is_aircraft {
+            // Clamp target into map bounds; outside that, refuse.
+            if !self.terrain.contains(target.0, target.1) {
+                return;
+            }
+            let path = pathfinder::straight_line_path(from, target);
+            if path.len() > 1 {
+                let speed = self.actor_speed(actor_id);
+                let move_activity = Activity::Move {
+                    path,
+                    path_index: 1,
+                    speed,
+                };
+                if let Some(actor) = self.actors.get_mut(&actor_id) {
+                    actor.activity = Some(move_activity);
+                }
+            }
+            return;
+        }
         // Resolve destination: spread to nearest unoccupied cell if target
         // is taken (by terrain occupancy or by another unit's pending move
         // destination this frame). The reservation set prevents N concurrent
@@ -1132,7 +1289,8 @@ impl World {
         if resolved_target != from {
             self.pending_move_destinations.insert(resolved_target);
         }
-        if let Some(path) = pathfinder::find_path(&self.terrain, from, resolved_target, Some(actor_id)) {
+        let naval = self.actor_is_naval(actor_id);
+        if let Some(path) = pathfinder::find_path_for_kind(&self.terrain, from, resolved_target, Some(actor_id), naval) {
             if path.len() > 1 {
                 let speed = self.actor_speed(actor_id);
                 let move_activity = Activity::Move {
@@ -1347,6 +1505,134 @@ impl World {
         }
     }
 
+    /// Tanya's C4 commando ability. The subject MUST be a `tanya`
+    /// actor; the target MUST be an enemy BUILDING. Non-conforming
+    /// orders are dropped silently (a stale-state agent should not
+    /// be able to misuse C4 — e.g. point a rifleman at the order,
+    /// or aim it at a friendly building). On success, Tanya is given
+    /// an `Activity::C4Plant` that walks her toward the building and
+    /// detonates on adjacency in the per-tick handler.
+    fn order_c4_detonate(&mut self, actor_id: u32, target_id: u32) {
+        if actor_id == target_id {
+            return;
+        }
+        // Subject must be a tanya actor (alive).
+        let subject_owner = match self.actors.get(&actor_id) {
+            Some(a) => {
+                if a.actor_type.as_deref() != Some("tanya") {
+                    return;
+                }
+                a.owner_id
+            }
+            None => return,
+        };
+        // Target must exist, be a building, and be enemy-owned.
+        let target_owner = match self.actors.get(&target_id) {
+            Some(a) => {
+                if a.kind != ActorKind::Building {
+                    return;
+                }
+                a.owner_id
+            }
+            None => return,
+        };
+        match (subject_owner, target_owner) {
+            (Some(so), Some(to)) if so != to => {}
+            _ => return, // friendly / unowned target rejected
+        }
+        let speed = self.actor_speed(actor_id);
+        if let Some(actor) = self.actors.get_mut(&actor_id) {
+            actor.activity = Some(Activity::C4Plant {
+                target_id,
+                speed,
+            });
+        }
+    }
+
+    /// Order an engineer (`e6`) to walk to an ENEMY building and
+    /// capture it (C# `Captures` / `CapturesTransform` — pragmatic
+    /// subset: instant on-arrival ownership transfer, capturer is
+    /// consumed). Validated:
+    ///   • subject must be alive infantry of type `e6` (engineer);
+    ///   • target must be alive Building owned by another player
+    ///     (skip same-owner / world-owned / non-building targets).
+    /// Same-owner captures are no-ops; the engineer keeps its activity.
+    fn order_capture_actor(&mut self, actor_id: u32, target_id: u32) {
+        if actor_id == target_id {
+            return;
+        }
+        // Capturer must be an alive engineer (infantry, actor_type "e6").
+        let capturer_owner = match self.actors.get(&actor_id) {
+            Some(a) if a.kind == ActorKind::Infantry
+                && a.actor_type.as_deref() == Some("e6") => a.owner_id,
+            _ => return,
+        };
+        // Target must be an alive building owned by a DIFFERENT player.
+        let target_owner = match self.actors.get(&target_id) {
+            Some(t) if t.kind == ActorKind::Building => t.owner_id,
+            _ => return,
+        };
+        if target_owner.is_none() || capturer_owner.is_none() {
+            return;
+        }
+        if target_owner == capturer_owner {
+            return;
+        }
+        let speed = self.actor_speed(actor_id);
+        if let Some(actor) = self.actors.get_mut(&actor_id) {
+            actor.activity = Some(Activity::Capture {
+                target_id,
+                speed,
+            });
+        }
+    }
+
+    /// Order a spy / thief infantry to walk into an enemy building
+    /// and trigger an infiltration effect (C# RA `Infiltrates` family).
+    /// The actor walks to a cell adjacent to the target; on adjacency
+    /// the tick logic (`process_frame` → infiltrate block) applies
+    /// the effect (spy: one-shot scan of the target's owner's
+    /// buildings into the agent's `infiltration_revealed_buildings`;
+    /// thief: drain a chunk of enemy cash into the infiltrator's
+    /// owner) and removes the infiltrator from the world. Issuing the
+    /// order against own or null buildings is rejected.
+    fn order_infiltrate(&mut self, actor_id: u32, target_id: u32) {
+        if actor_id == target_id {
+            return;
+        }
+        // Subject must be a live infiltrator (spy / thf).
+        let (subj_owner, is_infiltrator) = match self.actors.get(&actor_id) {
+            Some(a) => {
+                let inf = a
+                    .actor_type
+                    .as_deref()
+                    .map(|t| matches!(t, "spy" | "thf"))
+                    .unwrap_or(false);
+                (a.owner_id, inf)
+            }
+            None => return,
+        };
+        if !is_infiltrator {
+            return;
+        }
+        // Target must be an enemy BUILDING with a different owner.
+        let target_owner = match self.actors.get(&target_id) {
+            Some(t) if t.kind == ActorKind::Building => t.owner_id,
+            _ => return,
+        };
+        match (subj_owner, target_owner) {
+            (Some(s), Some(t)) if s != t => {}
+            _ => return,
+        }
+        let speed = self.actor_speed(actor_id);
+        if let Some(actor) = self.actors.get_mut(&actor_id) {
+            actor.activity = Some(Activity::Infiltrate {
+                target_id,
+                speed,
+            });
+        }
+    }
+
     /// Order a transport to eject all its passengers onto passable
     /// cells adjacent to it (C# `UnloadCargo`).
     fn order_unload(&mut self, transport_id: u32) {
@@ -1488,9 +1774,14 @@ impl World {
         // Enable production queues if this is a production building
         self.enable_production_queues(owner_player_id, building_type);
 
-        // Refinery auto-spawns a harvester (like OpenRA)
+        // Refinery auto-spawns a harvester (like OpenRA).
+        // Use the NEW proc's footprint as the spawn seed so that a 2nd
+        // refinery placed far from the 1st gets its own harvester
+        // adjacent to itself, not piled onto the 1st proc (the old
+        // `find_spawn_location` sorted candidates by id and so always
+        // picked the lowest-id proc).
         if building_type == "proc" {
-            self.spawn_unit("harv", owner_player_id);
+            self.spawn_unit_near_building("harv", owner_player_id, building_id);
         }
 
         eprintln!("PLACE: {} at ({},{}) id={} footprint={}x{} power={}",
@@ -1713,6 +2004,227 @@ impl World {
                 *ticks -= 1;
             }
         }
+
+        // Typed manager (Nuke / IronCurtain / Chronosphere) — seed a
+        // charge timer for every (kind, owner) pair where the owner
+        // owns at least one live launcher building, then tick down.
+        {
+            use crate::superweapon::SuperweaponKind;
+            let pairs: Vec<(SuperweaponKind, u32)> = self.actors.values()
+                .filter(|a| a.kind == ActorKind::Building)
+                .filter_map(|a| {
+                    let t = a.actor_type.as_deref()?;
+                    let kind = SuperweaponKind::from_building_type(t)?;
+                    Some((kind, a.owner_id?))
+                })
+                .collect();
+            for (kind, owner) in pairs {
+                self.superweapons.ensure_timer(kind, owner);
+            }
+            self.superweapons.tick();
+        }
+    }
+
+    /// Fire a typed superweapon for `owner`. Validates ownership of a
+    /// launcher building of the matching kind and that the weapon is
+    /// fully charged. Returns Ok with the number of affected actors
+    /// (for nuke: actors damaged/killed; for iron: 1 if applied, 0
+    /// otherwise; for chrono: 1 if teleported, 0 otherwise) or an Err
+    /// describing the validation failure.
+    ///
+    /// `target_cell` is required for Nuke and Chronosphere (the
+    /// destination cell). `target_id` is required for Iron Curtain and
+    /// Chronosphere (the friendly actor being affected).
+    pub fn fire_superweapon(
+        &mut self,
+        kind: crate::superweapon::SuperweaponKind,
+        owner: u32,
+        target_cell: Option<(i32, i32)>,
+        target_id: Option<u32>,
+    ) -> Result<usize, String> {
+        // Validate launcher ownership.
+        let has_launcher = self.actors.values().any(|a| {
+            a.kind == ActorKind::Building
+                && a.owner_id == Some(owner)
+                && a.actor_type.as_deref() == Some(kind.building_type())
+        });
+        if !has_launcher {
+            return Err(format!(
+                "player {owner} owns no {} launcher",
+                kind.building_type()
+            ));
+        }
+        // Validate charge.
+        if !self.superweapons.is_ready(kind, owner) {
+            return Err(format!(
+                "{} not charged for player {owner}",
+                kind.building_type()
+            ));
+        }
+
+        use crate::superweapon::SuperweaponKind;
+        let affected = match kind {
+            SuperweaponKind::Nuke => {
+                let (tx, ty) = target_cell.ok_or_else(|| "nuke needs target_cell".to_string())?;
+                self.detonate_nuke(owner, tx, ty)
+            }
+            SuperweaponKind::IronCurtain => {
+                let tid = target_id.ok_or_else(|| "iron curtain needs target_id".to_string())?;
+                let actor = self.actors.get(&tid)
+                    .ok_or_else(|| format!("iron curtain target {tid} not found"))?;
+                if actor.owner_id != Some(owner) {
+                    return Err(format!("iron curtain target {tid} not owned by {owner}"));
+                }
+                self.invulnerable
+                    .insert(tid, crate::superweapon::IRON_CURTAIN_TICKS as i32);
+                1
+            }
+            SuperweaponKind::Chronosphere => {
+                let tid = target_id.ok_or_else(|| "chronosphere needs target_id".to_string())?;
+                let (tx, ty) = target_cell.ok_or_else(|| "chronosphere needs target_cell".to_string())?;
+                let actor = self.actors.get(&tid)
+                    .ok_or_else(|| format!("chrono target {tid} not found"))?;
+                if actor.owner_id != Some(owner) {
+                    return Err(format!("chrono target {tid} not owned by {owner}"));
+                }
+                if self.teleport_actor(tid, tx, ty) { 1 } else { 0 }
+            }
+        };
+
+        self.superweapons.reset(kind, owner);
+        Ok(affected)
+    }
+
+    /// Apply nuclear-strike AoE damage at `(target_x, target_y)` and
+    /// return the number of actors hit. Damage falls off linearly with
+    /// Chebyshev distance to the centre; dead actors are removed.
+    fn detonate_nuke(&mut self, _owner: u32, target_x: i32, target_y: i32) -> usize {
+        let radius = crate::superweapon::NUKE_RADIUS_CELLS;
+        let base = crate::superweapon::NUKE_BASE_DAMAGE;
+        let mut damaged: Vec<(u32, i32)> = Vec::new();
+        for actor in self.actors.values() {
+            if let Some((ax, ay)) = actor.location {
+                let dist = (ax - target_x).abs().max((ay - target_y).abs());
+                if dist <= radius {
+                    let dmg = base * (radius + 1 - dist) / (radius + 1);
+                    damaged.push((actor.id, dmg));
+                }
+            }
+        }
+        let hit = damaged.len();
+        let mut dead: Vec<u32> = Vec::new();
+        for (aid, dmg) in damaged {
+            // Invulnerable actors (e.g. under Iron Curtain) take no damage.
+            if self.invulnerable.contains_key(&aid) {
+                continue;
+            }
+            if let Some(actor) = self.actors.get_mut(&aid) {
+                for t in &mut actor.traits {
+                    if let TraitState::Health { hp } = t {
+                        *hp -= dmg;
+                        if *hp <= 0 {
+                            dead.push(aid);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        for id in dead {
+            if let Some(a) = self.actors.remove(&id) {
+                if let Some(loc) = a.location {
+                    self.terrain.clear_occupant(loc.0, loc.1);
+                }
+            }
+        }
+        hit
+    }
+
+    /// Teleport an actor to `(x, y)`. Cancels any in-flight activity,
+    /// updates the terrain occupant map, and updates the Mobile trait's
+    /// from/to cell. Returns true on success, false if the destination
+    /// is out of bounds, impassable, or already occupied by another
+    /// actor.
+    pub fn teleport_actor(&mut self, actor_id: u32, x: i32, y: i32) -> bool {
+        if !self.terrain.contains(x, y) || !self.terrain.is_terrain_passable(x, y) {
+            return false;
+        }
+        let occ = self.terrain.occupant(x, y);
+        if occ != 0 && occ != actor_id {
+            return false;
+        }
+        let old_loc = match self.actors.get(&actor_id) {
+            Some(a) => a.location,
+            None => return false,
+        };
+        if let Some((ox, oy)) = old_loc {
+            self.terrain.clear_occupant(ox, oy);
+        }
+        self.terrain.set_occupant(x, y, actor_id);
+        if let Some(actor) = self.actors.get_mut(&actor_id) {
+            actor.location = Some((x, y));
+            actor.activity = None;
+            let new_cell = crate::math::CPos::new(x, y);
+            let new_center = center_of_cell(x, y);
+            for t in &mut actor.traits {
+                if let TraitState::Mobile { from_cell, to_cell, center_position, .. } = t {
+                    *from_cell = new_cell;
+                    *to_cell = new_cell;
+                    *center_position = new_center;
+                }
+            }
+        }
+        true
+    }
+
+    /// Auto-issue a Harvest activity to any owned, idle harvester
+    /// whose owner has a refinery (`proc`). This is the back-stop that
+    /// makes scenario-placed harvesters mine the moment the
+    /// refinery is up — `build_scenario_actor` injects them with
+    /// `activity: None`, so the harv would otherwise sit idle until
+    /// an explicit Harvest order arrived. The newly-spawned-via-
+    /// `spawn_unit` harvester path already starts in Harvest; this
+    /// method is the catch-all for every other code path (scenario
+    /// load, transport unload, deploy-then-build, etc.).
+    fn auto_route_idle_harvesters(&mut self) {
+        // Snapshot candidates: alive, kind == Vehicle, actor_type ==
+        // "harv", owner has a refinery, and current activity is None
+        // (Move/Attack/etc. counts as "busy" and must not be clobbered).
+        let candidates: Vec<u32> = self.actors.values()
+            .filter(|a| {
+                a.actor_type.as_deref() == Some("harv")
+                    && a.activity.is_none()
+                    && a.owner_id.is_some()
+            })
+            .map(|a| a.id)
+            .collect();
+        for hid in candidates {
+            let (owner, speed, loc) = {
+                let a = match self.actors.get(&hid) { Some(a) => a, None => continue };
+                (a.owner_id.unwrap(), self.actor_speed(hid), a.location)
+            };
+            if loc.is_none() {
+                continue;
+            }
+            let refinery_id = match self.find_refinery(owner) {
+                Some(id) => id,
+                None => continue, // no proc yet — stay idle
+            };
+            if let Some(actor) = self.actors.get_mut(&hid) {
+                actor.activity = Some(Activity::Harvest {
+                    state: HarvestState::FindingOre,
+                    refinery_id,
+                    carried_ore: 0,
+                    carried_gems: 0,
+                    capacity: 20,
+                    path: Vec::new(),
+                    path_index: 0,
+                    speed,
+                    harvest_ticks: 0,
+                    last_harvest_cell: None,
+                });
+            }
+        }
     }
 
     fn tick_harvesters(&mut self) {
@@ -1895,7 +2407,7 @@ impl World {
 
     /// Start a harvester moving to its refinery for delivery.
     fn harvester_start_delivery(&mut self, harvester_id: u32) {
-        let (refinery_id, from) = {
+        let (mut refinery_id, from, owner) = {
             let actor = match self.actors.get(&harvester_id) {
                 Some(a) => a,
                 None => return,
@@ -1905,8 +2417,39 @@ impl World {
             } else {
                 return;
             };
-            (rid, actor.location)
+            (rid, actor.location, actor.owner_id)
         };
+
+        // Self-healing refinery resolution. The harvester's stored
+        // `refinery_id` is set when its Harvest activity is first
+        // installed; if the player has since BUILT (scenario didn't
+        // pre-place) or LOST their refinery, the stored id is stale.
+        // Re-resolve to the owner's current `proc` so the harv keeps
+        // working as soon as a refinery exists.
+        let stale = refinery_id == 0
+            || !self.actors.get(&refinery_id)
+                .map(|a| a.kind == ActorKind::Building
+                    && a.actor_type.as_deref() == Some("proc"))
+                .unwrap_or(false);
+        if stale {
+            if let Some(pid) = owner {
+                // Prefer path-shortest refinery from the harv's current
+                // cell so that a per-base supply chain stays attached
+                // to its OWN refinery rather than re-snapping to the
+                // first one in id order.
+                let resolved = from
+                    .and_then(|fc| self.find_refinery_from(pid, fc))
+                    .or_else(|| self.find_refinery(pid));
+                if let Some(rid) = resolved {
+                    refinery_id = rid;
+                    if let Some(actor) = self.actors.get_mut(&harvester_id) {
+                        if let Some(Activity::Harvest { refinery_id: r, .. }) = &mut actor.activity {
+                            *r = refinery_id;
+                        }
+                    }
+                }
+            }
+        }
 
         // Find refinery location
         let refinery_loc = self.actors.get(&refinery_id).and_then(|a| a.location);
@@ -2098,6 +2641,12 @@ impl World {
                 ActorKind::Infantry => 43,
                 ActorKind::Vehicle => 85,
                 ActorKind::Mcv => 56,
+                // Naval MVP: dd/ca/pt/lst carry Mobile.Speed in the
+                // vendored RA YAML (dd=92, ca=44, pt=89, lst=71); the
+                // `defaults()` ruleset zeroes them so they wouldn't move
+                // when the vendored mod is absent. Use ~85 as a generic
+                // ship fallback (mid-range between dd and lst).
+                ActorKind::Ship => 85,
                 _ => 56,
             }
         } else {
@@ -2303,8 +2852,9 @@ impl World {
                 let dest = self
                     .find_adjacent_passable(tgt_loc, *id)
                     .unwrap_or(tgt_loc);
+                let naval = self.actor_is_naval(*id);
                 if let Some(path) =
-                    pathfinder::find_path(&self.terrain, from, dest, Some(*id))
+                    pathfinder::find_path_for_kind(&self.terrain, from, dest, Some(*id), naval)
                 {
                     if path.len() > 1 {
                         guard_steps.push((*id, from, path[1]));
@@ -2433,6 +2983,455 @@ impl World {
                     passenger.activity = None;
                     self.cargo.entry(tid).or_default().push(passenger);
                 }
+            }
+        }
+
+        // ── C4Plant: walk Tanya to the target building, then detonate ─
+        // Mirrors EnterTransport's pathing: step toward the building's
+        // footprint each tick; once Chebyshev-adjacent to any footprint
+        // cell, instantly destroy the building (tanya unharmed). If the
+        // target has died/disappeared en route the activity drops to
+        // idle. Validation (subject is tanya, target is an enemy
+        // building) was enforced at order issue time; we re-check the
+        // target still exists & is a building here in case it died
+        // mid-walk.
+        {
+            let mut step_moves: Vec<(u32, (i32, i32), (i32, i32))> = Vec::new();
+            let mut detonate: Vec<(u32, u32)> = Vec::new(); // (tanya, target)
+            let mut drop_idle: Vec<u32> = Vec::new();
+            for (id, actor) in &self.actors {
+                let target_id = match actor.activity {
+                    Some(Activity::C4Plant { target_id, .. }) => target_id,
+                    _ => continue,
+                };
+                let from = match actor.location {
+                    Some(l) => l,
+                    None => continue,
+                };
+                let (tloc, fw, fh) = match self.actors.get(&target_id) {
+                    Some(t) if t.kind == ActorKind::Building => match t.location {
+                        Some(l) => {
+                            let (fw, fh) = t
+                                .actor_type
+                                .as_deref()
+                                .and_then(|at| self.rules.actor(at))
+                                .map(|s| s.footprint)
+                                .unwrap_or((1, 1));
+                            (l, fw, fh)
+                        }
+                        None => {
+                            drop_idle.push(*id);
+                            continue;
+                        }
+                    },
+                    _ => {
+                        // Target gone or no longer a building — abort.
+                        drop_idle.push(*id);
+                        continue;
+                    }
+                };
+                // Chebyshev distance from `from` to nearest footprint cell.
+                let clamp_x = from.0.max(tloc.0).min(tloc.0 + fw - 1);
+                let clamp_y = from.1.max(tloc.1).min(tloc.1 + fh - 1);
+                let nearest = (clamp_x, clamp_y);
+                let gap = (from.0 - nearest.0).abs().max((from.1 - nearest.1).abs());
+                if gap <= 1 {
+                    detonate.push((*id, target_id));
+                } else {
+                    // Aim for a passable cell adjacent to the footprint's
+                    // top-left (matches EnterTransport's approach idiom).
+                    let dest = self
+                        .find_adjacent_passable(tloc, *id)
+                        .unwrap_or(tloc);
+                    if let Some(path) =
+                        pathfinder::find_path(&self.terrain, from, dest, Some(*id))
+                    {
+                        if path.len() > 1 {
+                            step_moves.push((*id, from, path[1]));
+                        }
+                    }
+                }
+            }
+            for id in drop_idle {
+                if let Some(a) = self.actors.get_mut(&id) {
+                    a.activity = None;
+                }
+            }
+            for (id, from, next_cell) in step_moves {
+                let occ = self.terrain.occupant(next_cell.0, next_cell.1);
+                if occ == 0 || occ == id {
+                    self.terrain.clear_occupant(from.0, from.1);
+                    self.terrain.set_occupant(next_cell.0, next_cell.1, id);
+                    if let Some(actor) = self.actors.get_mut(&id) {
+                        actor.location = Some(next_cell);
+                        for t in &mut actor.traits {
+                            if let TraitState::Mobile {
+                                center_position,
+                                from_cell,
+                                to_cell,
+                                ..
+                            } = t
+                            {
+                                *center_position =
+                                    center_of_cell(next_cell.0, next_cell.1);
+                                *from_cell = CPos::new(next_cell.0, next_cell.1);
+                                *to_cell = CPos::new(next_cell.0, next_cell.1);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            // Detonation: instantly kill the target building. Credit the
+            // kill to Tanya / her owner so kill_per_player stays
+            // consistent with the standard combat path. Clear the
+            // footprint (restoring passability) the same way regular
+            // building-death cleanup does. Tanya goes idle, fully alive.
+            let mut dead_ids: Vec<u32> = Vec::new();
+            for (tanya_id, tgt_id) in detonate {
+                // Drop tanya's activity first (she survives, planted &
+                // walks away).
+                if let Some(a) = self.actors.get_mut(&tanya_id) {
+                    a.activity = None;
+                }
+                // Zero the target's HP for the snapshot, then remove it.
+                let owner_for_kill_credit = self
+                    .actors
+                    .get(&tanya_id)
+                    .and_then(|a| a.owner_id);
+                if let Some(target) = self.actors.get_mut(&tgt_id) {
+                    for t in &mut target.traits {
+                        if let TraitState::Health { hp } = t {
+                            *hp = 0;
+                            break;
+                        }
+                    }
+                }
+                if let Some(dead) = self.actors.remove(&tgt_id) {
+                    dead_ids.push(tgt_id);
+                    if dead.kind == ActorKind::Building {
+                        if let Some(loc) = dead.location {
+                            let (fw, fh) = dead
+                                .actor_type
+                                .as_deref()
+                                .and_then(|at| self.rules.actor(at))
+                                .map(|s| s.footprint)
+                                .unwrap_or((2, 2));
+                            self.terrain.clear_footprint(loc.0, loc.1, fw, fh);
+                        }
+                    } else if let Some(loc) = dead.location {
+                        self.terrain.clear_occupant(loc.0, loc.1);
+                    }
+                    // Credit the kill so reward/units_killed signals reflect it.
+                    if let Some(a) = self.actors.get_mut(&tanya_id) {
+                        a.kills = a.kills.saturating_add(1);
+                    }
+                    if let Some(pid) = owner_for_kill_credit {
+                        *self.kills_per_player.entry(pid).or_insert(0) += 1;
+                    }
+                }
+            }
+            // Clear stale Attack activities aimed at any C4'd building.
+            if !dead_ids.is_empty() {
+                for actor in self.actors.values_mut() {
+                    if let Some(Activity::Attack { target_id, .. }) = actor.activity {
+                        if dead_ids.contains(&target_id) {
+                            actor.activity = None;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Capture: walk to enemy building, then transfer ownership ──
+        // C# `Captures`/`CapturesTransform` (engineer subset). The
+        // engineer steps toward a cell adjacent to the target building
+        // one tile per outer tick (mirroring the EnterTransport drive
+        // loop). On arrival (Chebyshev gap ≤ 1) the target's owner is
+        // reassigned to the engineer's owner and the engineer is
+        // consumed (removed from the world). If the target dies or
+        // disappears mid-route the engineer goes idle.
+        {
+            let mut step_moves: Vec<(u32, (i32, i32), (i32, i32))> = Vec::new();
+            let mut capture_now: Vec<(u32, u32)> = Vec::new(); // (engineer, target)
+            let mut drop_idle: Vec<u32> = Vec::new();
+            for (id, actor) in &self.actors {
+                let target_id = match actor.activity {
+                    Some(Activity::Capture { target_id, .. }) => target_id,
+                    _ => continue,
+                };
+                let from = match actor.location {
+                    Some(l) => l,
+                    None => continue,
+                };
+                // Target must still be an alive building owned by an
+                // enemy of the capturer; otherwise abandon.
+                let (tloc, tgt_owner, tgt_kind) = match self.actors.get(&target_id) {
+                    Some(t) => (t.location, t.owner_id, t.kind),
+                    None => {
+                        drop_idle.push(*id);
+                        continue;
+                    }
+                };
+                let tloc = match tloc {
+                    Some(l) => l,
+                    None => {
+                        drop_idle.push(*id);
+                        continue;
+                    }
+                };
+                if tgt_kind != ActorKind::Building {
+                    drop_idle.push(*id);
+                    continue;
+                }
+                if tgt_owner == actor.owner_id || tgt_owner.is_none() {
+                    drop_idle.push(*id);
+                    continue;
+                }
+                let gap = (from.0 - tloc.0).abs().max((from.1 - tloc.1).abs());
+                if gap <= 1 {
+                    capture_now.push((*id, target_id));
+                } else {
+                    let dest = self
+                        .find_adjacent_passable(tloc, *id)
+                        .unwrap_or(tloc);
+                    if let Some(path) =
+                        pathfinder::find_path(&self.terrain, from, dest, Some(*id))
+                    {
+                        if path.len() > 1 {
+                            step_moves.push((*id, from, path[1]));
+                        }
+                    }
+                }
+            }
+            for id in drop_idle {
+                if let Some(a) = self.actors.get_mut(&id) {
+                    a.activity = None;
+                }
+            }
+            for (id, from, next_cell) in step_moves {
+                let occ = self.terrain.occupant(next_cell.0, next_cell.1);
+                if occ == 0 || occ == id {
+                    self.terrain.clear_occupant(from.0, from.1);
+                    self.terrain.set_occupant(next_cell.0, next_cell.1, id);
+                    if let Some(actor) = self.actors.get_mut(&id) {
+                        actor.location = Some(next_cell);
+                        for t in &mut actor.traits {
+                            if let TraitState::Mobile {
+                                center_position,
+                                from_cell,
+                                to_cell,
+                                ..
+                            } = t
+                            {
+                                *center_position =
+                                    center_of_cell(next_cell.0, next_cell.1);
+                                *from_cell = CPos::new(next_cell.0, next_cell.1);
+                                *to_cell = CPos::new(next_cell.0, next_cell.1);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            for (engineer_id, target_id) in capture_now {
+                // Capturer's owner — re-read in case state shifted.
+                let new_owner = match self.actors.get(&engineer_id) {
+                    Some(a) => a.owner_id,
+                    None => continue,
+                };
+                if new_owner.is_none() {
+                    continue;
+                }
+                // Transfer ownership of the target building.
+                if let Some(t) = self.actors.get_mut(&target_id) {
+                    if t.kind != ActorKind::Building {
+                        continue;
+                    }
+                    t.owner_id = new_owner;
+                    // Clear PRIMARY flag — the new owner re-designates
+                    // its own primary producer; an inherited flag could
+                    // collide with a same-type sibling on the new side.
+                    self.primary_buildings.remove(&target_id);
+                    // Drop any pending PowerDown toggle on the target;
+                    // the new owner controls its own power policy.
+                    self.powered_down.remove(&target_id);
+                }
+                // Consume the engineer (remove from world). Mirrors
+                // the passenger removal in EnterTransport: clear the
+                // terrain occupant first, then drop the actor.
+                if let Some(engineer) = self.actors.remove(&engineer_id) {
+                    if let Some(loc) = engineer.location {
+                        self.terrain.clear_occupant(loc.0, loc.1);
+                    }
+                    drop(engineer);
+                }
+            }
+        }
+
+        // ── Infiltrate: walk to enemy building, then apply effect ─────
+        // C# RA `Infiltrates` family. The infiltrator (spy / thf) walks
+        // to a cell adjacent to the target building; on adjacency:
+        //   * spy   → reveal-scan: every enemy building owned by the
+        //             target's owner is recorded into the agent's
+        //             `infiltration_revealed_buildings` set (a one-shot
+        //             scan that persists through fog).
+        //   * thf   → cash-steal: drain up to STEAL_AMOUNT from the
+        //             target-owner's cash, credit the infiltrator's
+        //             owner.
+        // The infiltrator is consumed in both cases (single-use).
+        // If the target dies mid-walk, the infiltrator goes idle.
+        const THIEF_STEAL_AMOUNT: i32 = 500;
+        {
+            let mut step_moves: Vec<(u32, (i32, i32), (i32, i32))> = Vec::new();
+            let mut applies: Vec<(u32, u32)> = Vec::new(); // (infiltrator, target)
+            let mut drop_idle: Vec<u32> = Vec::new();
+            for (id, actor) in &self.actors {
+                let target_id = match actor.activity {
+                    Some(Activity::Infiltrate { target_id, .. }) => target_id,
+                    _ => continue,
+                };
+                let from = match actor.location {
+                    Some(l) => l,
+                    None => continue,
+                };
+                let tloc = match self.actors.get(&target_id).and_then(|a| a.location) {
+                    Some(l) => l,
+                    None => {
+                        drop_idle.push(*id);
+                        continue;
+                    }
+                };
+                let gap = (from.0 - tloc.0).abs().max((from.1 - tloc.1).abs());
+                if gap <= 1 {
+                    applies.push((*id, target_id));
+                } else {
+                    let dest = self
+                        .find_adjacent_passable(tloc, *id)
+                        .unwrap_or(tloc);
+                    if let Some(path) =
+                        pathfinder::find_path(&self.terrain, from, dest, Some(*id))
+                    {
+                        if path.len() > 1 {
+                            step_moves.push((*id, from, path[1]));
+                        }
+                    }
+                }
+            }
+            for id in drop_idle {
+                if let Some(a) = self.actors.get_mut(&id) {
+                    a.activity = None;
+                }
+            }
+            for (id, from, next_cell) in step_moves {
+                let occ = self.terrain.occupant(next_cell.0, next_cell.1);
+                if occ == 0 || occ == id {
+                    self.terrain.clear_occupant(from.0, from.1);
+                    self.terrain.set_occupant(next_cell.0, next_cell.1, id);
+                    if let Some(actor) = self.actors.get_mut(&id) {
+                        actor.location = Some(next_cell);
+                        for t in &mut actor.traits {
+                            if let TraitState::Mobile {
+                                center_position,
+                                from_cell,
+                                to_cell,
+                                ..
+                            } = t
+                            {
+                                *center_position =
+                                    center_of_cell(next_cell.0, next_cell.1);
+                                *from_cell = CPos::new(next_cell.0, next_cell.1);
+                                *to_cell = CPos::new(next_cell.0, next_cell.1);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            for (infiltrator_id, target_id) in applies {
+                // Snapshot infiltrator's type + owner; bail if it died.
+                let (subj_owner, subj_type) = match self.actors.get(&infiltrator_id) {
+                    Some(a) => (a.owner_id, a.actor_type.clone()),
+                    None => continue,
+                };
+                let subj_owner = match subj_owner {
+                    Some(o) => o,
+                    None => continue,
+                };
+                let target_owner = match self.actors.get(&target_id) {
+                    Some(t) if t.kind == ActorKind::Building => match t.owner_id {
+                        Some(o) => o,
+                        None => continue,
+                    },
+                    _ => {
+                        // Target died — drop activity.
+                        if let Some(a) = self.actors.get_mut(&infiltrator_id) {
+                            a.activity = None;
+                        }
+                        continue;
+                    }
+                };
+                match subj_type.as_deref() {
+                    Some("spy") => {
+                        // Reveal every building owned by the target's
+                        // owner into the infiltrator's owner's
+                        // persistent reveal set.
+                        let ids: Vec<u32> = self
+                            .actors
+                            .values()
+                            .filter(|a| {
+                                a.kind == ActorKind::Building
+                                    && a.owner_id == Some(target_owner)
+                            })
+                            .map(|a| a.id)
+                            .collect();
+                        let set = self
+                            .infiltration_revealed_buildings
+                            .entry(subj_owner)
+                            .or_default();
+                        for bid in ids {
+                            set.insert(bid);
+                        }
+                    }
+                    Some("thf") => {
+                        // Steal cash from target's owner; credit subject's owner.
+                        // Only proc / silo carry siphonable cash in the
+                        // C# parity model; a thf hitting another building
+                        // type is a no-op steal (but the infiltrator
+                        // is still consumed).
+                        let target_type = self
+                            .actors
+                            .get(&target_id)
+                            .and_then(|a| a.actor_type.clone());
+                        let stealable = matches!(
+                            target_type.as_deref(),
+                            Some("proc") | Some("silo")
+                        );
+                        if stealable {
+                            let cur = self.player_cash(target_owner);
+                            let amount = cur.min(THIEF_STEAL_AMOUNT).max(0);
+                            if amount > 0 {
+                                if let Some(victim) = self.actors.get_mut(&target_owner) {
+                                    victim.set_cash(cur - amount);
+                                }
+                                let agent_cash = self.player_cash(subj_owner);
+                                if let Some(agent) = self.actors.get_mut(&subj_owner) {
+                                    agent.set_cash(agent_cash + amount);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                // Consume the infiltrator.
+                if let Some(loc) = self
+                    .actors
+                    .get(&infiltrator_id)
+                    .and_then(|a| a.location)
+                {
+                    self.terrain.clear_occupant(loc.0, loc.1);
+                }
+                self.actors.remove(&infiltrator_id);
             }
         }
 
@@ -2625,21 +3624,29 @@ impl World {
                 }
                 let target_cell = path[*path_index];
                 let target_center = center_of_cell(target_cell.0, target_cell.1);
+                let is_aircraft = actor.kind == ActorKind::Aircraft;
 
                 // C# TurnsWhileMoving=false: at each path cell, if facing doesn't
                 // match the next segment, stop and Turn in place first.
                 // Reference: OpenRA Move.cs lines 207-213.
-                if let Some(current_loc) = actor.location {
-                    let desired_facing = pathfinder::facing_between(current_loc, target_cell);
-                    let current_facing = actor.traits.iter()
-                        .find_map(|t| {
-                            if let TraitState::Mobile { facing, .. } = t { Some(*facing) } else { None }
-                        })
-                        .unwrap_or(0);
-                    if current_facing != desired_facing {
-                        // Need to turn first — convert Move to Turn→Move
-                        turn_before_move.push(actor.id);
-                        continue;
+                //
+                // Aircraft MVP: skip the turn-in-place gate entirely — a
+                // helicopter using `CanSlide: True` rotates while moving
+                // and never stalls mid-flight to align. This keeps the
+                // straight-line air path single-segment continuous.
+                if !is_aircraft {
+                    if let Some(current_loc) = actor.location {
+                        let desired_facing = pathfinder::facing_between(current_loc, target_cell);
+                        let current_facing = actor.traits.iter()
+                            .find_map(|t| {
+                                if let TraitState::Mobile { facing, .. } = t { Some(*facing) } else { None }
+                            })
+                            .unwrap_or(0);
+                        if current_facing != desired_facing {
+                            // Need to turn first — convert Move to Turn→Move
+                            turn_before_move.push(actor.id);
+                            continue;
+                        }
                     }
                 }
 
@@ -2684,7 +3691,12 @@ impl World {
 
                 if arrived {
                     let old_loc = actor.location.unwrap_or(target_cell);
-                    if old_loc != target_cell {
+                    if old_loc != target_cell && !is_aircraft {
+                        // Aircraft skip terrain occupancy entirely — they
+                        // don't block ground units and ground units don't
+                        // block them. Tracking their "cell" via
+                        // `actor.location` is still useful for range /
+                        // sight queries.
                         occupancy_updates.push((actor.id, old_loc, target_cell));
                     }
                     actor.location = Some(target_cell);
@@ -3239,6 +4251,8 @@ impl World {
                             .unwrap_or((2, 2));
                         self.terrain.clear_footprint(loc.0, loc.1, fw, fh);
                     }
+                } else if dead.kind == ActorKind::Aircraft {
+                    // Aircraft never claimed ground occupancy.
                 } else if let Some(loc) = dead.location {
                     self.terrain.clear_occupant(loc.0, loc.1);
                 }
@@ -3287,11 +4301,44 @@ impl World {
                 Some(loc) => loc,
                 None => continue,
             };
-            // Find nearest passable cell adjacent to the target (for attacking buildings)
-            let chase_dest = self.find_adjacent_passable(target_loc, attacker_id)
-                .unwrap_or(target_loc);
-            // Pathfind toward target
-            if let Some(path) = pathfinder::find_path(&self.terrain, from, chase_dest, Some(attacker_id)) {
+            // Aircraft: chase in a straight line, ignoring terrain. The
+            // ground-unit branch (below) uses A* + passable-adjacent
+            // resolution because tanks can't path into a building cell;
+            // a heli can hover anywhere, so the straight-line chase puts
+            // it directly over the target. Naval units use the
+            // naval-aware A* (find_path_for_kind, naval=true) so they
+            // stay on water cells.
+            let attacker_is_aircraft = self
+                .actors
+                .get(&attacker_id)
+                .map(|a| a.kind == ActorKind::Aircraft)
+                .unwrap_or(false);
+            let chase_dest = if attacker_is_aircraft {
+                target_loc
+            } else {
+                self.find_adjacent_passable(target_loc, attacker_id)
+                    .unwrap_or(target_loc)
+            };
+            // Pathfind toward target. Aircraft use the straight-line
+            // helper directly (always succeeds in-bounds); ground +
+            // naval units path via A* (with naval-aware passability).
+            let path_opt = if attacker_is_aircraft {
+                if !self.terrain.contains(chase_dest.0, chase_dest.1) {
+                    None
+                } else {
+                    Some(pathfinder::straight_line_path(from, chase_dest))
+                }
+            } else {
+                let naval = self.actor_is_naval(attacker_id);
+                pathfinder::find_path_for_kind(
+                    &self.terrain,
+                    from,
+                    chase_dest,
+                    Some(attacker_id),
+                    naval,
+                )
+            };
+            if let Some(path) = path_opt {
                 if path.len() > 1 {
                     // Advance toward the next path cell at the actor's
                     // real movement speed (world units/tick), lerping the
@@ -3303,8 +4350,9 @@ impl World {
                     // decision frame instead of pathing normally.
                     let speed = self.actor_speed(attacker_id);
                     let next_cell = path[1];
+                    // Aircraft ignore ground occupancy — they're airborne.
                     let occ = self.terrain.occupant(next_cell.0, next_cell.1);
-                    if occ == 0 || occ == attacker_id {
+                    if attacker_is_aircraft || occ == 0 || occ == attacker_id {
                         let next_center = center_of_cell(next_cell.0, next_cell.1);
                         let mut arrived = false;
                         if let Some(actor) = self.actors.get_mut(&attacker_id) {
@@ -3365,9 +4413,15 @@ impl World {
                         // the interpolated position actually reaches the
                         // next cell center.
                         if arrived {
-                            self.terrain.clear_occupant(from.0, from.1);
-                            self.terrain
-                                .set_occupant(next_cell.0, next_cell.1, attacker_id);
+                            // Aircraft don't claim ground cells (see Move
+                            // tick comment); skip both the clear and the
+                            // set so the air unit's path leaves the ground
+                            // occupancy grid untouched.
+                            if !attacker_is_aircraft {
+                                self.terrain.clear_occupant(from.0, from.1);
+                                self.terrain
+                                    .set_occupant(next_cell.0, next_cell.1, attacker_id);
+                            }
                             if let Some(actor) = self.actors.get_mut(&attacker_id) {
                                 actor.location = Some(next_cell);
                             }
@@ -3441,6 +4495,15 @@ impl World {
         for id in expired_inv {
             self.invulnerable.remove(&id);
         }
+
+        // Resource-economy idiom: any idle, owned harvester whose
+        // owner has at least one refinery should auto-start a Harvest
+        // cycle (matches the C# AutoTarget-on-spawn behaviour for HARV).
+        // This is what makes a scenario-placed `harv` actually mine the
+        // moment the agent's `proc` is up — without it the harv stands
+        // inert because `build_scenario_actor` injects it with no
+        // Activity.
+        self.auto_route_idle_harvesters();
 
         // Tick Harvest activities.
         self.tick_harvesters();
@@ -3749,6 +4812,10 @@ impl World {
                             .unwrap_or((2, 2));
                         self.terrain.clear_footprint(loc.0, loc.1, fw, fh);
                     }
+                } else if dead.kind == ActorKind::Aircraft {
+                    // Aircraft never claimed ground occupancy — leave the
+                    // grid alone so a ground unit beneath the wreck isn't
+                    // erased.
                 } else if let Some(loc) = dead.location {
                     self.terrain.clear_occupant(loc.0, loc.1);
                 }
@@ -3784,32 +4851,98 @@ impl World {
 
     /// Spawn a unit near the owner's production building (WEAP for vehicles, TENT/BARR for infantry).
     fn spawn_unit(&mut self, unit_type: &str, owner_player_id: u32) {
-        // Find a building owned by this player to spawn near
         let spawn_loc = self.find_spawn_location(owner_player_id, unit_type);
         let (x, y) = match spawn_loc {
             Some(loc) => loc,
-            None => return, // No production building found
+            None => return,
         };
+        self.spawn_unit_at(unit_type, owner_player_id, x, y);
+    }
 
+    /// Spawn a unit adjacent to a SPECIFIC building actor (rather than
+    /// the lowest-id production building of the matching category).
+    /// Used by `order_place_building` for the proc auto-harv so a 2nd
+    /// refinery placed far from the 1st gets its OWN harvester at its
+    /// own footprint, not at the 1st proc's footprint (which is the
+    /// historical footgun fixed here).
+    fn spawn_unit_near_building(
+        &mut self,
+        unit_type: &str,
+        owner_player_id: u32,
+        building_id: u32,
+    ) {
+        let (bx, by, btype) = match self.actors.get(&building_id) {
+            Some(a) => match (a.location, a.actor_type.as_deref()) {
+                (Some((x, y)), Some(t)) => (x, y, t.to_string()),
+                _ => {
+                    // Fall back to the legacy lowest-id behaviour.
+                    self.spawn_unit(unit_type, owner_player_id);
+                    return;
+                }
+            },
+            None => {
+                self.spawn_unit(unit_type, owner_player_id);
+                return;
+            }
+        };
+        let (fw, fh) = self
+            .rules
+            .actor(&btype)
+            .map(|s| s.footprint)
+            .unwrap_or((2, 2));
+        // Same scan as `find_spawn_location` but anchored on this
+        // specific building's footprint.
+        let mut spawn_loc: Option<(i32, i32)> = None;
+        'outer: for dy in -1..=fh {
+            for dx in -1..=fw {
+                let sx = bx + dx;
+                let sy = by + dy;
+                if self.terrain.is_passable(sx, sy) {
+                    spawn_loc = Some((sx, sy));
+                    break 'outer;
+                }
+            }
+        }
+        let (x, y) = match spawn_loc {
+            Some(loc) => loc,
+            None => return,
+        };
+        self.spawn_unit_at(unit_type, owner_player_id, x, y);
+    }
+
+    /// Shared spawn worker used by `spawn_unit` and
+    /// `spawn_unit_near_building`. Creates the actor at `(x, y)` and
+    /// wires harvest activity / rally point / occupancy.
+    fn spawn_unit_at(
+        &mut self,
+        unit_type: &str,
+        owner_player_id: u32,
+        x: i32,
+        y: i32,
+    ) {
         let unit_id = self.next_actor_id;
         self.next_actor_id += 1;
 
         let (kind, speed, hp) = self.rules.actor(unit_type)
             .map(|s| (s.kind, s.speed, s.hp))
             .unwrap_or((ActorKind::Vehicle, 71, 100000));
-        let facing = 512; // Default facing south
+        let facing = 512;
         let cell = CPos::new(x, y);
         let center = center_of_cell(x, y);
 
-        // Harvesters auto-start harvesting
+        // Harvesters auto-start harvesting; pick the closest refinery
+        // by path distance from the harv's own cell (the spawn cell).
         let activity = if unit_type == "harv" {
-            let refinery_id = self.find_refinery(owner_player_id).unwrap_or(0);
+            let refinery_id = self
+                .find_refinery_from(owner_player_id, (x, y))
+                .or_else(|| self.find_refinery(owner_player_id))
+                .unwrap_or(0);
             Some(Activity::Harvest {
                 state: HarvestState::FindingOre,
                 refinery_id,
                 carried_ore: 0,
                 carried_gems: 0,
-                capacity: 20, // RA HARV capacity
+                capacity: 20,
                 path: Vec::new(),
                 path_index: 0,
                 speed,
@@ -3838,11 +4971,12 @@ impl World {
             kills: 0, rank: 0,
         };
         self.actors.insert(unit_id, actor);
-        self.terrain.set_occupant(x, y, unit_id);
+        if kind != ActorKind::Aircraft {
+            self.terrain.set_occupant(x, y, unit_id);
+        }
         eprintln!("SPAWN: {} id={} at ({},{}) owner={} speed={} hp={}",
             unit_type, unit_id, x, y, owner_player_id, speed, hp);
 
-        // Auto-move to rally point if set on the production building
         if unit_type != "harv" {
             let rally = self.find_rally_point_for_unit(owner_player_id, unit_type);
             if let Some(target) = rally {
@@ -3955,6 +5089,66 @@ impl World {
             }
         }
         None
+    }
+
+    /// Pick the owner's refinery (`proc`) whose adjacent cell is
+    /// nearest by REAL PATH from `from_cell`. Falls back to the lowest
+    /// reachable / Chebyshev-closest one when no path exists.
+    ///
+    /// Historical footgun: the original `find_refinery` returned the
+    /// lowest-id proc unconditionally, which meant every harvester
+    /// (including ones spawned at a new far-away proc) trudged back to
+    /// the original refinery — defeating the point of expansion. This
+    /// helper is consulted at:
+    ///   * harv spawn (`spawn_unit_at`)
+    ///   * stale-id re-resolve in `harvester_start_delivery`
+    fn find_refinery_from(
+        &self,
+        owner_player_id: u32,
+        from_cell: (i32, i32),
+    ) -> Option<u32> {
+        let mut candidates: Vec<(u32, (i32, i32))> = Vec::new();
+        for actor in self.actors.values() {
+            if actor.owner_id == Some(owner_player_id)
+                && actor.kind == ActorKind::Building
+                && actor.actor_type.as_deref() == Some("proc")
+            {
+                if let Some(loc) = actor.location {
+                    candidates.push((actor.id, loc));
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+        // Try real pathfind first (most accurate; respects walls).
+        let mut best: Option<(usize, u32)> = None; // (path_len, id)
+        for &(rid, (bx, by)) in &candidates {
+            if let Some(target) = self.find_adjacent_cell(bx, by) {
+                if let Some(path) =
+                    pathfinder::find_path(&self.terrain, from_cell, target, None)
+                {
+                    let len = path.len();
+                    let take = match best {
+                        None => true,
+                        Some((bl, bid)) => len < bl || (len == bl && rid < bid),
+                    };
+                    if take {
+                        best = Some((len, rid));
+                    }
+                }
+            }
+        }
+        if let Some((_, rid)) = best {
+            return Some(rid);
+        }
+        // No path to any proc — fall back to Chebyshev-nearest, then id.
+        candidates.sort_by_key(|(rid, (bx, by))| {
+            let dx = (bx - from_cell.0).abs();
+            let dy = (by - from_cell.1).abs();
+            (dx.max(dy), *rid)
+        });
+        candidates.first().map(|(rid, _)| *rid)
     }
 
     /// Compute all virtual prerequisites a player currently has based on owned buildings and faction.
@@ -4527,6 +5721,17 @@ impl World {
         self.typed_shroud.get(&player_id)
     }
 
+    /// Returns `true` when `building_id` has been revealed to `viewer`
+    /// by a spy infiltration. The observation layer additively surfaces
+    /// these in `enemy_buildings_summary` even when the building's cell
+    /// is currently fogged for the viewer.
+    pub fn was_infiltration_revealed(&self, viewer: u32, building_id: u32) -> bool {
+        self.infiltration_revealed_buildings
+            .get(&viewer)
+            .map(|s| s.contains(&building_id))
+            .unwrap_or(false)
+    }
+
     /// Total kills credited to `player_id` across all combat paths
     /// (data-driven `tick_actors` + trait-based `AttackActivity`).
     /// Updated whenever a target's HP reaches zero from one of that
@@ -4902,6 +6107,10 @@ pub fn insert_test_actor(world: &mut World, actor: Actor) {
                 .map(|s| s.footprint)
                 .unwrap_or((1, 1));
             world.terrain.occupy_footprint(loc.0, loc.1, fw, fh, id);
+        } else if actor.kind == ActorKind::Aircraft {
+            // Aircraft are airborne — they don't claim ground cells, so
+            // tests / scenarios can spawn a heli over a building footprint
+            // or impassable terrain without corrupting the occupancy grid.
         } else {
             world.terrain.set_occupant(loc.0, loc.1, id);
         }
@@ -4925,6 +6134,8 @@ pub fn remove_test_actor(world: &mut World, id: u32) -> Option<Actor> {
                 .map(|s| s.footprint)
                 .unwrap_or((1, 1));
             world.terrain.clear_footprint(loc.0, loc.1, fw, fh);
+        } else if actor.kind == ActorKind::Aircraft {
+            // Aircraft never occupied — nothing to clear.
         } else {
             world.terrain.clear_occupant(loc.0, loc.1);
         }
@@ -5022,12 +6233,16 @@ pub fn build_world(
     for slot in &lobby.occupied_slots {
         let id = next_id;
         player_factions.insert(id, slot.faction.clone());
+        // Per-slot starting-cash override (from scenario YAML
+        // `agent: {cash: N}` / `enemy: {cash: M}`); falls back to
+        // the lobby-wide default when the slot leaves it unset.
+        let slot_cash = slot.starting_cash.unwrap_or(lobby.starting_cash);
         actors.insert(id, Actor {
             id,
             kind: ActorKind::Player,
             owner_id: None,
             location: None,
-            traits: build_player_traits(lobby.starting_cash),
+            traits: build_player_traits(slot_cash),
             activity: None,
             actor_type: None,
             kills: 0,
@@ -5262,6 +6477,7 @@ pub fn build_world(
         recently_received_fire: HashMap::new(),
         hunt_enabled: HashSet::new(),
         superweapon_timers: HashMap::new(),
+        superweapons: crate::superweapon::SuperweaponManager::new(),
         invulnerable: HashMap::new(),
         player_factions,
         typed_shroud: BTreeMap::new(),
@@ -5272,6 +6488,7 @@ pub fn build_world(
         combat_reveal_cells: BTreeMap::new(),
         pending_move_destinations: HashSet::new(),
         move_fire_cooldown: HashMap::new(),
+        infiltration_revealed_buildings: BTreeMap::new(),
     };
 
     // Initial shroud reveal around starting units
@@ -5349,8 +6566,8 @@ mod tests {
             starting_cash: 5000,
             allow_spectators: true,
             occupied_slots: vec![
-                SlotInfo { player_reference: "P1".into(), faction: "allies".into(), is_bot: false },
-                SlotInfo { player_reference: "P2".into(), faction: "soviet".into(), is_bot: false },
+                SlotInfo { player_reference: "P1".into(), faction: "allies".into(), is_bot: false, starting_cash: None },
+                SlotInfo { player_reference: "P2".into(), faction: "soviet".into(), is_bot: false, starting_cash: None },
             ],
         };
         let mut world = build_world(&map, 0, &lobby, None, 0, false);

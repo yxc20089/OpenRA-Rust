@@ -69,6 +69,38 @@ pub enum Activity {
         transport_id: u32,
         speed: i32,
     },
+    /// Tanya's C4 commando ability — walk to an enemy building, plant
+    /// C4 on adjacency, instantly destroying it. The planter (Tanya)
+    /// survives the detonation (RA canon: Tanya plants, runs away,
+    /// building explodes; MVP simplifies "runs away" to "stays put,
+    /// unharmed"). Subject/target validation (subject is `tanya`,
+    /// target is an enemy Building) happens at order issue time;
+    /// once the activity is on the actor the tick handler only re-
+    /// checks that the target still exists.
+    C4Plant {
+        target_id: u32,
+        speed: i32,
+    },
+    /// Walk to an enemy building and capture it (C# `Captures` /
+    /// `CapturesTransform`). When the engineer reaches a cell adjacent
+    /// to the target the target's `owner_id` is reassigned to the
+    /// capturer's owner and the engineer is consumed (removed from the
+    /// world). Pragmatic subset: no "external capture" weights,
+    /// instant on-arrival transfer.
+    Capture {
+        target_id: u32,
+        speed: i32,
+    },
+    /// Walk an infiltrator (spy / thief) to an enemy building. On
+    /// adjacency, apply the type-dependent effect (spy reveals enemy
+    /// structures to the agent; thief drains some enemy cash to the
+    /// agent) and consume the infiltrator. C# RA `Infiltrates` /
+    /// `InfiltrateForCash` family — collapsed to a single Activity
+    /// because the dispatch is by the infiltrator's `actor_type`.
+    Infiltrate {
+        target_id: u32,
+        speed: i32,
+    },
     /// Harvest resources: find ore → move → harvest → deliver → repeat.
     Harvest {
         state: HarvestState,

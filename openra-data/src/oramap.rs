@@ -391,8 +391,19 @@ pub struct MapDef {
     pub spawn_mcvs: bool,
     /// Per-scenario starting cash for every player (designed economy
     /// constraint). Defaults to 5000 (OpenRA skirmish default) when the
-    /// scenario omits `starting_cash:`.
+    /// scenario omits `starting_cash:`. Acts as the floor when neither
+    /// `agent: {cash: N}` nor `enemy: {cash: M}` override it.
     pub starting_cash: i32,
+    /// Per-player starting-cash override parsed from
+    /// `agent: {cash: N}`. When `None`, the agent slot inherits
+    /// `starting_cash`. Lets a scenario give the agent a different
+    /// starting balance from the enemy (e.g. agent: 0, enemy: 2000 in
+    /// the thief-steals-cash scenario).
+    pub agent_starting_cash: Option<i32>,
+    /// Per-player starting-cash override parsed from
+    /// `enemy: {cash: M}`. When `None`, the enemy slot inherits
+    /// `starting_cash`. See `agent_starting_cash`.
+    pub enemy_starting_cash: Option<i32>,
     /// Scripted opponent behaviour for the enemy side, if the
     /// scenario set `enemy: {bot: ...}` (else None ⇒ stance-only).
     pub enemy_bot: Option<String>,
@@ -402,6 +413,41 @@ pub struct MapDef {
     /// downstream consumers (the env per-tick firing path) typically
     /// fire each event exactly once when `world_tick >= event.tick`.
     pub scheduled_events: Vec<ScheduledEvent>,
+    /// If true, the agent player observes the entire map with no fog of
+    /// war: every enemy actor is reported regardless of shroud, and
+    /// `explored_cells` covers the whole playable rectangle. Defaults to
+    /// `false` (normal fog). This is the no-fog half of the bench's
+    /// perception ablation grid (vision/structured × fog/no-fog) — a
+    /// perfect-information control cell, not a load-bearing scenario.
+    pub reveal_map: bool,
+    /// Ore patches declared directly in the scenario YAML via the
+    /// top-level `ore_patches:` list. Each entry is materialised by the
+    /// env layer into a disk of ore cells on the terrain map so
+    /// harvesters can mine it. Scenarios that pre-place ore via the
+    /// `mine` map prop still work unchanged (the env layer continues to
+    /// handle that path); `ore_patches:` is the explicit, declarative
+    /// alternative that makes the bench's economy scenarios
+    /// load-bearing.
+    pub ore_patches: Vec<OrePatchDef>,
+    /// Water cells declared by the scenario YAML's `water_cells:` and/or
+    /// `water_rect:` blocks. The engine marks each `(x, y)` as a water
+    /// cell in the terrain map: ground actors (Infantry / Vehicle /
+    /// Building) cannot enter; naval actors (Ship) can ONLY traverse
+    /// water cells. Used by the naval MVP to declare water bands
+    /// without touching the `map.bin` tile encoding.
+    pub water_cells: Vec<(i32, i32)>,
+}
+
+/// A scenario-declared ore patch. Materialised by the env layer at
+/// world-build time into a disk of harvestable ore centered at
+/// `(x, y)` with roughly `amount` density units spread across cells.
+/// `radius` controls the disk size (default 3, ≈28 cells).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OrePatchDef {
+    pub x: i32,
+    pub y: i32,
+    pub amount: i32,
+    pub radius: i32,
 }
 
 /// One scripted mid-episode event. Parsed from a top-level
@@ -671,8 +717,13 @@ pub fn load_rush_hour_map_with_spawn(
         actors,
         spawn_mcvs: scenario.spawn_mcvs.unwrap_or(true),
         starting_cash: scenario.starting_cash.unwrap_or(5000),
+        agent_starting_cash: scenario.agent_starting_cash,
+        enemy_starting_cash: scenario.enemy_starting_cash,
         enemy_bot: scenario.enemy_bot,
         scheduled_events: scenario.scheduled_events,
+        reveal_map: scenario.reveal_map.unwrap_or(false),
+        ore_patches: scenario.ore_patches,
+        water_cells: scenario.water_cells,
     })
 }
 
@@ -696,8 +747,28 @@ struct ScenarioYaml {
     /// Optional scripted opponent behaviour for the enemy side
     /// (`enemy: {bot: hunt|rusher|patrol|turtle}`).
     enemy_bot: Option<String>,
+    /// Optional per-player starting-cash override parsed from
+    /// `agent: {cash: N}` inside the agent block. When None, the agent
+    /// slot inherits the scenario-level `starting_cash`.
+    agent_starting_cash: Option<i32>,
+    /// Optional per-player starting-cash override parsed from
+    /// `enemy: {cash: M}` inside the enemy block. See
+    /// `agent_starting_cash`.
+    enemy_starting_cash: Option<i32>,
     /// Parsed `scheduled_events:` block (empty when omitted).
     scheduled_events: Vec<ScheduledEvent>,
+    /// Top-level `reveal_map:` flag. None ⇒ default (false ⇒ normal fog
+    /// of war). Set `reveal_map: true` to disable fog for the agent
+    /// player — the no-fog cells of the perception ablation grid.
+    reveal_map: Option<bool>,
+    /// Parsed `ore_patches:` block (empty when omitted).
+    ore_patches: Vec<OrePatchDef>,
+    /// Water cells declared by `water_cells:` (a flat list of `[x, y]`
+    /// pairs) and/or `water_rect:` (an `[x, y, w, h]` rectangle that
+    /// is expanded into a flat cell list at parse time). MVP overlay
+    /// path: lets a naval scenario declare water without touching
+    /// `map.bin`. Empty when neither block is present.
+    water_cells: Vec<(i32, i32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -759,15 +830,17 @@ fn parse_scenario_yaml(text: &str) -> io::Result<ScenarioYaml> {
                     continue;
                 }
                 "agent" => {
-                    let (faction, _bot, ni) = read_block_faction(&lines, i + 1);
+                    let (faction, _bot, cash, ni) = read_block_faction(&lines, i + 1);
                     out.agent_faction = faction;
+                    out.agent_starting_cash = cash;
                     i = ni;
                     continue;
                 }
                 "enemy" => {
-                    let (faction, bot, ni) = read_block_faction(&lines, i + 1);
+                    let (faction, bot, cash, ni) = read_block_faction(&lines, i + 1);
                     out.enemy_faction = faction;
                     out.enemy_bot = bot;
+                    out.enemy_starting_cash = cash;
                     i = ni;
                     continue;
                 }
@@ -800,6 +873,14 @@ fn parse_scenario_yaml(text: &str) -> io::Result<ScenarioYaml> {
                     i = ni;
                     continue;
                 }
+                "ore_patches" => {
+                    let detected_indent = detect_list_indent(&lines, i + 1).unwrap_or(0);
+                    let (patches, ni) =
+                        read_ore_patches(&lines, i + 1, detected_indent);
+                    out.ore_patches = patches;
+                    i = ni;
+                    continue;
+                }
                 "spawn_mcvs" => {
                     let trimmed_v = v.trim().trim_matches(|c: char| c == '"' || c == '\'');
                     out.spawn_mcvs = match trimmed_v {
@@ -808,6 +889,74 @@ fn parse_scenario_yaml(text: &str) -> io::Result<ScenarioYaml> {
                         _ => None,
                     };
                     i += 1;
+                    continue;
+                }
+                "reveal_map" => {
+                    let trimmed_v = v.trim().trim_matches(|c: char| c == '"' || c == '\'');
+                    out.reveal_map = match trimmed_v {
+                        "true" | "True" | "yes" | "1" => Some(true),
+                        "false" | "False" | "no" | "0" => Some(false),
+                        _ => None,
+                    };
+                    i += 1;
+                    continue;
+                }
+                "water_rect" => {
+                    // Two accepted shapes:
+                    //   inline: `water_rect: [x, y, w, h]`
+                    //   block:  `water_rect:\n  - x\n  - y\n  - w\n  - h`
+                    // PyYAML's `safe_dump` emits the block form by
+                    // default, so the bench's `_scenario_to_tmp_yaml`
+                    // produces the block form and the engine must
+                    // accept both.
+                    let mut rect: Vec<i32> = if v.trim().is_empty() {
+                        // Block form: 4 `- N` items at indent > 0.
+                        let detected_indent =
+                            detect_list_indent(&lines, i + 1).unwrap_or(0);
+                        let (vals, ni) =
+                            read_int_scalar_list(&lines, i + 1, detected_indent);
+                        i = ni;
+                        vals
+                    } else {
+                        // Inline `[x, y, w, h]`.
+                        let r = parse_inline_int_list(v).unwrap_or_default();
+                        i += 1;
+                        r
+                    };
+                    if rect.len() == 4 {
+                        let h = rect.pop().unwrap();
+                        let w = rect.pop().unwrap();
+                        let y = rect.pop().unwrap();
+                        let x = rect.pop().unwrap();
+                        for dy in 0..h {
+                            for dx in 0..w {
+                                out.water_cells.push((x + dx, y + dy));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                "water_cells" => {
+                    // Flat list of `[x, y]` pairs (PyYAML block form):
+                    //   water_cells:
+                    //     - [10, 5]
+                    //     - [10, 6]
+                    // OR inline list-of-lists:
+                    //   water_cells: [[10, 5], [10, 6]]
+                    if !v.trim().is_empty() {
+                        // Inline form (`[[x, y], [x, y]]`).
+                        for pair in parse_inline_pair_list(v) {
+                            out.water_cells.push(pair);
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    // Block form — list items at indent > 0.
+                    let detected_indent = detect_list_indent(&lines, i + 1).unwrap_or(0);
+                    let (cells, ni) =
+                        read_water_cell_list(&lines, i + 1, detected_indent);
+                    out.water_cells.extend(cells);
+                    i = ni;
                     continue;
                 }
                 _ => {}
@@ -851,10 +1000,14 @@ fn leading_spaces(line: &str) -> usize {
 
 /// Inside a `agent:` or `enemy:` top-level block, read indented `faction:` line.
 /// Returns `(faction_string, next_line_index)`.
-fn read_block_faction(lines: &[&str], start: usize) -> (String, Option<String>, usize) {
+fn read_block_faction(
+    lines: &[&str],
+    start: usize,
+) -> (String, Option<String>, Option<i32>, usize) {
     let mut i = start;
     let mut faction = String::new();
     let mut bot: Option<String> = None;
+    let mut cash: Option<i32> = None;
     while i < lines.len() {
         let raw = lines[i];
         let trimmed = strip_yaml_comment(raw).trim_end();
@@ -876,12 +1029,25 @@ fn read_block_faction(lines: &[&str], start: usize) -> (String, Option<String>, 
                         bot = Some(v);
                     }
                 }
+                // Per-player starting-cash override (`agent: {cash: N}`
+                // / `enemy: {cash: M}`). Bench scenarios use this to
+                // seed a thief's target enemy with cash while keeping
+                // the agent's own balance separate.
+                "cash" => {
+                    if let Ok(n) = v
+                        .trim()
+                        .trim_matches(|c: char| c == '"' || c == '\'')
+                        .parse::<i32>()
+                    {
+                        cash = Some(n);
+                    }
+                }
                 _ => {}
             }
         }
         i += 1;
     }
-    (faction, bot, i)
+    (faction, bot, cash, i)
 }
 
 /// Parse the `actors:` list. Each list item starts with `- type: NAME` at
@@ -1067,6 +1233,178 @@ fn parse_inline_xy(s: &str) -> Option<(i32, i32)> {
     let x: i32 = parts.next()?.trim().parse().ok()?;
     let y: i32 = parts.next()?.trim().parse().ok()?;
     Some((x, y))
+}
+
+/// Parse `[A, B, C, ...]` flow-list of ints. Empty `Vec` on malformed.
+/// Used by naval-MVP `water_rect: [x, y, w, h]` parsing.
+fn parse_inline_int_list(s: &str) -> Option<Vec<i32>> {
+    let trim = s.trim();
+    let inner = trim.strip_prefix('[')?.strip_suffix(']')?;
+    let mut out = Vec::new();
+    for tok in inner.split(',') {
+        out.push(tok.trim().parse::<i32>().ok()?);
+    }
+    Some(out)
+}
+
+/// Parse `[[X, Y], [X, Y], ...]` flow-list of pairs. Returns an empty
+/// `Vec` on malformed input. Used by naval-MVP inline `water_cells:`.
+fn parse_inline_pair_list(s: &str) -> Vec<(i32, i32)> {
+    let trim = s.trim();
+    let inner = match trim.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+        Some(x) => x,
+        None => return Vec::new(),
+    };
+    // Walk char-by-char, splitting on `]` then trimming the `, [`.
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut buf = String::new();
+    for ch in inner.chars() {
+        match ch {
+            '[' => {
+                depth += 1;
+                if depth == 1 {
+                    buf.clear();
+                    continue;
+                }
+                buf.push(ch);
+            }
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(pair) = parse_inline_xy(&format!("[{buf}]")) {
+                        out.push(pair);
+                    }
+                    buf.clear();
+                    continue;
+                }
+                buf.push(ch);
+            }
+            _ => {
+                if depth >= 1 {
+                    buf.push(ch);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Read a flat list of `- N` integer entries (PyYAML block form for
+/// a top-level scalar list). Stops at the first non-list, non-blank
+/// line at indent `<= expected_indent`. Used by naval-MVP block-form
+/// `water_rect:`.
+fn read_int_scalar_list(
+    lines: &[&str],
+    start: usize,
+    expected_indent: usize,
+) -> (Vec<i32>, usize) {
+    let mut out = Vec::new();
+    let mut i = start;
+    while i < lines.len() {
+        let raw = lines[i];
+        let trimmed = strip_yaml_comment(raw).trim_end();
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+        let indent = leading_spaces(raw);
+        if indent < expected_indent {
+            break;
+        }
+        let lead = trimmed.trim_start();
+        if let Some(rest) = lead.strip_prefix("- ") {
+            if let Ok(v) = rest.trim().parse::<i32>() {
+                out.push(v);
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        break;
+    }
+    (out, i)
+}
+
+/// Read a flat list of `- [X, Y]` water-cell entries (PyYAML block form).
+/// Stops at the first non-list, non-blank line at indent `<= expected_indent`.
+///
+/// Two shapes accepted:
+///   - `- [X, Y]`                   (inline-pair items)
+///   - `- - X\n  - Y`               (PyYAML block-block form: each
+///                                   item is itself a 2-element list)
+fn read_water_cell_list(
+    lines: &[&str],
+    start: usize,
+    expected_indent: usize,
+) -> (Vec<(i32, i32)>, usize) {
+    let mut out = Vec::new();
+    let mut i = start;
+    while i < lines.len() {
+        let raw = lines[i];
+        let trimmed = strip_yaml_comment(raw).trim_end();
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+        let indent = leading_spaces(raw);
+        if indent < expected_indent {
+            break;
+        }
+        let lead = trimmed.trim_start();
+        if let Some(rest) = lead.strip_prefix("- ") {
+            // Inline pair `[x, y]` after `- `.
+            if let Some(pair) = parse_inline_xy(rest.trim()) {
+                out.push(pair);
+                i += 1;
+                continue;
+            }
+            // PyYAML block-block form: `- - X` (the `- ` is followed
+            // by another `- ` opening a nested 2-element scalar list).
+            // The first scalar lives on the same line; the second lives
+            // on the next sibling line at `indent` + 2 (or whatever
+            // sub-indent PyYAML chose). Reuse `read_xy_list` on the
+            // tail.
+            if let Some(inner_first) = rest.strip_prefix("- ") {
+                if let Ok(x) = inner_first.trim().parse::<i32>() {
+                    // Parse the second scalar at the same nested-list
+                    // indent as `- `, which sits at `indent + 2`.
+                    let nested_indent = indent + 2;
+                    let mut vals = vec![x];
+                    i += 1;
+                    while i < lines.len() && vals.len() < 2 {
+                        let sub = lines[i];
+                        let st = strip_yaml_comment(sub).trim_end();
+                        if st.is_empty() {
+                            i += 1;
+                            continue;
+                        }
+                        let sind = leading_spaces(sub);
+                        if sind < nested_indent {
+                            break;
+                        }
+                        let sl = st.trim_start();
+                        if let Some(r) = sl.strip_prefix("- ") {
+                            if let Ok(v) = r.trim().parse::<i32>() {
+                                vals.push(v);
+                                i += 1;
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    if vals.len() == 2 {
+                        out.push((vals[0], vals[1]));
+                    }
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    (out, i)
 }
 
 /// Read a 2-element scalar list. Items must be at indent
@@ -1341,6 +1679,99 @@ fn read_scheduled_events(
         i += 1;
     }
     (events, i)
+}
+
+/// Parse the `ore_patches:` list. Each list item is a dict with
+/// `x:`, `y:`, `amount:` (required) and an optional `radius:`. Mirrors
+/// the shape of `scheduled_events:` / `spawn_mcvs:` (top-level YAML
+/// keys consumed by the env layer at world-build time). Returns the
+/// parsed patches (in declaration order) and the index of the first
+/// line past the block. Unknown sub-keys are tolerated.
+fn read_ore_patches(
+    lines: &[&str],
+    start: usize,
+    list_indent: usize,
+) -> (Vec<OrePatchDef>, usize) {
+    let mut patches = Vec::new();
+    let mut i = start;
+
+    while i < lines.len() {
+        let raw = lines[i];
+        let trimmed = strip_yaml_comment(raw).trim_end();
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+        let indent = leading_spaces(raw);
+        let trim_lead = trimmed.trim_start();
+
+        if indent < list_indent {
+            break;
+        }
+        if indent == list_indent && !trim_lead.starts_with("- ") {
+            break;
+        }
+
+        if let Some(rest) = trim_lead.strip_prefix("- ") {
+            // Start a new patch. Anchor defaults; required `x`, `y`,
+            // `amount` are validated at the end.
+            let mut p_x: Option<i32> = None;
+            let mut p_y: Option<i32> = None;
+            let mut p_amount: Option<i32> = None;
+            let mut p_radius: i32 = 3;
+
+            // First key on the `- ` line itself (PyYAML often writes
+            // `- x: 50`).
+            if let Some((k, v)) = split_key_value(rest) {
+                match k {
+                    "x" => p_x = v.parse().ok(),
+                    "y" => p_y = v.parse().ok(),
+                    "amount" => p_amount = v.parse().ok(),
+                    "radius" => {
+                        if let Ok(r) = v.parse::<i32>() {
+                            p_radius = r.max(0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+
+            // Body lines indented strictly more than `list_indent`.
+            while i < lines.len() {
+                let sub = lines[i];
+                let sub_trim = strip_yaml_comment(sub).trim_end();
+                if sub_trim.is_empty() {
+                    i += 1;
+                    continue;
+                }
+                let sub_indent = leading_spaces(sub);
+                if sub_indent <= list_indent {
+                    break;
+                }
+                let sub_lead = sub_trim.trim_start();
+                match split_key_value(sub_lead) {
+                    Some(("x", v)) => p_x = v.parse().ok(),
+                    Some(("y", v)) => p_y = v.parse().ok(),
+                    Some(("amount", v)) => p_amount = v.parse().ok(),
+                    Some(("radius", v)) => {
+                        if let Ok(r) = v.parse::<i32>() {
+                            p_radius = r.max(0);
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+
+            if let (Some(x), Some(y), Some(amount)) = (p_x, p_y, p_amount) {
+                patches.push(OrePatchDef { x, y, amount, radius: p_radius });
+            }
+            continue;
+        }
+        i += 1;
+    }
+    (patches, i)
 }
 
 /// Parse an `ActorFilter` block. Lines belong to the filter while their

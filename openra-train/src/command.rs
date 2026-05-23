@@ -62,6 +62,36 @@ pub enum Command {
     Surrender,
     /// No-op; the env still ticks N frames.
     Observe,
+    /// Tanya's C4 commando ability: the named tanya unit(s) walk to
+    /// the target ENEMY BUILDING and instantly destroy it on
+    /// adjacency. Subject MUST be a `tanya` actor; target MUST be an
+    /// enemy building. Non-conforming subjects / targets are dropped
+    /// (with a warning). Appended at the end of the enum to minimise
+    /// merge conflicts with concurrent engine work.
+    C4Detonate { unit_ids: Vec<String>, target_id: String },
+    /// Order an engineer (`e6`) to walk to an enemy building and
+    /// capture it (C# `Captures`). On arrival the target's ownership
+    /// transfers to the capturer's player and the engineer is consumed.
+    /// `unit_ids` holds engineer id(s); `target_id` is the enemy
+    /// building id.
+    CaptureActor { unit_ids: Vec<String>, target_id: String },
+    /// Walk an infiltrator (spy / thief) into an enemy building. On
+    /// adjacency the engine applies the type-dependent effect — spy
+    /// reveals the target-owner's structures; thief drains some
+    /// enemy cash — and consumes the infiltrator.
+    Infiltrate { unit_ids: Vec<String>, target_id: String },
+    /// Fire one of the three superweapons (`mslo` nuke / `iron` iron
+    /// curtain / `pdox` chronosphere). The handler validates that the
+    /// agent owns a launcher building of the matching kind and that the
+    /// weapon is fully charged; otherwise the order is silently dropped
+    /// with a warning. `target_cell` is required for the nuke and the
+    /// chronosphere (destination); `target_id` (a friendly actor) is
+    /// required for the iron curtain and chronosphere.
+    FireSuperweapon {
+        kind: String,
+        target_cell: Option<(i32, i32)>,
+        target_id: Option<String>,
+    },
 }
 
 /// Python-facing shim around `Command`.
@@ -179,6 +209,36 @@ impl PyCommand {
     #[staticmethod]
     fn patrol(unit_ids: Vec<String>) -> Self {
         Self { inner: Command::Patrol { unit_ids } }
+    }
+
+    #[staticmethod]
+    fn c4_detonate(unit_ids: Vec<String>, target_id: String) -> Self {
+        Self { inner: Command::C4Detonate { unit_ids, target_id } }
+    }
+
+    /// Order engineer(s) to capture an enemy building. The capturer
+    /// walks to the target building's cell; on arrival the building's
+    /// owner is transferred to the capturer's player and the engineer
+    /// is consumed.
+    #[staticmethod]
+    fn capture_actor(unit_ids: Vec<String>, target_id: String) -> Self {
+        Self { inner: Command::CaptureActor { unit_ids, target_id } }
+    }
+
+    #[staticmethod]
+    fn infiltrate(unit_ids: Vec<String>, target_id: String) -> Self {
+        Self { inner: Command::Infiltrate { unit_ids, target_id } }
+    }
+
+    /// Fire a superweapon (`mslo` / `iron` / `pdox`).
+    #[staticmethod]
+    #[pyo3(signature = (kind, target_cell=None, target_id=None))]
+    fn fire_superweapon(
+        kind: String,
+        target_cell: Option<(i32, i32)>,
+        target_id: Option<String>,
+    ) -> Self {
+        Self { inner: Command::FireSuperweapon { kind, target_cell, target_id } }
     }
 
     fn __repr__(&self) -> String {

@@ -60,8 +60,8 @@ fn build_arena(seed: i32) -> Option<World> {
         starting_cash: 0,
         allow_spectators: false,
         occupied_slots: vec![
-            SlotInfo { player_reference: "Multi0".into(), faction: "allies".into(), is_bot: false },
-            SlotInfo { player_reference: "Multi1".into(), faction: "soviet".into(), is_bot: false },
+            SlotInfo { player_reference: "Multi0".into(), faction: "allies".into(), is_bot: false, starting_cash: None },
+            SlotInfo { player_reference: "Multi1".into(), faction: "soviet".into(), is_bot: false, starting_cash: None },
         ],
     };
     let mut world = world::build_world(&map, seed, &lobby, Some(rules), 0, false);

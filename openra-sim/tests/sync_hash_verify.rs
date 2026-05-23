@@ -15,6 +15,7 @@ fn lobby_from_replay(replay: &orarep::Replay) -> LobbyInfo {
             player_reference: player_ref.clone(),
             faction: faction.clone(),
             is_bot: false,
+            starting_cash: None,
         }
     }).collect();
 

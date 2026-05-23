@@ -73,6 +73,12 @@ pub struct TerrainMap {
     occupancy: CellLayer<u32>,
     /// Resource layer: ore/gems per cell.
     resources: CellLayer<ResourceCell>,
+    /// Water layer (naval support, MVP). `true` = water cell: ground
+    /// actors (Infantry/Vehicle/Mcv/Building) treat it as impassable;
+    /// naval actors (Ship) treat it as the only passable terrain.
+    /// Independent from `costs` — a water cell typically has
+    /// `COST_NORMAL` so ship pathfinding uses normal movement weighting.
+    water: CellLayer<bool>,
 }
 
 impl TerrainMap {
@@ -91,6 +97,7 @@ impl TerrainMap {
             costs,
             occupancy: CellLayer::new(width, height),
             resources: CellLayer::new(width, height),
+            water: CellLayer::new(width, height),
         }
     }
 
@@ -108,22 +115,85 @@ impl TerrainMap {
     }
 
     /// Check if a cell is passable (not impassable terrain AND not occupied).
+    ///
+    /// Ground-actor semantics: water cells are reported as impassable.
+    /// Naval-aware callers should use [`is_passable_for_kind`].
     pub fn is_passable(&self, x: i32, y: i32) -> bool {
         self.contains(x, y)
             && *self.costs.get(x, y) != COST_IMPASSABLE
+            && !*self.water.get(x, y)
             && *self.occupancy.get(x, y) == 0
     }
 
     /// Check if a cell is passable for a specific actor (passable if empty or self).
+    ///
+    /// Ground-actor semantics — naval actors must call
+    /// [`is_passable_for_kind`] with `naval = true`.
     pub fn is_passable_for(&self, x: i32, y: i32, actor_id: u32) -> bool {
         self.contains(x, y)
             && *self.costs.get(x, y) != COST_IMPASSABLE
+            && !*self.water.get(x, y)
             && (*self.occupancy.get(x, y) == 0 || *self.occupancy.get(x, y) == actor_id)
     }
 
     /// Check if a cell is passable terrain (ignoring occupancy).
+    ///
+    /// NOTE — this is the *ground* terrain check: water cells are
+    /// reported as impassable (matching legacy callers that predate
+    /// naval support). Use [`is_terrain_passable_for_naval`] /
+    /// [`is_passable_for_kind`] when the caller knows the actor kind.
     pub fn is_terrain_passable(&self, x: i32, y: i32) -> bool {
-        self.contains(x, y) && *self.costs.get(x, y) != COST_IMPASSABLE
+        self.contains(x, y)
+            && *self.costs.get(x, y) != COST_IMPASSABLE
+            && !*self.water.get(x, y)
+    }
+
+    /// Mark cell `(x, y)` as a water cell (naval-only). Idempotent; out-
+    /// of-bounds calls no-op. Water cells are: ground-impassable,
+    /// ship-passable. Cost stays `COST_NORMAL` so ship pathfinding uses
+    /// the normal orthogonal/diagonal weighting.
+    pub fn set_water(&mut self, x: i32, y: i32, is_water: bool) {
+        if self.contains(x, y) {
+            self.water.set(x, y, is_water);
+        }
+    }
+
+    /// True iff `(x, y)` is a water cell.
+    pub fn is_water(&self, x: i32, y: i32) -> bool {
+        self.contains(x, y) && *self.water.get(x, y)
+    }
+
+    /// Ship-aware terrain passability: water cells pass, every
+    /// non-water cell is impassable for ships (even normal grass).
+    pub fn is_terrain_passable_for_naval(&self, x: i32, y: i32) -> bool {
+        self.contains(x, y)
+            && *self.costs.get(x, y) != COST_IMPASSABLE
+            && *self.water.get(x, y)
+    }
+
+    /// Kind-aware passability gate used by the pathfinder and movement
+    /// tick. `naval = true` ⇒ only water cells pass; `naval = false` ⇒
+    /// only non-water passable cells pass. Occupancy: empty or the
+    /// supplied `actor_id` (matches `is_passable_for`).
+    pub fn is_passable_for_kind(
+        &self,
+        x: i32,
+        y: i32,
+        actor_id: u32,
+        naval: bool,
+    ) -> bool {
+        if !self.contains(x, y) {
+            return false;
+        }
+        if *self.costs.get(x, y) == COST_IMPASSABLE {
+            return false;
+        }
+        let is_water = *self.water.get(x, y);
+        if naval != is_water {
+            return false;
+        }
+        let occ = *self.occupancy.get(x, y);
+        occ == 0 || occ == actor_id
     }
 
     /// Get the actor ID occupying a cell (0 = empty).
@@ -314,6 +384,23 @@ mod tests {
         map.set_resource(10, 10, ResourceType::Gems, 3);
         let nearest = map.find_nearest_resource(6, 6, 10);
         assert_eq!(nearest, Some((5, 5))); // Closer
+    }
+
+    #[test]
+    fn water_layer_segregates_ground_and_naval() {
+        let mut m = TerrainMap::new(10, 10);
+        // Ground cell — both kinds: ground passes, ship does not.
+        assert!(m.is_terrain_passable(2, 2));
+        assert!(!m.is_terrain_passable_for_naval(2, 2));
+        assert!(m.is_passable_for_kind(2, 2, 0, false));
+        assert!(!m.is_passable_for_kind(2, 2, 0, true));
+        // Mark a water cell — flips both checks.
+        m.set_water(5, 5, true);
+        assert!(m.is_water(5, 5));
+        assert!(!m.is_terrain_passable(5, 5));
+        assert!(m.is_terrain_passable_for_naval(5, 5));
+        assert!(!m.is_passable_for_kind(5, 5, 0, false));
+        assert!(m.is_passable_for_kind(5, 5, 0, true));
     }
 
     #[test]

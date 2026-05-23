@@ -127,6 +127,7 @@ fn lobby_from_replay(replay: &orarep::Replay) -> LobbyInfo {
             player_reference: player_ref.clone(),
             faction: faction.clone(),
             is_bot: false,
+            starting_cash: None,
         })
         .collect();
     LobbyInfo {
@@ -251,11 +252,13 @@ impl GameSession {
             player_reference: "Multi0".to_string(),
             faction: factions[0].to_string(),
             is_bot: bot_vs_bot,
+            starting_cash: None,
         });
         slots.push(SlotInfo {
             player_reference: "Multi1".to_string(),
             faction: factions[1].to_string(),
             is_bot: true,
+            starting_cash: None,
         });
 
         let lobby = LobbyInfo {
@@ -293,6 +296,7 @@ impl GameSession {
                 player_reference: format!("Multi{}", i),
                 faction: factions[(i as usize) % 2].to_string(),
                 is_bot: true,
+                starting_cash: None,
             });
         }
 
