@@ -2098,7 +2098,10 @@ impl World {
     /// Apply nuclear-strike AoE damage at `(target_x, target_y)` and
     /// return the number of actors hit. Damage falls off linearly with
     /// Chebyshev distance to the centre; dead actors are removed.
-    fn detonate_nuke(&mut self, _owner: u32, target_x: i32, target_y: i32) -> usize {
+    /// Each enemy actor killed credits one kill to `owner` via
+    /// `kills_per_player` (mirrors the projectile-resolve path so a
+    /// `units_killed_gte` win predicate can be triggered by a nuke).
+    fn detonate_nuke(&mut self, owner: u32, target_x: i32, target_y: i32) -> usize {
         let radius = crate::superweapon::NUKE_RADIUS_CELLS;
         let base = crate::superweapon::NUKE_BASE_DAMAGE;
         let mut damaged: Vec<(u32, i32)> = Vec::new();
@@ -2131,9 +2134,19 @@ impl World {
             }
         }
         for id in dead {
+            // Snapshot victim owner BEFORE removing so we can decide
+            // whether the kill credits the attacker. Friendly-fire
+            // (victim_owner == owner) does NOT credit, mirroring how
+            // the projectile path scopes kill credit to enemies.
+            let victim_owner = self.actors.get(&id).and_then(|a| a.owner_id);
             if let Some(a) = self.actors.remove(&id) {
                 if let Some(loc) = a.location {
                     self.terrain.clear_occupant(loc.0, loc.1);
+                }
+            }
+            if let Some(vo) = victim_owner {
+                if vo != owner {
+                    *self.kills_per_player.entry(owner).or_insert(0) += 1;
                 }
             }
         }
