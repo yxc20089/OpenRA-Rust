@@ -3919,17 +3919,20 @@ impl World {
         }
 
         // Tick Attack activities: check range, manage reload, deal damage.
-        // First pass: decrement reload timers and collect ready-to-fire attackers
-        let mut ready_attackers: Vec<(u32, u32, i32, i32)> = Vec::new(); // (attacker_id, target_id, damage, weapon_range)
+        // First pass: decrement reload timers and collect ready-to-fire attackers.
+        // Fifth tuple field is `auto_acquired` — needed so the damage-
+        // application step can apply the stance:1 DPS multiplier (Fix #5
+        // in ENGINE_FOLLOWUPS Wave-13).
+        let mut ready_attackers: Vec<(u32, u32, i32, i32, bool)> = Vec::new(); // (attacker_id, target_id, damage, weapon_range, auto_acquired)
         for actor in self.actors.values_mut() {
             if let Some(Activity::Attack {
                 target_id, weapon_range, weapon_damage,
-                ref mut reload_remaining, ..
+                ref mut reload_remaining, auto_acquired, ..
             }) = actor.activity {
                 if *reload_remaining > 0 {
                     *reload_remaining -= 1;
                 } else {
-                    ready_attackers.push((actor.id, target_id, weapon_damage, weapon_range));
+                    ready_attackers.push((actor.id, target_id, weapon_damage, weapon_range, auto_acquired));
                 }
             }
         }
@@ -4095,6 +4098,16 @@ impl World {
             if damage <= 0 {
                 continue;
             }
+            // Move-fire shots are by construction auto-acquired
+            // (opportunistic). Apply the stance-driven DPS multiplier
+            // before queuing damage — stance:1 (ReturnFire) deals
+            // reduced auto-fire DPS so a passive kiter cannot just sit
+            // and trade fire (Fix #5).
+            let damage = scale_auto_fire_damage(
+                damage,
+                self.stances.get(attacker_id).copied().unwrap_or(2),
+                true,
+            );
             if proj_speed > 0 {
                 spawn_projectiles.push((
                     *attacker_id,
@@ -4109,7 +4122,7 @@ impl World {
             }
             self.move_fire_cooldown.insert(*attacker_id, reload);
         }
-        for (attacker_id, target_id, damage, weapon_range) in ready_attackers {
+        for (attacker_id, target_id, damage, weapon_range, auto_acquired) in ready_attackers {
             let attacker_loc = self.actors.get(&attacker_id).and_then(|a| a.location);
             let target_loc = self.actors.get(&target_id).and_then(|a| a.location);
             if let (Some(aloc), Some(tloc)) = (attacker_loc, target_loc) {
@@ -4131,6 +4144,18 @@ impl World {
                         .and_then(|t| self.rules.best_weapon_against(t, proj_target_armor))
                         .map(|(_, w)| (w.projectile_speed, w.splash_radius, w.versus.clone()))
                         .unwrap_or((0, 0, BTreeMap::new()));
+                    // Apply the stance-driven auto-fire DPS multiplier:
+                    // stance:1 (ReturnFire) attackers that ENTERED this
+                    // Attack via the auto-engage scan deal reduced
+                    // damage so a stationary kiter cannot just stand and
+                    // trade fire (Fix #5). An order-issued Attack
+                    // (`auto_acquired=false`) is always at full DPS —
+                    // explicit player intent overrides the balance gate.
+                    let damage = scale_auto_fire_damage(
+                        damage,
+                        self.stances.get(&attacker_id).copied().unwrap_or(2),
+                        auto_acquired,
+                    );
                     if proj_speed > 0 {
                         spawn_projectiles.push((attacker_id, target_id, damage, proj_speed, splash, versus_table));
                     } else {
@@ -5927,6 +5952,31 @@ pub fn center_of_cell(x: i32, y: i32) -> WPos {
 }
 
 /// Parse "X,Y" cell target from order target_string.
+/// Scale auto-fire damage by stance. A stance:1 (ReturnFire) actor
+/// that fires via auto-target (auto-engage scan or move-fire) deals
+/// reduced DPS — represents "snap fire while reorienting, not aimed
+/// fire". This is the engine half of Fix #5 in OpenRA-Bench's
+/// ENGINE_FOLLOWUPS Wave-13: it makes a stationary stance:1 kiter
+/// LOSE the head-on trade against an advancing stance:3 chaser at
+/// reduced chaser HP, restoring the kite-and-pull capability gate
+/// (without this scaling, "just stand still on ReturnFire" trivially
+/// wins, making the kite verb redundant).
+///
+/// Stances other than 1 are unaffected. Order-issued attacks
+/// (`auto_acquired == false`) are always at full DPS — player intent
+/// overrides the balance gate.
+///
+/// Scaling: 0.6× (i.e. 60%). Chosen empirically to flip the bench's
+/// EASY-tier outcome from "stationary kiter wins" to "advancing
+/// chaser wins" without altering the existing scripted-attack tests.
+fn scale_auto_fire_damage(damage: i32, stance: u8, auto_acquired: bool) -> i32 {
+    if stance == 1 && auto_acquired {
+        (damage * 6) / 10
+    } else {
+        damage
+    }
+}
+
 fn parse_cell_target(s: &str) -> Option<(i32, i32)> {
     let mut parts = s.split(',');
     let x = parts.next()?.trim().parse::<i32>().ok()?;
