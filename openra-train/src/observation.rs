@@ -165,6 +165,14 @@ pub struct Observation {
     /// spatial reasoning (the ERQA-transfer axis).
     pub spatial: Vec<f32>,
     pub spatial_shape: (i32, i32, i32),
+    /// Per-cell ore inventory: `(cell_x, cell_y, amount)` for every
+    /// cell that currently holds ore/gems. This is the agent's
+    /// "where is the ore?" perception channel — the text-based
+    /// counterpart to spatial channel 5. Surfaced so a model that
+    /// receives only the structured/text observation can still see
+    /// ore patches and decide where to place its refinery.
+    /// (Ore is global, not fog-gated.)
+    pub ore_cells: Vec<(i32, i32, i32)>,
 }
 
 /// Channel count of the spatial tensor.
@@ -263,6 +271,13 @@ impl Observation {
         bytes_of_i32(sw, &mut h);
         bytes_of_i32(sc, &mut h);
         bytes_of_i32(self.spatial.len() as i32, &mut h);
+        mix(&mut h, b'|');
+        bytes_of_i32(self.ore_cells.len() as i32, &mut h);
+        for (x, y, a) in &self.ore_cells {
+            bytes_of_i32(*x, &mut h);
+            bytes_of_i32(*y, &mut h);
+            bytes_of_i32(*a, &mut h);
+        }
         h
     }
 }
@@ -408,6 +423,21 @@ mod py {
                 cells.append(pair)?;
             }
             d.set_item("explored_cells", cells)?;
+
+            // ore_cells: list[{cell_x, cell_y, amount}] — per-cell ore
+            // inventory. Surfaced so a structured-only observation can
+            // still see where ore patches are and how depleted they
+            // are. Ore is global (not fog-gated); the renderer / agent
+            // briefing reads this to label patches.
+            let ore = PyList::empty_bound(py);
+            for &(x, y, a) in &self.ore_cells {
+                let e = PyDict::new_bound(py);
+                e.set_item("cell_x", x)?;
+                e.set_item("cell_y", y)?;
+                e.set_item("amount", a)?;
+                ore.append(e)?;
+            }
+            d.set_item("ore_cells", ore)?;
             Ok(d)
         }
     }
