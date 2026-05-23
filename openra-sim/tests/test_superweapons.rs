@@ -74,11 +74,13 @@ fn build_arena(seed: i32) -> World {
                 player_reference: "P1".into(),
                 faction: "allies".into(),
                 is_bot: false,
+                starting_cash: None,
             },
             SlotInfo {
                 player_reference: "P2".into(),
                 faction: "soviet".into(),
                 is_bot: false,
+                starting_cash: None,
             },
         ],
     };

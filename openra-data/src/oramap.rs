@@ -391,8 +391,19 @@ pub struct MapDef {
     pub spawn_mcvs: bool,
     /// Per-scenario starting cash for every player (designed economy
     /// constraint). Defaults to 5000 (OpenRA skirmish default) when the
-    /// scenario omits `starting_cash:`.
+    /// scenario omits `starting_cash:`. Acts as the floor when neither
+    /// `agent: {cash: N}` nor `enemy: {cash: M}` override it.
     pub starting_cash: i32,
+    /// Per-player starting-cash override parsed from
+    /// `agent: {cash: N}`. When `None`, the agent slot inherits
+    /// `starting_cash`. Lets a scenario give the agent a different
+    /// starting balance from the enemy (e.g. agent: 0, enemy: 2000 in
+    /// the thief-steals-cash scenario).
+    pub agent_starting_cash: Option<i32>,
+    /// Per-player starting-cash override parsed from
+    /// `enemy: {cash: M}`. When `None`, the enemy slot inherits
+    /// `starting_cash`. See `agent_starting_cash`.
+    pub enemy_starting_cash: Option<i32>,
     /// Scripted opponent behaviour for the enemy side, if the
     /// scenario set `enemy: {bot: ...}` (else None ⇒ stance-only).
     pub enemy_bot: Option<String>,
@@ -706,6 +717,8 @@ pub fn load_rush_hour_map_with_spawn(
         actors,
         spawn_mcvs: scenario.spawn_mcvs.unwrap_or(true),
         starting_cash: scenario.starting_cash.unwrap_or(5000),
+        agent_starting_cash: scenario.agent_starting_cash,
+        enemy_starting_cash: scenario.enemy_starting_cash,
         enemy_bot: scenario.enemy_bot,
         scheduled_events: scenario.scheduled_events,
         reveal_map: scenario.reveal_map.unwrap_or(false),
@@ -734,6 +747,14 @@ struct ScenarioYaml {
     /// Optional scripted opponent behaviour for the enemy side
     /// (`enemy: {bot: hunt|rusher|patrol|turtle}`).
     enemy_bot: Option<String>,
+    /// Optional per-player starting-cash override parsed from
+    /// `agent: {cash: N}` inside the agent block. When None, the agent
+    /// slot inherits the scenario-level `starting_cash`.
+    agent_starting_cash: Option<i32>,
+    /// Optional per-player starting-cash override parsed from
+    /// `enemy: {cash: M}` inside the enemy block. See
+    /// `agent_starting_cash`.
+    enemy_starting_cash: Option<i32>,
     /// Parsed `scheduled_events:` block (empty when omitted).
     scheduled_events: Vec<ScheduledEvent>,
     /// Top-level `reveal_map:` flag. None ⇒ default (false ⇒ normal fog
@@ -809,15 +830,17 @@ fn parse_scenario_yaml(text: &str) -> io::Result<ScenarioYaml> {
                     continue;
                 }
                 "agent" => {
-                    let (faction, _bot, ni) = read_block_faction(&lines, i + 1);
+                    let (faction, _bot, cash, ni) = read_block_faction(&lines, i + 1);
                     out.agent_faction = faction;
+                    out.agent_starting_cash = cash;
                     i = ni;
                     continue;
                 }
                 "enemy" => {
-                    let (faction, bot, ni) = read_block_faction(&lines, i + 1);
+                    let (faction, bot, cash, ni) = read_block_faction(&lines, i + 1);
                     out.enemy_faction = faction;
                     out.enemy_bot = bot;
+                    out.enemy_starting_cash = cash;
                     i = ni;
                     continue;
                 }
@@ -977,10 +1000,14 @@ fn leading_spaces(line: &str) -> usize {
 
 /// Inside a `agent:` or `enemy:` top-level block, read indented `faction:` line.
 /// Returns `(faction_string, next_line_index)`.
-fn read_block_faction(lines: &[&str], start: usize) -> (String, Option<String>, usize) {
+fn read_block_faction(
+    lines: &[&str],
+    start: usize,
+) -> (String, Option<String>, Option<i32>, usize) {
     let mut i = start;
     let mut faction = String::new();
     let mut bot: Option<String> = None;
+    let mut cash: Option<i32> = None;
     while i < lines.len() {
         let raw = lines[i];
         let trimmed = strip_yaml_comment(raw).trim_end();
@@ -1002,12 +1029,25 @@ fn read_block_faction(lines: &[&str], start: usize) -> (String, Option<String>, 
                         bot = Some(v);
                     }
                 }
+                // Per-player starting-cash override (`agent: {cash: N}`
+                // / `enemy: {cash: M}`). Bench scenarios use this to
+                // seed a thief's target enemy with cash while keeping
+                // the agent's own balance separate.
+                "cash" => {
+                    if let Ok(n) = v
+                        .trim()
+                        .trim_matches(|c: char| c == '"' || c == '\'')
+                        .parse::<i32>()
+                    {
+                        cash = Some(n);
+                    }
+                }
                 _ => {}
             }
         }
         i += 1;
     }
-    (faction, bot, i)
+    (faction, bot, cash, i)
 }
 
 /// Parse the `actors:` list. Each list item starts with `- type: NAME` at

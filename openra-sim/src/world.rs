@@ -29,12 +29,19 @@ pub struct LobbyInfo {
     pub occupied_slots: Vec<SlotInfo>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SlotInfo {
     pub player_reference: String,
     pub faction: String,
     /// Whether this slot is controlled by an AI bot.
     pub is_bot: bool,
+    /// Per-slot starting-cash override. When `Some(n)`, this slot's
+    /// player actor is initialised with `n` credits; when `None`, the
+    /// slot falls back to `LobbyInfo::starting_cash`. Plumbed in by the
+    /// scenario YAML's `agent: {cash: N}` / `enemy: {cash: M}` blocks
+    /// so e.g. a "thief steals from enemy" scenario can give the agent
+    /// 0 cash and the enemy 2000.
+    pub starting_cash: Option<i32>,
 }
 
 impl Default for LobbyInfo {
@@ -1767,9 +1774,14 @@ impl World {
         // Enable production queues if this is a production building
         self.enable_production_queues(owner_player_id, building_type);
 
-        // Refinery auto-spawns a harvester (like OpenRA)
+        // Refinery auto-spawns a harvester (like OpenRA).
+        // Use the NEW proc's footprint as the spawn seed so that a 2nd
+        // refinery placed far from the 1st gets its own harvester
+        // adjacent to itself, not piled onto the 1st proc (the old
+        // `find_spawn_location` sorted candidates by id and so always
+        // picked the lowest-id proc).
         if building_type == "proc" {
-            self.spawn_unit("harv", owner_player_id);
+            self.spawn_unit_near_building("harv", owner_player_id, building_id);
         }
 
         eprintln!("PLACE: {} at ({},{}) id={} footprint={}x{} power={}",
@@ -2421,7 +2433,14 @@ impl World {
                 .unwrap_or(false);
         if stale {
             if let Some(pid) = owner {
-                if let Some(rid) = self.find_refinery(pid) {
+                // Prefer path-shortest refinery from the harv's current
+                // cell so that a per-base supply chain stays attached
+                // to its OWN refinery rather than re-snapping to the
+                // first one in id order.
+                let resolved = from
+                    .and_then(|fc| self.find_refinery_from(pid, fc))
+                    .or_else(|| self.find_refinery(pid));
+                if let Some(rid) = resolved {
                     refinery_id = rid;
                     if let Some(actor) = self.actors.get_mut(&harvester_id) {
                         if let Some(Activity::Harvest { refinery_id: r, .. }) = &mut actor.activity {
@@ -4832,32 +4851,98 @@ impl World {
 
     /// Spawn a unit near the owner's production building (WEAP for vehicles, TENT/BARR for infantry).
     fn spawn_unit(&mut self, unit_type: &str, owner_player_id: u32) {
-        // Find a building owned by this player to spawn near
         let spawn_loc = self.find_spawn_location(owner_player_id, unit_type);
         let (x, y) = match spawn_loc {
             Some(loc) => loc,
-            None => return, // No production building found
+            None => return,
         };
+        self.spawn_unit_at(unit_type, owner_player_id, x, y);
+    }
 
+    /// Spawn a unit adjacent to a SPECIFIC building actor (rather than
+    /// the lowest-id production building of the matching category).
+    /// Used by `order_place_building` for the proc auto-harv so a 2nd
+    /// refinery placed far from the 1st gets its OWN harvester at its
+    /// own footprint, not at the 1st proc's footprint (which is the
+    /// historical footgun fixed here).
+    fn spawn_unit_near_building(
+        &mut self,
+        unit_type: &str,
+        owner_player_id: u32,
+        building_id: u32,
+    ) {
+        let (bx, by, btype) = match self.actors.get(&building_id) {
+            Some(a) => match (a.location, a.actor_type.as_deref()) {
+                (Some((x, y)), Some(t)) => (x, y, t.to_string()),
+                _ => {
+                    // Fall back to the legacy lowest-id behaviour.
+                    self.spawn_unit(unit_type, owner_player_id);
+                    return;
+                }
+            },
+            None => {
+                self.spawn_unit(unit_type, owner_player_id);
+                return;
+            }
+        };
+        let (fw, fh) = self
+            .rules
+            .actor(&btype)
+            .map(|s| s.footprint)
+            .unwrap_or((2, 2));
+        // Same scan as `find_spawn_location` but anchored on this
+        // specific building's footprint.
+        let mut spawn_loc: Option<(i32, i32)> = None;
+        'outer: for dy in -1..=fh {
+            for dx in -1..=fw {
+                let sx = bx + dx;
+                let sy = by + dy;
+                if self.terrain.is_passable(sx, sy) {
+                    spawn_loc = Some((sx, sy));
+                    break 'outer;
+                }
+            }
+        }
+        let (x, y) = match spawn_loc {
+            Some(loc) => loc,
+            None => return,
+        };
+        self.spawn_unit_at(unit_type, owner_player_id, x, y);
+    }
+
+    /// Shared spawn worker used by `spawn_unit` and
+    /// `spawn_unit_near_building`. Creates the actor at `(x, y)` and
+    /// wires harvest activity / rally point / occupancy.
+    fn spawn_unit_at(
+        &mut self,
+        unit_type: &str,
+        owner_player_id: u32,
+        x: i32,
+        y: i32,
+    ) {
         let unit_id = self.next_actor_id;
         self.next_actor_id += 1;
 
         let (kind, speed, hp) = self.rules.actor(unit_type)
             .map(|s| (s.kind, s.speed, s.hp))
             .unwrap_or((ActorKind::Vehicle, 71, 100000));
-        let facing = 512; // Default facing south
+        let facing = 512;
         let cell = CPos::new(x, y);
         let center = center_of_cell(x, y);
 
-        // Harvesters auto-start harvesting
+        // Harvesters auto-start harvesting; pick the closest refinery
+        // by path distance from the harv's own cell (the spawn cell).
         let activity = if unit_type == "harv" {
-            let refinery_id = self.find_refinery(owner_player_id).unwrap_or(0);
+            let refinery_id = self
+                .find_refinery_from(owner_player_id, (x, y))
+                .or_else(|| self.find_refinery(owner_player_id))
+                .unwrap_or(0);
             Some(Activity::Harvest {
                 state: HarvestState::FindingOre,
                 refinery_id,
                 carried_ore: 0,
                 carried_gems: 0,
-                capacity: 20, // RA HARV capacity
+                capacity: 20,
                 path: Vec::new(),
                 path_index: 0,
                 speed,
@@ -4886,14 +4971,12 @@ impl World {
             kills: 0, rank: 0,
         };
         self.actors.insert(unit_id, actor);
-        // Aircraft don't claim ground cells (see Move tick / insert_test_actor).
         if kind != ActorKind::Aircraft {
             self.terrain.set_occupant(x, y, unit_id);
         }
         eprintln!("SPAWN: {} id={} at ({},{}) owner={} speed={} hp={}",
             unit_type, unit_id, x, y, owner_player_id, speed, hp);
 
-        // Auto-move to rally point if set on the production building
         if unit_type != "harv" {
             let rally = self.find_rally_point_for_unit(owner_player_id, unit_type);
             if let Some(target) = rally {
@@ -5006,6 +5089,66 @@ impl World {
             }
         }
         None
+    }
+
+    /// Pick the owner's refinery (`proc`) whose adjacent cell is
+    /// nearest by REAL PATH from `from_cell`. Falls back to the lowest
+    /// reachable / Chebyshev-closest one when no path exists.
+    ///
+    /// Historical footgun: the original `find_refinery` returned the
+    /// lowest-id proc unconditionally, which meant every harvester
+    /// (including ones spawned at a new far-away proc) trudged back to
+    /// the original refinery — defeating the point of expansion. This
+    /// helper is consulted at:
+    ///   * harv spawn (`spawn_unit_at`)
+    ///   * stale-id re-resolve in `harvester_start_delivery`
+    fn find_refinery_from(
+        &self,
+        owner_player_id: u32,
+        from_cell: (i32, i32),
+    ) -> Option<u32> {
+        let mut candidates: Vec<(u32, (i32, i32))> = Vec::new();
+        for actor in self.actors.values() {
+            if actor.owner_id == Some(owner_player_id)
+                && actor.kind == ActorKind::Building
+                && actor.actor_type.as_deref() == Some("proc")
+            {
+                if let Some(loc) = actor.location {
+                    candidates.push((actor.id, loc));
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+        // Try real pathfind first (most accurate; respects walls).
+        let mut best: Option<(usize, u32)> = None; // (path_len, id)
+        for &(rid, (bx, by)) in &candidates {
+            if let Some(target) = self.find_adjacent_cell(bx, by) {
+                if let Some(path) =
+                    pathfinder::find_path(&self.terrain, from_cell, target, None)
+                {
+                    let len = path.len();
+                    let take = match best {
+                        None => true,
+                        Some((bl, bid)) => len < bl || (len == bl && rid < bid),
+                    };
+                    if take {
+                        best = Some((len, rid));
+                    }
+                }
+            }
+        }
+        if let Some((_, rid)) = best {
+            return Some(rid);
+        }
+        // No path to any proc — fall back to Chebyshev-nearest, then id.
+        candidates.sort_by_key(|(rid, (bx, by))| {
+            let dx = (bx - from_cell.0).abs();
+            let dy = (by - from_cell.1).abs();
+            (dx.max(dy), *rid)
+        });
+        candidates.first().map(|(rid, _)| *rid)
     }
 
     /// Compute all virtual prerequisites a player currently has based on owned buildings and faction.
@@ -6090,12 +6233,16 @@ pub fn build_world(
     for slot in &lobby.occupied_slots {
         let id = next_id;
         player_factions.insert(id, slot.faction.clone());
+        // Per-slot starting-cash override (from scenario YAML
+        // `agent: {cash: N}` / `enemy: {cash: M}`); falls back to
+        // the lobby-wide default when the slot leaves it unset.
+        let slot_cash = slot.starting_cash.unwrap_or(lobby.starting_cash);
         actors.insert(id, Actor {
             id,
             kind: ActorKind::Player,
             owner_id: None,
             location: None,
-            traits: build_player_traits(lobby.starting_cash),
+            traits: build_player_traits(slot_cash),
             activity: None,
             actor_type: None,
             kills: 0,
@@ -6419,8 +6566,8 @@ mod tests {
             starting_cash: 5000,
             allow_spectators: true,
             occupied_slots: vec![
-                SlotInfo { player_reference: "P1".into(), faction: "allies".into(), is_bot: false },
-                SlotInfo { player_reference: "P2".into(), faction: "soviet".into(), is_bot: false },
+                SlotInfo { player_reference: "P1".into(), faction: "allies".into(), is_bot: false, starting_cash: None },
+                SlotInfo { player_reference: "P2".into(), faction: "soviet".into(), is_bot: false, starting_cash: None },
             ],
         };
         let mut world = build_world(&map, 0, &lobby, None, 0, false);

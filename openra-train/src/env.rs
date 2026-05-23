@@ -871,11 +871,21 @@ impl Env {
                     player_reference: "Multi0".into(),
                     faction: self.map_def.agent_faction.clone(),
                     is_bot: false,
+                    // Per-player starting-cash from
+                    // `agent: {cash: N}`; falls back to lobby
+                    // `starting_cash` when omitted.
+                    starting_cash: self.map_def.agent_starting_cash,
                 },
                 SlotInfo {
                     player_reference: "Multi1".into(),
                     faction: self.map_def.enemy_faction.clone(),
                     is_bot: false,
+                    // Per-player starting-cash from
+                    // `enemy: {cash: M}`; falls back to lobby
+                    // `starting_cash` when omitted. This is what makes
+                    // e.g. `spec-thief-steal-cash` load-bearing — the
+                    // enemy must hold credits the thief can steal.
+                    starting_cash: self.map_def.enemy_starting_cash,
                 },
             ],
         };
@@ -2517,6 +2527,8 @@ pub fn build_test_env_with_no_enemies(map_size: (i32, i32), seed: u64) -> Env {
         }],
         spawn_mcvs: true,
         starting_cash: 5000,
+        agent_starting_cash: None,
+        enemy_starting_cash: None,
         enemy_bot: None,
         scheduled_events: Vec::new(),
         reveal_map: false,
@@ -2758,6 +2770,19 @@ mod py {
         #[getter]
         fn enemy_player_id(&self) -> u32 {
             self.inner.enemy_player_id()
+        }
+
+        /// Read a player's current cash balance. Bench tests use this
+        /// to cross-check the per-player starting-cash plumbing
+        /// (`agent: {cash:}` / `enemy: {cash:}`): the agent's own
+        /// cash already surfaces in the observation, but the enemy
+        /// player's cash isn't exposed elsewhere on the Python side.
+        /// Returns 0 for unknown ids (mirrors `World::player_cash`).
+        fn player_cash(&self, player_id: u32) -> i32 {
+            self.inner
+                .world()
+                .map(|w| w.player_cash(player_id))
+                .unwrap_or(0)
         }
 
         #[getter]

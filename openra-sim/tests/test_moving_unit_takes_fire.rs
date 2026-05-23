@@ -86,8 +86,8 @@ fn arena() -> Option<World> {
         starting_cash: 0,
         allow_spectators: true,
         occupied_slots: vec![
-            SlotInfo { player_reference: "P1".into(), faction: "allies".into(), is_bot: false },
-            SlotInfo { player_reference: "P2".into(), faction: "soviet".into(), is_bot: false },
+            SlotInfo { player_reference: "P1".into(), faction: "allies".into(), is_bot: false, starting_cash: None },
+            SlotInfo { player_reference: "P2".into(), faction: "soviet".into(), is_bot: false, starting_cash: None },
         ],
     };
     let mut w = world::build_world(&map, 0, &lobby, Some(rules), 0, false);

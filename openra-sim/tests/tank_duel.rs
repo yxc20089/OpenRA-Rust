@@ -96,11 +96,13 @@ fn build_arena_with_real_rules(seed: i32) -> World {
                 player_reference: "Multi0".into(),
                 faction: "allies".into(),
                 is_bot: false,
+                starting_cash: None,
             },
             SlotInfo {
                 player_reference: "Multi1".into(),
                 faction: "soviet".into(),
                 is_bot: false,
+                starting_cash: None,
             },
         ],
     };

@@ -80,8 +80,8 @@ fn build_arena(seed: i32) -> World {
         starting_cash: 0,
         allow_spectators: false,
         occupied_slots: vec![
-            SlotInfo { player_reference: "P1".into(), faction: "allies".into(), is_bot: false },
-            SlotInfo { player_reference: "P2".into(), faction: "soviet".into(), is_bot: false },
+            SlotInfo { player_reference: "P1".into(), faction: "allies".into(), is_bot: false, starting_cash: None },
+            SlotInfo { player_reference: "P2".into(), faction: "soviet".into(), is_bot: false, starting_cash: None },
         ],
     };
     // Use defaults so we don't depend on the vendor dir.
