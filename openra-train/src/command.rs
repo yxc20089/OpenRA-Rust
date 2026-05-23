@@ -75,6 +75,11 @@ pub enum Command {
     /// `unit_ids` holds engineer id(s); `target_id` is the enemy
     /// building id.
     CaptureActor { unit_ids: Vec<String>, target_id: String },
+    /// Walk an infiltrator (spy / thief) into an enemy building. On
+    /// adjacency the engine applies the type-dependent effect — spy
+    /// reveals the target-owner's structures; thief drains some
+    /// enemy cash — and consumes the infiltrator.
+    Infiltrate { unit_ids: Vec<String>, target_id: String },
 }
 
 /// Python-facing shim around `Command`.
@@ -206,6 +211,11 @@ impl PyCommand {
     #[staticmethod]
     fn capture_actor(unit_ids: Vec<String>, target_id: String) -> Self {
         Self { inner: Command::CaptureActor { unit_ids, target_id } }
+    }
+
+    #[staticmethod]
+    fn infiltrate(unit_ids: Vec<String>, target_id: String) -> Self {
+        Self { inner: Command::Infiltrate { unit_ids, target_id } }
     }
 
     fn __repr__(&self) -> String {
