@@ -1306,6 +1306,55 @@ impl Env {
                         extra_data: None,
                     });
                 }
+                Command::C4Detonate { unit_ids, target_id } => {
+                    // Engine re-validates (subject must be `tanya`,
+                    // target must be an enemy Building), but we filter
+                    // here too so warnings surface early and don't get
+                    // silently dropped.
+                    let target_aid = match parse_actor_id(target_id) {
+                        Some(v) => v,
+                        None => {
+                            self.last_warnings
+                                .push(format!("invalid target_id {target_id:?}"));
+                            continue;
+                        }
+                    };
+                    // Target must be a building (alive); ownership check
+                    // (must be enemy) happens at the engine layer where
+                    // the issuer's actual owner id is in scope.
+                    let target_is_building = world
+                        .actor(target_aid)
+                        .map(|a| a.kind == openra_sim::actor::ActorKind::Building)
+                        .unwrap_or(false);
+                    if !target_is_building {
+                        self.last_warnings.push(format!(
+                            "C4Detonate target {target_aid} is not a building; dropped"
+                        ));
+                        continue;
+                    }
+                    for id in unit_ids {
+                        if let Some(aid) =
+                            resolve_owned(id, &issuer_owned, &mut self.last_warnings)
+                        {
+                            let is_tanya = world
+                                .actor(aid)
+                                .and_then(|a| a.actor_type.as_deref())
+                                == Some("tanya");
+                            if !is_tanya {
+                                self.last_warnings.push(format!(
+                                    "C4Detonate subject {aid} is not a tanya; dropped"
+                                ));
+                                continue;
+                            }
+                            orders.push(GameOrder {
+                                order_string: "C4Detonate".into(),
+                                subject_id: Some(aid),
+                                target_string: None,
+                                extra_data: Some(target_aid),
+                            });
+                        }
+                    }
+                }
             }
         }
         orders

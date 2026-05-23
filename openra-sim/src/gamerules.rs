@@ -307,6 +307,29 @@ impl GameRules {
         actor!("dog", ActorKind::Infantry, 20000, 85, 200, 0, 1, 1, false);
         actor!("spy", ActorKind::Infantry, 25000, 56, 500, 0, 1, 1, false);
         actor!("thf", ActorKind::Infantry, 50000, 56, 500, 0, 1, 1, false);
+        // Tanya — Allied commando hero. Single high-HP, fast-moving
+        // infantry with a strong anti-infantry sidearm. HP ~3x e1,
+        // speed ~1.5x e1, damage ~5x M1Carbine, faster reload. The
+        // weapon (`TanyaPistol`) is registered below in the weapons
+        // table; her actor entry pre-binds it so the auto-engage /
+        // best_weapon_against paths resolve correctly when she is
+        // placed via `insert_test_actor` (no vendor YAML needed).
+        actors.insert("tanya".to_string(), ActorStats {
+            kind: ActorKind::Infantry,
+            hp: 150000,
+            speed: 64,
+            cost: 1200,
+            power: 0,
+            footprint: (1, 1),
+            armor_type: ArmorType::None,
+            is_building: false,
+            must_be_destroyed: false,
+            prerequisites: vec!["tent".to_string(), "atek".to_string()],
+            weapons: vec!["TanyaPistol".to_string()],
+            sight_range: 6,
+            provides_prerequisites: Vec::new(),
+            build_palette_order: 9999,
+        });
 
         // Vehicles
         actor!("1tnk", ActorKind::Vehicle, 160000, 113, 700, 0, 1, 1, false);
@@ -426,6 +449,21 @@ impl GameRules {
             damage: 100,
             range: 5 * 1024,
             reload_delay: 1,
+            burst: 1,
+            versus: BTreeMap::new(),
+            projectile_speed: 0,
+            splash_radius: 0,
+        });
+
+        // Tanya's sidearm — strong, fast-firing, single-target anti-
+        // infantry. Damage 5000 (5x M1Carbine), reload_delay 10 (2x
+        // faster than M1Carbine's 20), range 5 cells, instant-hit. A
+        // single tanya outpaces the burst output of multiple e1's at
+        // close range, which is the load-bearing "hero" property.
+        weapons.insert("TanyaPistol".to_string(), WeaponStats {
+            damage: 5000,
+            range: 5 * 1024,
+            reload_delay: 10,
             burst: 1,
             versus: BTreeMap::new(),
             projectile_speed: 0,

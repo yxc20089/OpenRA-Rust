@@ -69,6 +69,18 @@ pub enum Activity {
         transport_id: u32,
         speed: i32,
     },
+    /// Tanya's C4 commando ability — walk to an enemy building, plant
+    /// C4 on adjacency, instantly destroying it. The planter (Tanya)
+    /// survives the detonation (RA canon: Tanya plants, runs away,
+    /// building explodes; MVP simplifies "runs away" to "stays put,
+    /// unharmed"). Subject/target validation (subject is `tanya`,
+    /// target is an enemy Building) happens at order issue time;
+    /// once the activity is on the actor the tick handler only re-
+    /// checks that the target still exists.
+    C4Plant {
+        target_id: u32,
+        speed: i32,
+    },
     /// Harvest resources: find ore → move → harvest → deliver → repeat.
     Harvest {
         state: HarvestState,

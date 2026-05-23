@@ -62,6 +62,13 @@ pub enum Command {
     Surrender,
     /// No-op; the env still ticks N frames.
     Observe,
+    /// Tanya's C4 commando ability: the named tanya unit(s) walk to
+    /// the target ENEMY BUILDING and instantly destroy it on
+    /// adjacency. Subject MUST be a `tanya` actor; target MUST be an
+    /// enemy building. Non-conforming subjects / targets are dropped
+    /// (with a warning). Appended at the end of the enum to minimise
+    /// merge conflicts with concurrent engine work.
+    C4Detonate { unit_ids: Vec<String>, target_id: String },
 }
 
 /// Python-facing shim around `Command`.
@@ -179,6 +186,11 @@ impl PyCommand {
     #[staticmethod]
     fn patrol(unit_ids: Vec<String>) -> Self {
         Self { inner: Command::Patrol { unit_ids } }
+    }
+
+    #[staticmethod]
+    fn c4_detonate(unit_ids: Vec<String>, target_id: String) -> Self {
+        Self { inner: Command::C4Detonate { unit_ids, target_id } }
     }
 
     fn __repr__(&self) -> String {
