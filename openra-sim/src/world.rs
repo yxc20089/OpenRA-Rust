@@ -593,6 +593,7 @@ impl World {
                 Some(Activity::Attack { .. }) => "attacking",
                 Some(Activity::Guard { .. }) => "guarding",
                 Some(Activity::EnterTransport { .. }) => "entering",
+                Some(Activity::C4Plant { .. }) => "c4-planting",
                 Some(Activity::Harvest { .. }) => "harvesting",
             }.to_string();
             let (facing, cx, cy) = actor.traits.iter().find_map(|t| {
@@ -908,6 +909,13 @@ impl World {
                     (order.subject_id, order.extra_data)
                 {
                     self.order_enter_transport(subject_id, target_actor_id);
+                }
+            }
+            "C4Detonate" => {
+                if let (Some(subject_id), Some(target_actor_id)) =
+                    (order.subject_id, order.extra_data)
+                {
+                    self.order_c4_detonate(subject_id, target_actor_id);
                 }
             }
             "Unload" => {
@@ -1342,6 +1350,50 @@ impl World {
         if let Some(actor) = self.actors.get_mut(&actor_id) {
             actor.activity = Some(Activity::EnterTransport {
                 transport_id,
+                speed,
+            });
+        }
+    }
+
+    /// Tanya's C4 commando ability. The subject MUST be a `tanya`
+    /// actor; the target MUST be an enemy BUILDING. Non-conforming
+    /// orders are dropped silently (a stale-state agent should not
+    /// be able to misuse C4 — e.g. point a rifleman at the order,
+    /// or aim it at a friendly building). On success, Tanya is given
+    /// an `Activity::C4Plant` that walks her toward the building and
+    /// detonates on adjacency in the per-tick handler.
+    fn order_c4_detonate(&mut self, actor_id: u32, target_id: u32) {
+        if actor_id == target_id {
+            return;
+        }
+        // Subject must be a tanya actor (alive).
+        let subject_owner = match self.actors.get(&actor_id) {
+            Some(a) => {
+                if a.actor_type.as_deref() != Some("tanya") {
+                    return;
+                }
+                a.owner_id
+            }
+            None => return,
+        };
+        // Target must exist, be a building, and be enemy-owned.
+        let target_owner = match self.actors.get(&target_id) {
+            Some(a) => {
+                if a.kind != ActorKind::Building {
+                    return;
+                }
+                a.owner_id
+            }
+            None => return,
+        };
+        match (subject_owner, target_owner) {
+            (Some(so), Some(to)) if so != to => {}
+            _ => return, // friendly / unowned target rejected
+        }
+        let speed = self.actor_speed(actor_id);
+        if let Some(actor) = self.actors.get_mut(&actor_id) {
+            actor.activity = Some(Activity::C4Plant {
+                target_id,
                 speed,
             });
         }
@@ -2432,6 +2484,163 @@ impl World {
                     }
                     passenger.activity = None;
                     self.cargo.entry(tid).or_default().push(passenger);
+                }
+            }
+        }
+
+        // ── C4Plant: walk Tanya to the target building, then detonate ─
+        // Mirrors EnterTransport's pathing: step toward the building's
+        // footprint each tick; once Chebyshev-adjacent to any footprint
+        // cell, instantly destroy the building (tanya unharmed). If the
+        // target has died/disappeared en route the activity drops to
+        // idle. Validation (subject is tanya, target is an enemy
+        // building) was enforced at order issue time; we re-check the
+        // target still exists & is a building here in case it died
+        // mid-walk.
+        {
+            let mut step_moves: Vec<(u32, (i32, i32), (i32, i32))> = Vec::new();
+            let mut detonate: Vec<(u32, u32)> = Vec::new(); // (tanya, target)
+            let mut drop_idle: Vec<u32> = Vec::new();
+            for (id, actor) in &self.actors {
+                let target_id = match actor.activity {
+                    Some(Activity::C4Plant { target_id, .. }) => target_id,
+                    _ => continue,
+                };
+                let from = match actor.location {
+                    Some(l) => l,
+                    None => continue,
+                };
+                let (tloc, fw, fh) = match self.actors.get(&target_id) {
+                    Some(t) if t.kind == ActorKind::Building => match t.location {
+                        Some(l) => {
+                            let (fw, fh) = t
+                                .actor_type
+                                .as_deref()
+                                .and_then(|at| self.rules.actor(at))
+                                .map(|s| s.footprint)
+                                .unwrap_or((1, 1));
+                            (l, fw, fh)
+                        }
+                        None => {
+                            drop_idle.push(*id);
+                            continue;
+                        }
+                    },
+                    _ => {
+                        // Target gone or no longer a building — abort.
+                        drop_idle.push(*id);
+                        continue;
+                    }
+                };
+                // Chebyshev distance from `from` to nearest footprint cell.
+                let clamp_x = from.0.max(tloc.0).min(tloc.0 + fw - 1);
+                let clamp_y = from.1.max(tloc.1).min(tloc.1 + fh - 1);
+                let nearest = (clamp_x, clamp_y);
+                let gap = (from.0 - nearest.0).abs().max((from.1 - nearest.1).abs());
+                if gap <= 1 {
+                    detonate.push((*id, target_id));
+                } else {
+                    // Aim for a passable cell adjacent to the footprint's
+                    // top-left (matches EnterTransport's approach idiom).
+                    let dest = self
+                        .find_adjacent_passable(tloc, *id)
+                        .unwrap_or(tloc);
+                    if let Some(path) =
+                        pathfinder::find_path(&self.terrain, from, dest, Some(*id))
+                    {
+                        if path.len() > 1 {
+                            step_moves.push((*id, from, path[1]));
+                        }
+                    }
+                }
+            }
+            for id in drop_idle {
+                if let Some(a) = self.actors.get_mut(&id) {
+                    a.activity = None;
+                }
+            }
+            for (id, from, next_cell) in step_moves {
+                let occ = self.terrain.occupant(next_cell.0, next_cell.1);
+                if occ == 0 || occ == id {
+                    self.terrain.clear_occupant(from.0, from.1);
+                    self.terrain.set_occupant(next_cell.0, next_cell.1, id);
+                    if let Some(actor) = self.actors.get_mut(&id) {
+                        actor.location = Some(next_cell);
+                        for t in &mut actor.traits {
+                            if let TraitState::Mobile {
+                                center_position,
+                                from_cell,
+                                to_cell,
+                                ..
+                            } = t
+                            {
+                                *center_position =
+                                    center_of_cell(next_cell.0, next_cell.1);
+                                *from_cell = CPos::new(next_cell.0, next_cell.1);
+                                *to_cell = CPos::new(next_cell.0, next_cell.1);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            // Detonation: instantly kill the target building. Credit the
+            // kill to Tanya / her owner so kill_per_player stays
+            // consistent with the standard combat path. Clear the
+            // footprint (restoring passability) the same way regular
+            // building-death cleanup does. Tanya goes idle, fully alive.
+            let mut dead_ids: Vec<u32> = Vec::new();
+            for (tanya_id, tgt_id) in detonate {
+                // Drop tanya's activity first (she survives, planted &
+                // walks away).
+                if let Some(a) = self.actors.get_mut(&tanya_id) {
+                    a.activity = None;
+                }
+                // Zero the target's HP for the snapshot, then remove it.
+                let owner_for_kill_credit = self
+                    .actors
+                    .get(&tanya_id)
+                    .and_then(|a| a.owner_id);
+                if let Some(target) = self.actors.get_mut(&tgt_id) {
+                    for t in &mut target.traits {
+                        if let TraitState::Health { hp } = t {
+                            *hp = 0;
+                            break;
+                        }
+                    }
+                }
+                if let Some(dead) = self.actors.remove(&tgt_id) {
+                    dead_ids.push(tgt_id);
+                    if dead.kind == ActorKind::Building {
+                        if let Some(loc) = dead.location {
+                            let (fw, fh) = dead
+                                .actor_type
+                                .as_deref()
+                                .and_then(|at| self.rules.actor(at))
+                                .map(|s| s.footprint)
+                                .unwrap_or((2, 2));
+                            self.terrain.clear_footprint(loc.0, loc.1, fw, fh);
+                        }
+                    } else if let Some(loc) = dead.location {
+                        self.terrain.clear_occupant(loc.0, loc.1);
+                    }
+                    // Credit the kill so reward/units_killed signals reflect it.
+                    if let Some(a) = self.actors.get_mut(&tanya_id) {
+                        a.kills = a.kills.saturating_add(1);
+                    }
+                    if let Some(pid) = owner_for_kill_credit {
+                        *self.kills_per_player.entry(pid).or_insert(0) += 1;
+                    }
+                }
+            }
+            // Clear stale Attack activities aimed at any C4'd building.
+            if !dead_ids.is_empty() {
+                for actor in self.actors.values_mut() {
+                    if let Some(Activity::Attack { target_id, .. }) = actor.activity {
+                        if dead_ids.contains(&target_id) {
+                            actor.activity = None;
+                        }
+                    }
                 }
             }
         }
