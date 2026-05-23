@@ -1,0 +1,121 @@
+# spec-nuke-strike — load-bearing nuclear-strike superweapon.
+#
+# The agent owns one nuclear silo (`mslo`) launcher building from turn 1
+# and starts with enough cash to survive until the missile is charged.
+# The enemy is a tight cluster of 5+ rifle infantry at a fixed centre.
+# A nuke at the cluster cell kills every e1 inside the R=4 Chebyshev
+# radius (the base damage of 500k against an e1's 50k HP is overkill at
+# every cell within the radius — see `superweapon.rs::NUKE_RADIUS_CELLS`
+# / `NUKE_BASE_DAMAGE`).
+#
+# Discrimination (the four script-policy bar):
+#   • stall (only observe): missile charges but is never fired; kill bar
+#     unmet → after_ticks LOSS.
+#   • build-only (queues structures but never fires the silo): same as
+#     stall — the missile sits charged at zero ticks remaining and the
+#     enemy cluster never takes damage → after_ticks LOSS.
+#   • blind-fire (fires the nuke at a wrong cell, e.g. own base or empty
+#     terrain): zero enemy infantry killed → after_ticks LOSS.
+#   • intended nuke-strike: wait the ~100-tick charge window (hardcoded
+#     MVP charge), then `FireSuperweapon { kind: "mslo",
+#     target_cell: (25,25) }` — all 5 e1s die in one shot → WIN.
+#
+# Engine constants used:
+#   • Superweapon charge: 100 ticks (see
+#     `openra-sim/src/superweapon.rs::SuperweaponKind::charge_ticks`).
+#     Trivially reachable inside any reasonable budget.
+#   • Nuke radius: 4 cells Chebyshev distance, base 500_000 damage with
+#     linear falloff to ~100_000 at the edge.
+#   • Iron-Curtain invulnerability ignored here (no incoming damage
+#     against the silo within the budget).
+#
+# Engine guardrails:
+#   • Far persistent enemy `fact` at (38, 38) prevents engine auto-done
+#     when the last e1 falls (the win predicate is units_killed_gte:5,
+#     not full force wipe).
+
+meta:
+  id: spec-nuke-strike
+  title: 'Nuclear Strike — Fire the mslo on the Enemy Cluster'
+  capability: superweapon
+  real_world_meaning: >
+    The agent owns a nuclear missile silo and the only path to victory
+    is to wait for it to charge, then fire on the visible enemy cluster.
+    The capability under test is FIRING a charged superweapon at the
+    correct target cell — every non-fire policy (stall, build-only,
+    blind-fire) loses.
+  benchmark_anchor:
+    - "RA1 / RA2 Nuclear Missile silo"
+    - "TA / SC2 nuke launch sequence"
+  author: openra-bench
+
+base_map: rush-hour-arena
+starting_cash: 5000
+
+base:
+  agent: {faction: soviet, cash: 5000}
+  enemy: {faction: allies, cash: 0, bot_type: ''}
+  tools: [observe, fire_superweapon]
+  planning: true
+  interrupts:
+    enemy_unit_spotted: true
+  termination: {max_ticks: 4000}
+  actors: []
+
+levels:
+  easy:
+    description: >
+      The agent starts with one fully-functional nuclear silo (mslo)
+      at (5, 5). After ~100 ticks the silo is charged. Fire on the
+      enemy cluster at (25, 25) — five rifle infantry (e1) stand
+      stacked there and the nuke's R=4 area kills them all in one shot.
+      Win on units_killed_gte:5 inside 1800 ticks.
+    overrides:
+      actors:
+        # Agent's silo — already complete, will start charging on tick 1.
+        - {type: mslo, owner: agent, position: [5, 5]}
+        # Enemy cluster — 5 rifle infantry stacked tight around (25,25).
+        - {type: e1, owner: enemy, position: [25, 25], stance: 2}
+        - {type: e1, owner: enemy, position: [26, 25], stance: 2}
+        - {type: e1, owner: enemy, position: [25, 26], stance: 2}
+        - {type: e1, owner: enemy, position: [24, 25], stance: 2}
+        - {type: e1, owner: enemy, position: [25, 24], stance: 2}
+        # Far persistent enemy marker — prevents engine auto-done on
+        # last-infantry kill so the win/fail evaluator sees the
+        # terminal frame.
+        - {type: fact, owner: enemy, position: [38, 38]}
+    win_condition:
+      all_of:
+        - {units_killed_gte: 5}
+        - {within_ticks: 1800}
+    fail_condition:
+      any_of:
+        - {after_ticks: 1801}
+    max_turns: 20
+
+  medium:
+    description: >
+      Same as easy but the enemy cluster is denser (8 e1s in a 3×3
+      block centred on (25, 25)) and the kill bar rises to 8 — one
+      nuke still clears the whole 3×3 block (every cell is within
+      R=2 Chebyshev of the centre).
+    overrides:
+      actors:
+        - {type: mslo, owner: agent, position: [5, 5]}
+        - {type: e1, owner: enemy, position: [24, 24], stance: 2}
+        - {type: e1, owner: enemy, position: [25, 24], stance: 2}
+        - {type: e1, owner: enemy, position: [26, 24], stance: 2}
+        - {type: e1, owner: enemy, position: [24, 25], stance: 2}
+        - {type: e1, owner: enemy, position: [25, 25], stance: 2}
+        - {type: e1, owner: enemy, position: [26, 25], stance: 2}
+        - {type: e1, owner: enemy, position: [24, 26], stance: 2}
+        - {type: e1, owner: enemy, position: [25, 26], stance: 2}
+        - {type: fact, owner: enemy, position: [38, 38]}
+    win_condition:
+      all_of:
+        - {units_killed_gte: 8}
+        - {within_ticks: 1800}
+    fail_condition:
+      any_of:
+        - {after_ticks: 1801}
+    max_turns: 20

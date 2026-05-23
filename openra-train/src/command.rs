@@ -80,6 +80,18 @@ pub enum Command {
     /// reveals the target-owner's structures; thief drains some
     /// enemy cash — and consumes the infiltrator.
     Infiltrate { unit_ids: Vec<String>, target_id: String },
+    /// Fire one of the three superweapons (`mslo` nuke / `iron` iron
+    /// curtain / `pdox` chronosphere). The handler validates that the
+    /// agent owns a launcher building of the matching kind and that the
+    /// weapon is fully charged; otherwise the order is silently dropped
+    /// with a warning. `target_cell` is required for the nuke and the
+    /// chronosphere (destination); `target_id` (a friendly actor) is
+    /// required for the iron curtain and chronosphere.
+    FireSuperweapon {
+        kind: String,
+        target_cell: Option<(i32, i32)>,
+        target_id: Option<String>,
+    },
 }
 
 /// Python-facing shim around `Command`.
@@ -216,6 +228,17 @@ impl PyCommand {
     #[staticmethod]
     fn infiltrate(unit_ids: Vec<String>, target_id: String) -> Self {
         Self { inner: Command::Infiltrate { unit_ids, target_id } }
+    }
+
+    /// Fire a superweapon (`mslo` / `iron` / `pdox`).
+    #[staticmethod]
+    #[pyo3(signature = (kind, target_cell=None, target_id=None))]
+    fn fire_superweapon(
+        kind: String,
+        target_cell: Option<(i32, i32)>,
+        target_id: Option<String>,
+    ) -> Self {
+        Self { inner: Command::FireSuperweapon { kind, target_cell, target_id } }
     }
 
     fn __repr__(&self) -> String {

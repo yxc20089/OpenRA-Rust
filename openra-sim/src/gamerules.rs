@@ -293,6 +293,13 @@ impl GameRules {
         actor!("hbox", ActorKind::Building, 40000, 0, 600, 0, 1, 1, true);
         actor!("gun", ActorKind::Building, 40000, 0, 600, 0, 1, 1, true);
         actor!("ftur", ActorKind::Building, 40000, 0, 600, 0, 1, 1, true);
+        // Superweapon launchers. Each is a 2×2 building with high HP /
+        // high cost / heavy power draw, mirroring the C# RA balance.
+        // The actual superweapon effect / charge state lives in
+        // `superweapon.rs` and is dispatched from `world.rs::fire_superweapon`.
+        actor!("mslo", ActorKind::Building, 100000, 0, 5000, -200, 2, 2, true); // Nuclear Missile Silo
+        actor!("iron", ActorKind::Building, 100000, 0, 2800, -200, 2, 2, true); // Iron Curtain
+        actor!("pdox", ActorKind::Building, 100000, 0, 2800, -200, 2, 2, true); // Chronosphere
 
         // Infantry
         actor!("e1", ActorKind::Infantry, 50000, 43, 100, 0, 1, 1, false);
@@ -433,7 +440,7 @@ impl GameRules {
             ];
         }
         // Other buildings provide themselves
-        for bname in &["proc","dome","fix","hpad","afld","spen","syrd","atek","stek","sam","agun","gap","tsla","pbox","hbox","gun","ftur"] {
+        for bname in &["proc","dome","fix","hpad","afld","spen","syrd","atek","stek","sam","agun","gap","tsla","pbox","hbox","gun","ftur","mslo","iron","pdox"] {
             if let Some(a) = actors.get_mut(*bname) {
                 if a.provides_prerequisites.is_empty() {
                     a.provides_prerequisites = vec![ProvidesPrereq { factions: vec![], prerequisite: bname.to_string(), requires_prerequisites: vec![] }];
