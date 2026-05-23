@@ -594,6 +594,7 @@ impl World {
                 Some(Activity::Guard { .. }) => "guarding",
                 Some(Activity::EnterTransport { .. }) => "entering",
                 Some(Activity::C4Plant { .. }) => "c4-planting",
+                Some(Activity::Capture { .. }) => "capturing",
                 Some(Activity::Harvest { .. }) => "harvesting",
             }.to_string();
             let (facing, cx, cy) = actor.traits.iter().find_map(|t| {
@@ -916,6 +917,13 @@ impl World {
                     (order.subject_id, order.extra_data)
                 {
                     self.order_c4_detonate(subject_id, target_actor_id);
+                }
+            }
+            "CaptureActor" => {
+                if let (Some(subject_id), Some(target_actor_id)) =
+                    (order.subject_id, order.extra_data)
+                {
+                    self.order_capture_actor(subject_id, target_actor_id);
                 }
             }
             "Unload" => {
@@ -1393,6 +1401,44 @@ impl World {
         let speed = self.actor_speed(actor_id);
         if let Some(actor) = self.actors.get_mut(&actor_id) {
             actor.activity = Some(Activity::C4Plant {
+                target_id,
+                speed,
+            });
+        }
+    }
+
+    /// Order an engineer (`e6`) to walk to an ENEMY building and
+    /// capture it (C# `Captures` / `CapturesTransform` — pragmatic
+    /// subset: instant on-arrival ownership transfer, capturer is
+    /// consumed). Validated:
+    ///   • subject must be alive infantry of type `e6` (engineer);
+    ///   • target must be alive Building owned by another player
+    ///     (skip same-owner / world-owned / non-building targets).
+    /// Same-owner captures are no-ops; the engineer keeps its activity.
+    fn order_capture_actor(&mut self, actor_id: u32, target_id: u32) {
+        if actor_id == target_id {
+            return;
+        }
+        // Capturer must be an alive engineer (infantry, actor_type "e6").
+        let capturer_owner = match self.actors.get(&actor_id) {
+            Some(a) if a.kind == ActorKind::Infantry
+                && a.actor_type.as_deref() == Some("e6") => a.owner_id,
+            _ => return,
+        };
+        // Target must be an alive building owned by a DIFFERENT player.
+        let target_owner = match self.actors.get(&target_id) {
+            Some(t) if t.kind == ActorKind::Building => t.owner_id,
+            _ => return,
+        };
+        if target_owner.is_none() || capturer_owner.is_none() {
+            return;
+        }
+        if target_owner == capturer_owner {
+            return;
+        }
+        let speed = self.actor_speed(actor_id);
+        if let Some(actor) = self.actors.get_mut(&actor_id) {
+            actor.activity = Some(Activity::Capture {
                 target_id,
                 speed,
             });
@@ -2641,6 +2687,132 @@ impl World {
                             actor.activity = None;
                         }
                     }
+                }
+            }
+        }
+
+        // ── Capture: walk to enemy building, then transfer ownership ──
+        // C# `Captures`/`CapturesTransform` (engineer subset). The
+        // engineer steps toward a cell adjacent to the target building
+        // one tile per outer tick (mirroring the EnterTransport drive
+        // loop). On arrival (Chebyshev gap ≤ 1) the target's owner is
+        // reassigned to the engineer's owner and the engineer is
+        // consumed (removed from the world). If the target dies or
+        // disappears mid-route the engineer goes idle.
+        {
+            let mut step_moves: Vec<(u32, (i32, i32), (i32, i32))> = Vec::new();
+            let mut capture_now: Vec<(u32, u32)> = Vec::new(); // (engineer, target)
+            let mut drop_idle: Vec<u32> = Vec::new();
+            for (id, actor) in &self.actors {
+                let target_id = match actor.activity {
+                    Some(Activity::Capture { target_id, .. }) => target_id,
+                    _ => continue,
+                };
+                let from = match actor.location {
+                    Some(l) => l,
+                    None => continue,
+                };
+                // Target must still be an alive building owned by an
+                // enemy of the capturer; otherwise abandon.
+                let (tloc, tgt_owner, tgt_kind) = match self.actors.get(&target_id) {
+                    Some(t) => (t.location, t.owner_id, t.kind),
+                    None => {
+                        drop_idle.push(*id);
+                        continue;
+                    }
+                };
+                let tloc = match tloc {
+                    Some(l) => l,
+                    None => {
+                        drop_idle.push(*id);
+                        continue;
+                    }
+                };
+                if tgt_kind != ActorKind::Building {
+                    drop_idle.push(*id);
+                    continue;
+                }
+                if tgt_owner == actor.owner_id || tgt_owner.is_none() {
+                    drop_idle.push(*id);
+                    continue;
+                }
+                let gap = (from.0 - tloc.0).abs().max((from.1 - tloc.1).abs());
+                if gap <= 1 {
+                    capture_now.push((*id, target_id));
+                } else {
+                    let dest = self
+                        .find_adjacent_passable(tloc, *id)
+                        .unwrap_or(tloc);
+                    if let Some(path) =
+                        pathfinder::find_path(&self.terrain, from, dest, Some(*id))
+                    {
+                        if path.len() > 1 {
+                            step_moves.push((*id, from, path[1]));
+                        }
+                    }
+                }
+            }
+            for id in drop_idle {
+                if let Some(a) = self.actors.get_mut(&id) {
+                    a.activity = None;
+                }
+            }
+            for (id, from, next_cell) in step_moves {
+                let occ = self.terrain.occupant(next_cell.0, next_cell.1);
+                if occ == 0 || occ == id {
+                    self.terrain.clear_occupant(from.0, from.1);
+                    self.terrain.set_occupant(next_cell.0, next_cell.1, id);
+                    if let Some(actor) = self.actors.get_mut(&id) {
+                        actor.location = Some(next_cell);
+                        for t in &mut actor.traits {
+                            if let TraitState::Mobile {
+                                center_position,
+                                from_cell,
+                                to_cell,
+                                ..
+                            } = t
+                            {
+                                *center_position =
+                                    center_of_cell(next_cell.0, next_cell.1);
+                                *from_cell = CPos::new(next_cell.0, next_cell.1);
+                                *to_cell = CPos::new(next_cell.0, next_cell.1);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            for (engineer_id, target_id) in capture_now {
+                // Capturer's owner — re-read in case state shifted.
+                let new_owner = match self.actors.get(&engineer_id) {
+                    Some(a) => a.owner_id,
+                    None => continue,
+                };
+                if new_owner.is_none() {
+                    continue;
+                }
+                // Transfer ownership of the target building.
+                if let Some(t) = self.actors.get_mut(&target_id) {
+                    if t.kind != ActorKind::Building {
+                        continue;
+                    }
+                    t.owner_id = new_owner;
+                    // Clear PRIMARY flag — the new owner re-designates
+                    // its own primary producer; an inherited flag could
+                    // collide with a same-type sibling on the new side.
+                    self.primary_buildings.remove(&target_id);
+                    // Drop any pending PowerDown toggle on the target;
+                    // the new owner controls its own power policy.
+                    self.powered_down.remove(&target_id);
+                }
+                // Consume the engineer (remove from world). Mirrors
+                // the passenger removal in EnterTransport: clear the
+                // terrain occupant first, then drop the actor.
+                if let Some(engineer) = self.actors.remove(&engineer_id) {
+                    if let Some(loc) = engineer.location {
+                        self.terrain.clear_occupant(loc.0, loc.1);
+                    }
+                    drop(engineer);
                 }
             }
         }

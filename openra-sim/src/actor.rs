@@ -81,6 +81,16 @@ pub enum Activity {
         target_id: u32,
         speed: i32,
     },
+    /// Walk to an enemy building and capture it (C# `Captures` /
+    /// `CapturesTransform`). When the engineer reaches a cell adjacent
+    /// to the target the target's `owner_id` is reassigned to the
+    /// capturer's owner and the engineer is consumed (removed from the
+    /// world). Pragmatic subset: no "external capture" weights,
+    /// instant on-arrival transfer.
+    Capture {
+        target_id: u32,
+        speed: i32,
+    },
     /// Harvest resources: find ore → move → harvest → deliver → repeat.
     Harvest {
         state: HarvestState,

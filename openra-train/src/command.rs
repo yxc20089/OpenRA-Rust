@@ -69,6 +69,12 @@ pub enum Command {
     /// (with a warning). Appended at the end of the enum to minimise
     /// merge conflicts with concurrent engine work.
     C4Detonate { unit_ids: Vec<String>, target_id: String },
+    /// Order an engineer (`e6`) to walk to an enemy building and
+    /// capture it (C# `Captures`). On arrival the target's ownership
+    /// transfers to the capturer's player and the engineer is consumed.
+    /// `unit_ids` holds engineer id(s); `target_id` is the enemy
+    /// building id.
+    CaptureActor { unit_ids: Vec<String>, target_id: String },
 }
 
 /// Python-facing shim around `Command`.
@@ -191,6 +197,15 @@ impl PyCommand {
     #[staticmethod]
     fn c4_detonate(unit_ids: Vec<String>, target_id: String) -> Self {
         Self { inner: Command::C4Detonate { unit_ids, target_id } }
+    }
+
+    /// Order engineer(s) to capture an enemy building. The capturer
+    /// walks to the target building's cell; on arrival the building's
+    /// owner is transferred to the capturer's player and the engineer
+    /// is consumed.
+    #[staticmethod]
+    fn capture_actor(unit_ids: Vec<String>, target_id: String) -> Self {
+        Self { inner: Command::CaptureActor { unit_ids, target_id } }
     }
 
     fn __repr__(&self) -> String {

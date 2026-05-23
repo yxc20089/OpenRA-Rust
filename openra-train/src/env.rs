@@ -1355,6 +1355,34 @@ impl Env {
                         }
                     }
                 }
+                Command::CaptureActor { unit_ids, target_id } => {
+                    // Engineer (e6) walks to an enemy building and
+                    // captures it. We accept any owned actor id here;
+                    // the engine-side `order_capture_actor` gates on
+                    // actor_type == "e6" and target being an enemy
+                    // Building, so non-engineer / friendly targets are
+                    // silently dropped at the engine.
+                    let target_aid = match parse_actor_id(target_id) {
+                        Some(v) => v,
+                        None => {
+                            self.last_warnings
+                                .push(format!("invalid target_id {target_id:?}"));
+                            continue;
+                        }
+                    };
+                    for id in unit_ids {
+                        if let Some(aid) =
+                            resolve_owned(id, &issuer_owned, &mut self.last_warnings)
+                        {
+                            orders.push(GameOrder {
+                                order_string: "CaptureActor".into(),
+                                subject_id: Some(aid),
+                                target_string: None,
+                                extra_data: Some(target_aid),
+                            });
+                        }
+                    }
+                }
             }
         }
         orders
