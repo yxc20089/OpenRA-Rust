@@ -69,6 +69,16 @@ pub enum Activity {
         transport_id: u32,
         speed: i32,
     },
+    /// Walk an infiltrator (spy / thief) to an enemy building. On
+    /// adjacency, apply the type-dependent effect (spy reveals enemy
+    /// structures to the agent; thief drains some enemy cash to the
+    /// agent) and consume the infiltrator. C# RA `Infiltrates` /
+    /// `InfiltrateForCash` family — collapsed to a single Activity
+    /// because the dispatch is by the infiltrator's `actor_type`.
+    Infiltrate {
+        target_id: u32,
+        speed: i32,
+    },
     /// Harvest resources: find ore → move → harvest → deliver → repeat.
     Harvest {
         state: HarvestState,

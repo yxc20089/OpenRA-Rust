@@ -539,10 +539,16 @@ impl Env {
                 continue;
             }
             if a.owner == self.enemy_player_id {
-                if !self.is_visible_to_agent(world, a.x, a.y) {
+                let cell_visible = self.is_visible_to_agent(world, a.x, a.y);
+                let is_building = matches!(a.kind, ActorKind::Building);
+                // Spy infiltration permanently reveals enemy buildings
+                // to the agent even through fog (one-shot reveal scan).
+                let infiltrated = is_building
+                    && world.was_infiltration_revealed(self.agent_player_id, a.id);
+                if !cell_visible && !infiltrated {
                     continue;
                 }
-                if matches!(a.kind, ActorKind::Building) {
+                if is_building {
                     cur_visible_enemy_buildings.insert(a.id);
                 } else {
                     cur_visible_enemy_units.insert(a.id);
@@ -1306,6 +1312,31 @@ impl Env {
                         extra_data: None,
                     });
                 }
+                Command::Infiltrate { unit_ids, target_id } => {
+                    let target_aid = match parse_actor_id(target_id) {
+                        Some(v) => v,
+                        None => {
+                            self.last_warnings
+                                .push(format!("invalid target_id {target_id:?}"));
+                            continue;
+                        }
+                    };
+                    // Engine validates owner / building / infiltrator
+                    // type at order time (`order_infiltrate`); the env
+                    // just resolves agent-owned subjects.
+                    for id in unit_ids {
+                        if let Some(aid) =
+                            resolve_owned(id, &issuer_owned, &mut self.last_warnings)
+                        {
+                            orders.push(GameOrder {
+                                order_string: "Infiltrate".into(),
+                                subject_id: Some(aid),
+                                target_string: None,
+                                extra_data: Some(target_aid),
+                            });
+                        }
+                    }
+                }
             }
         }
         orders
@@ -1688,10 +1719,14 @@ impl Env {
                 ));
                 unit_hp.push((id_str, pct));
             } else if a.owner == opponent {
-                if !self.is_visible_to(world, viewer, a.x, a.y) {
+                let cell_visible = self.is_visible_to(world, viewer, a.x, a.y);
+                let is_building = matches!(a.kind, ActorKind::Building);
+                let infiltrated = is_building
+                    && world.was_infiltration_revealed(viewer, a.id);
+                if !cell_visible && !infiltrated {
                     continue;
                 }
-                if matches!(a.kind, ActorKind::Building) {
+                if is_building {
                     enemy_buildings.push(EnemyBuilding {
                         cell_x: a.x,
                         cell_y: a.y,

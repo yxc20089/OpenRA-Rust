@@ -62,6 +62,11 @@ pub enum Command {
     Surrender,
     /// No-op; the env still ticks N frames.
     Observe,
+    /// Walk an infiltrator (spy / thief) into an enemy building. On
+    /// adjacency the engine applies the type-dependent effect — spy
+    /// reveals the target-owner's structures; thief drains some
+    /// enemy cash — and consumes the infiltrator.
+    Infiltrate { unit_ids: Vec<String>, target_id: String },
 }
 
 /// Python-facing shim around `Command`.
@@ -179,6 +184,11 @@ impl PyCommand {
     #[staticmethod]
     fn patrol(unit_ids: Vec<String>) -> Self {
         Self { inner: Command::Patrol { unit_ids } }
+    }
+
+    #[staticmethod]
+    fn infiltrate(unit_ids: Vec<String>, target_id: String) -> Self {
+        Self { inner: Command::Infiltrate { unit_ids, target_id } }
     }
 
     fn __repr__(&self) -> String {

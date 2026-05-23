@@ -379,6 +379,13 @@ pub struct World {
     /// moving or dies. Without this, a unit on a long `move` order
     /// crossed a kill zone untouched — "sprint-invincibility".
     move_fire_cooldown: HashMap<u32, i32>,
+    /// Per-viewer (agent player) persistent set of enemy building ids
+    /// that have been revealed by a successful spy `Infiltrate`. The
+    /// observation layer (`env.rs::build_observation`) surfaces these
+    /// in `enemy_buildings_summary` regardless of current cell
+    /// visibility — a spy scan is a one-shot reveal that survives the
+    /// shroud-recompute each tick. Keyed by the VIEWING player id.
+    pub infiltration_revealed_buildings: BTreeMap<u32, std::collections::BTreeSet<u32>>,
 }
 
 /// Typed components attached to a single actor. Lookup is via
@@ -593,6 +600,7 @@ impl World {
                 Some(Activity::Attack { .. }) => "attacking",
                 Some(Activity::Guard { .. }) => "guarding",
                 Some(Activity::EnterTransport { .. }) => "entering",
+                Some(Activity::Infiltrate { .. }) => "infiltrating",
                 Some(Activity::Harvest { .. }) => "harvesting",
             }.to_string();
             let (facing, cx, cy) = actor.traits.iter().find_map(|t| {
@@ -908,6 +916,13 @@ impl World {
                     (order.subject_id, order.extra_data)
                 {
                     self.order_enter_transport(subject_id, target_actor_id);
+                }
+            }
+            "Infiltrate" => {
+                if let (Some(subject_id), Some(target_actor_id)) =
+                    (order.subject_id, order.extra_data)
+                {
+                    self.order_infiltrate(subject_id, target_actor_id);
                 }
             }
             "Unload" => {
@@ -1342,6 +1357,52 @@ impl World {
         if let Some(actor) = self.actors.get_mut(&actor_id) {
             actor.activity = Some(Activity::EnterTransport {
                 transport_id,
+                speed,
+            });
+        }
+    }
+
+    /// Order a spy / thief infantry to walk into an enemy building
+    /// and trigger an infiltration effect (C# RA `Infiltrates` family).
+    /// The actor walks to a cell adjacent to the target; on adjacency
+    /// the tick logic (`process_frame` → infiltrate block) applies
+    /// the effect (spy: one-shot scan of the target's owner's
+    /// buildings into the agent's `infiltration_revealed_buildings`;
+    /// thief: drain a chunk of enemy cash into the infiltrator's
+    /// owner) and removes the infiltrator from the world. Issuing the
+    /// order against own or null buildings is rejected.
+    fn order_infiltrate(&mut self, actor_id: u32, target_id: u32) {
+        if actor_id == target_id {
+            return;
+        }
+        // Subject must be a live infiltrator (spy / thf).
+        let (subj_owner, is_infiltrator) = match self.actors.get(&actor_id) {
+            Some(a) => {
+                let inf = a
+                    .actor_type
+                    .as_deref()
+                    .map(|t| matches!(t, "spy" | "thf"))
+                    .unwrap_or(false);
+                (a.owner_id, inf)
+            }
+            None => return,
+        };
+        if !is_infiltrator {
+            return;
+        }
+        // Target must be an enemy BUILDING with a different owner.
+        let target_owner = match self.actors.get(&target_id) {
+            Some(t) if t.kind == ActorKind::Building => t.owner_id,
+            _ => return,
+        };
+        match (subj_owner, target_owner) {
+            (Some(s), Some(t)) if s != t => {}
+            _ => return,
+        }
+        let speed = self.actor_speed(actor_id);
+        if let Some(actor) = self.actors.get_mut(&actor_id) {
+            actor.activity = Some(Activity::Infiltrate {
+                target_id,
                 speed,
             });
         }
@@ -2433,6 +2494,172 @@ impl World {
                     passenger.activity = None;
                     self.cargo.entry(tid).or_default().push(passenger);
                 }
+            }
+        }
+
+        // ── Infiltrate: walk to enemy building, then apply effect ─────
+        // C# RA `Infiltrates` family. The infiltrator (spy / thf) walks
+        // to a cell adjacent to the target building; on adjacency:
+        //   * spy   → reveal-scan: every enemy building owned by the
+        //             target's owner is recorded into the agent's
+        //             `infiltration_revealed_buildings` set (a one-shot
+        //             scan that persists through fog).
+        //   * thf   → cash-steal: drain up to STEAL_AMOUNT from the
+        //             target-owner's cash, credit the infiltrator's
+        //             owner.
+        // The infiltrator is consumed in both cases (single-use).
+        // If the target dies mid-walk, the infiltrator goes idle.
+        const THIEF_STEAL_AMOUNT: i32 = 500;
+        {
+            let mut step_moves: Vec<(u32, (i32, i32), (i32, i32))> = Vec::new();
+            let mut applies: Vec<(u32, u32)> = Vec::new(); // (infiltrator, target)
+            let mut drop_idle: Vec<u32> = Vec::new();
+            for (id, actor) in &self.actors {
+                let target_id = match actor.activity {
+                    Some(Activity::Infiltrate { target_id, .. }) => target_id,
+                    _ => continue,
+                };
+                let from = match actor.location {
+                    Some(l) => l,
+                    None => continue,
+                };
+                let tloc = match self.actors.get(&target_id).and_then(|a| a.location) {
+                    Some(l) => l,
+                    None => {
+                        drop_idle.push(*id);
+                        continue;
+                    }
+                };
+                let gap = (from.0 - tloc.0).abs().max((from.1 - tloc.1).abs());
+                if gap <= 1 {
+                    applies.push((*id, target_id));
+                } else {
+                    let dest = self
+                        .find_adjacent_passable(tloc, *id)
+                        .unwrap_or(tloc);
+                    if let Some(path) =
+                        pathfinder::find_path(&self.terrain, from, dest, Some(*id))
+                    {
+                        if path.len() > 1 {
+                            step_moves.push((*id, from, path[1]));
+                        }
+                    }
+                }
+            }
+            for id in drop_idle {
+                if let Some(a) = self.actors.get_mut(&id) {
+                    a.activity = None;
+                }
+            }
+            for (id, from, next_cell) in step_moves {
+                let occ = self.terrain.occupant(next_cell.0, next_cell.1);
+                if occ == 0 || occ == id {
+                    self.terrain.clear_occupant(from.0, from.1);
+                    self.terrain.set_occupant(next_cell.0, next_cell.1, id);
+                    if let Some(actor) = self.actors.get_mut(&id) {
+                        actor.location = Some(next_cell);
+                        for t in &mut actor.traits {
+                            if let TraitState::Mobile {
+                                center_position,
+                                from_cell,
+                                to_cell,
+                                ..
+                            } = t
+                            {
+                                *center_position =
+                                    center_of_cell(next_cell.0, next_cell.1);
+                                *from_cell = CPos::new(next_cell.0, next_cell.1);
+                                *to_cell = CPos::new(next_cell.0, next_cell.1);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            for (infiltrator_id, target_id) in applies {
+                // Snapshot infiltrator's type + owner; bail if it died.
+                let (subj_owner, subj_type) = match self.actors.get(&infiltrator_id) {
+                    Some(a) => (a.owner_id, a.actor_type.clone()),
+                    None => continue,
+                };
+                let subj_owner = match subj_owner {
+                    Some(o) => o,
+                    None => continue,
+                };
+                let target_owner = match self.actors.get(&target_id) {
+                    Some(t) if t.kind == ActorKind::Building => match t.owner_id {
+                        Some(o) => o,
+                        None => continue,
+                    },
+                    _ => {
+                        // Target died — drop activity.
+                        if let Some(a) = self.actors.get_mut(&infiltrator_id) {
+                            a.activity = None;
+                        }
+                        continue;
+                    }
+                };
+                match subj_type.as_deref() {
+                    Some("spy") => {
+                        // Reveal every building owned by the target's
+                        // owner into the infiltrator's owner's
+                        // persistent reveal set.
+                        let ids: Vec<u32> = self
+                            .actors
+                            .values()
+                            .filter(|a| {
+                                a.kind == ActorKind::Building
+                                    && a.owner_id == Some(target_owner)
+                            })
+                            .map(|a| a.id)
+                            .collect();
+                        let set = self
+                            .infiltration_revealed_buildings
+                            .entry(subj_owner)
+                            .or_default();
+                        for bid in ids {
+                            set.insert(bid);
+                        }
+                    }
+                    Some("thf") => {
+                        // Steal cash from target's owner; credit subject's owner.
+                        // Only proc / silo carry siphonable cash in the
+                        // C# parity model; a thf hitting another building
+                        // type is a no-op steal (but the infiltrator
+                        // is still consumed).
+                        let target_type = self
+                            .actors
+                            .get(&target_id)
+                            .and_then(|a| a.actor_type.clone());
+                        let stealable = matches!(
+                            target_type.as_deref(),
+                            Some("proc") | Some("silo")
+                        );
+                        if stealable {
+                            let cur = self.player_cash(target_owner);
+                            let amount = cur.min(THIEF_STEAL_AMOUNT).max(0);
+                            if amount > 0 {
+                                if let Some(victim) = self.actors.get_mut(&target_owner) {
+                                    victim.set_cash(cur - amount);
+                                }
+                                let agent_cash = self.player_cash(subj_owner);
+                                if let Some(agent) = self.actors.get_mut(&subj_owner) {
+                                    agent.set_cash(agent_cash + amount);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                // Consume the infiltrator.
+                if let Some(loc) = self
+                    .actors
+                    .get(&infiltrator_id)
+                    .and_then(|a| a.location)
+                {
+                    self.terrain.clear_occupant(loc.0, loc.1);
+                }
+                self.actors.remove(&infiltrator_id);
             }
         }
 
@@ -4527,6 +4754,17 @@ impl World {
         self.typed_shroud.get(&player_id)
     }
 
+    /// Returns `true` when `building_id` has been revealed to `viewer`
+    /// by a spy infiltration. The observation layer additively surfaces
+    /// these in `enemy_buildings_summary` even when the building's cell
+    /// is currently fogged for the viewer.
+    pub fn was_infiltration_revealed(&self, viewer: u32, building_id: u32) -> bool {
+        self.infiltration_revealed_buildings
+            .get(&viewer)
+            .map(|s| s.contains(&building_id))
+            .unwrap_or(false)
+    }
+
     /// Total kills credited to `player_id` across all combat paths
     /// (data-driven `tick_actors` + trait-based `AttackActivity`).
     /// Updated whenever a target's HP reaches zero from one of that
@@ -5272,6 +5510,7 @@ pub fn build_world(
         combat_reveal_cells: BTreeMap::new(),
         pending_move_destinations: HashSet::new(),
         move_fire_cooldown: HashMap::new(),
+        infiltration_revealed_buildings: BTreeMap::new(),
     };
 
     // Initial shroud reveal around starting units
