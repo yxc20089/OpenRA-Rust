@@ -434,6 +434,14 @@ impl World {
         self.actors.get(&actor_id).map(|a| a.kind)
     }
 
+    /// True iff `actor_id` is a naval actor (ship). Used by the
+    /// pathfinder and movement-tick callsites to pick the water-only
+    /// passability gate. Returns `false` for unknown ids / non-naval
+    /// kinds.
+    pub fn actor_is_naval(&self, actor_id: u32) -> bool {
+        matches!(self.actor_kind(actor_id), Some(ActorKind::Ship))
+    }
+
     pub fn actor_type_name(&self, actor_id: u32) -> Option<&str> {
         self.actors.get(&actor_id).and_then(|a| a.actor_type.as_deref())
     }
@@ -507,9 +515,15 @@ impl World {
 
     /// Find the location of an enemy unit or building.
     /// Find nearest passable cell adjacent to a target location (for attacking buildings).
+    ///
+    /// Naval-aware: a ship looks for adjacent WATER cells; a ground
+    /// actor looks for adjacent non-water passable cells. This lets a
+    /// destroyer take up an adjacent firing position next to a shore
+    /// building without trying to step onto land.
     fn find_adjacent_passable(&self, target: (i32, i32), actor_id: u32) -> Option<(i32, i32)> {
-        // If target itself is passable, use it directly
-        if self.terrain.is_passable_for(target.0, target.1, actor_id) {
+        let naval = self.actor_is_naval(actor_id);
+        // If target itself is passable for this kind, use it directly.
+        if self.terrain.is_passable_for_kind(target.0, target.1, actor_id, naval) {
             return Some(target);
         }
         // Check all 8 neighbors
@@ -517,7 +531,7 @@ impl World {
         for (dx, dy) in &dirs {
             let nx = target.0 + dx;
             let ny = target.1 + dy;
-            if self.terrain.is_passable_for(nx, ny, actor_id) {
+            if self.terrain.is_passable_for_kind(nx, ny, actor_id, naval) {
                 return Some((nx, ny));
             }
         }
@@ -1057,11 +1071,22 @@ impl World {
         ignore_actor: Option<u32>,
         max_radius: i32,
     ) -> Option<(i32, i32)> {
+        // Naval-aware: a ship-owned move resolves to the nearest WATER
+        // cell; a ground-owned move resolves to the nearest non-water
+        // passable cell. Without this branch a destroyer commanded
+        // toward a coastal target snaps to the nearest land tile and
+        // its pathfind then fails because grass is impassable to ships.
+        let naval = ignore_actor.map_or(false, |id| self.actor_is_naval(id));
         let cell_ok = |x: i32, y: i32| -> bool {
             if !self.terrain.contains(x, y) {
                 return false;
             }
-            if !self.terrain.is_terrain_passable(x, y) {
+            let kind_ok = if naval {
+                self.terrain.is_terrain_passable_for_naval(x, y)
+            } else {
+                self.terrain.is_terrain_passable(x, y)
+            };
+            if !kind_ok {
                 return false;
             }
             if self.pending_move_destinations.contains(&(x, y)) {
@@ -1132,7 +1157,8 @@ impl World {
         if resolved_target != from {
             self.pending_move_destinations.insert(resolved_target);
         }
-        if let Some(path) = pathfinder::find_path(&self.terrain, from, resolved_target, Some(actor_id)) {
+        let naval = self.actor_is_naval(actor_id);
+        if let Some(path) = pathfinder::find_path_for_kind(&self.terrain, from, resolved_target, Some(actor_id), naval) {
             if path.len() > 1 {
                 let speed = self.actor_speed(actor_id);
                 let move_activity = Activity::Move {
@@ -2098,6 +2124,12 @@ impl World {
                 ActorKind::Infantry => 43,
                 ActorKind::Vehicle => 85,
                 ActorKind::Mcv => 56,
+                // Naval MVP: dd/ca/pt/lst carry Mobile.Speed in the
+                // vendored RA YAML (dd=92, ca=44, pt=89, lst=71); the
+                // `defaults()` ruleset zeroes them so they wouldn't move
+                // when the vendored mod is absent. Use ~85 as a generic
+                // ship fallback (mid-range between dd and lst).
+                ActorKind::Ship => 85,
                 _ => 56,
             }
         } else {
@@ -2303,8 +2335,9 @@ impl World {
                 let dest = self
                     .find_adjacent_passable(tgt_loc, *id)
                     .unwrap_or(tgt_loc);
+                let naval = self.actor_is_naval(*id);
                 if let Some(path) =
-                    pathfinder::find_path(&self.terrain, from, dest, Some(*id))
+                    pathfinder::find_path_for_kind(&self.terrain, from, dest, Some(*id), naval)
                 {
                     if path.len() > 1 {
                         guard_steps.push((*id, from, path[1]));
@@ -3290,8 +3323,9 @@ impl World {
             // Find nearest passable cell adjacent to the target (for attacking buildings)
             let chase_dest = self.find_adjacent_passable(target_loc, attacker_id)
                 .unwrap_or(target_loc);
-            // Pathfind toward target
-            if let Some(path) = pathfinder::find_path(&self.terrain, from, chase_dest, Some(attacker_id)) {
+            // Pathfind toward target (naval-aware so ships stay on water).
+            let naval = self.actor_is_naval(attacker_id);
+            if let Some(path) = pathfinder::find_path_for_kind(&self.terrain, from, chase_dest, Some(attacker_id), naval) {
                 if path.len() > 1 {
                     // Advance toward the next path cell at the actor's
                     // real movement speed (world units/tick), lerping the

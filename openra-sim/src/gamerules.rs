@@ -334,13 +334,17 @@ impl GameRules {
         actor!("mig", ActorKind::Aircraft, 100000, 0, 2000, 0, 1, 1, false);
         actor!("yak", ActorKind::Aircraft, 100000, 0, 800, 0, 1, 1, false);
 
-        // Naval
-        actor!("ss", ActorKind::Ship, 100000, 0, 950, 0, 1, 1, false);
-        actor!("msub", ActorKind::Ship, 100000, 0, 1800, 0, 1, 1, false);
-        actor!("sub", ActorKind::Ship, 100000, 0, 950, 0, 1, 1, false);
-        actor!("dd", ActorKind::Ship, 100000, 0, 1000, 0, 1, 1, false);
-        actor!("ca", ActorKind::Ship, 100000, 0, 2000, 0, 1, 1, false);
-        actor!("pt", ActorKind::Ship, 100000, 0, 700, 0, 1, 1, false);
+        // Naval. Speeds approximate the vendored RA `Mobile.Speed`
+        // values (dd=92, ca=44, pt=89, lst=71, ss/sub=71, msub=85).
+        // HP / cost mirror the C# YAML so the bench's economy gates
+        // still bite when the vendored mod is absent.
+        actor!("ss", ActorKind::Ship, 60000, 71, 950, 0, 1, 1, false);
+        actor!("msub", ActorKind::Ship, 60000, 85, 1800, 0, 1, 1, false);
+        actor!("sub", ActorKind::Ship, 60000, 71, 950, 0, 1, 1, false);
+        actor!("dd", ActorKind::Ship, 40000, 92, 1000, 0, 1, 1, false);
+        actor!("ca", ActorKind::Ship, 80000, 44, 2400, 0, 1, 1, false);
+        actor!("pt", ActorKind::Ship, 15000, 89, 500, 0, 1, 1, false);
+        actor!("lst", ActorKind::Ship, 40000, 71, 700, 0, 1, 1, false);
 
         // Set prerequisites for units and buildings (matching OpenRA rules)
         // Infantry require barracks (tent/barr)
@@ -361,6 +365,30 @@ impl GameRules {
                 a.prerequisites = vec!["weap".to_string(), "dome".to_string()];
             }
         }
+        // Naval units require a naval yard (spen for soviet subs,
+        // syrd for allied surface ships). Matches the C# YAML
+        // `~spen` / `~syrd` prerequisites. The bench's MVP
+        // accepts spen as a generic naval producer regardless of
+        // faction; faction-specific gating lands when the
+        // `~tilde` prerequisite syntax is parsed.
+        for name in &["ss", "sub", "msub"] {
+            if let Some(a) = actors.get_mut(*name) {
+                a.prerequisites = vec!["spen".to_string()];
+            }
+        }
+        for name in &["dd", "ca", "pt", "lst"] {
+            if let Some(a) = actors.get_mut(*name) {
+                // dd / ca need radar dome in the C# YAML; pt and lst
+                // do not. Use the conservative path so the engine
+                // refuses to produce a dd before a dome exists.
+                if matches!(*name, "dd" | "ca") {
+                    a.prerequisites =
+                        vec!["spen".to_string(), "dome".to_string()];
+                } else {
+                    a.prerequisites = vec!["spen".to_string()];
+                }
+            }
+        }
         // Buildings prerequisites (matching OpenRA)
         if let Some(a) = actors.get_mut("tent") { a.prerequisites = vec!["powr".to_string()]; }
         if let Some(a) = actors.get_mut("barr") { a.prerequisites = vec!["powr".to_string()]; }
@@ -372,6 +400,10 @@ impl GameRules {
         if let Some(a) = actors.get_mut("afld") { a.prerequisites = vec!["dome".to_string()]; }
         if let Some(a) = actors.get_mut("atek") { a.prerequisites = vec!["weap".to_string(), "dome".to_string()]; }
         if let Some(a) = actors.get_mut("stek") { a.prerequisites = vec!["weap".to_string(), "dome".to_string()]; }
+        // Naval yards: spen (sub pen, soviet) and syrd (allied
+        // shipyard). Both gate on proc, matching the weap pattern.
+        if let Some(a) = actors.get_mut("spen") { a.prerequisites = vec!["proc".to_string()]; }
+        if let Some(a) = actors.get_mut("syrd") { a.prerequisites = vec!["proc".to_string()]; }
 
         // ProvidesPrerequisite for buildings (simplified defaults for testing)
         // FACT provides structures.allies / structures.soviet based on faction

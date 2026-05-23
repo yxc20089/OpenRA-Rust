@@ -409,6 +409,13 @@ pub struct MapDef {
     /// perception ablation grid (vision/structured × fog/no-fog) — a
     /// perfect-information control cell, not a load-bearing scenario.
     pub reveal_map: bool,
+    /// Water cells declared by the scenario YAML's `water_cells:` and/or
+    /// `water_rect:` blocks. The engine marks each `(x, y)` as a water
+    /// cell in the terrain map: ground actors (Infantry / Vehicle /
+    /// Building) cannot enter; naval actors (Ship) can ONLY traverse
+    /// water cells. Used by the naval MVP to declare water bands
+    /// without touching the `map.bin` tile encoding.
+    pub water_cells: Vec<(i32, i32)>,
 }
 
 /// One scripted mid-episode event. Parsed from a top-level
@@ -681,6 +688,7 @@ pub fn load_rush_hour_map_with_spawn(
         enemy_bot: scenario.enemy_bot,
         scheduled_events: scenario.scheduled_events,
         reveal_map: scenario.reveal_map.unwrap_or(false),
+        water_cells: scenario.water_cells,
     })
 }
 
@@ -710,6 +718,12 @@ struct ScenarioYaml {
     /// of war). Set `reveal_map: true` to disable fog for the agent
     /// player — the no-fog cells of the perception ablation grid.
     reveal_map: Option<bool>,
+    /// Water cells declared by `water_cells:` (a flat list of `[x, y]`
+    /// pairs) and/or `water_rect:` (an `[x, y, w, h]` rectangle that
+    /// is expanded into a flat cell list at parse time). MVP overlay
+    /// path: lets a naval scenario declare water without touching
+    /// `map.bin`. Empty when neither block is present.
+    water_cells: Vec<(i32, i32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -830,6 +844,64 @@ fn parse_scenario_yaml(text: &str) -> io::Result<ScenarioYaml> {
                         _ => None,
                     };
                     i += 1;
+                    continue;
+                }
+                "water_rect" => {
+                    // Two accepted shapes:
+                    //   inline: `water_rect: [x, y, w, h]`
+                    //   block:  `water_rect:\n  - x\n  - y\n  - w\n  - h`
+                    // PyYAML's `safe_dump` emits the block form by
+                    // default, so the bench's `_scenario_to_tmp_yaml`
+                    // produces the block form and the engine must
+                    // accept both.
+                    let mut rect: Vec<i32> = if v.trim().is_empty() {
+                        // Block form: 4 `- N` items at indent > 0.
+                        let detected_indent =
+                            detect_list_indent(&lines, i + 1).unwrap_or(0);
+                        let (vals, ni) =
+                            read_int_scalar_list(&lines, i + 1, detected_indent);
+                        i = ni;
+                        vals
+                    } else {
+                        // Inline `[x, y, w, h]`.
+                        let r = parse_inline_int_list(v).unwrap_or_default();
+                        i += 1;
+                        r
+                    };
+                    if rect.len() == 4 {
+                        let h = rect.pop().unwrap();
+                        let w = rect.pop().unwrap();
+                        let y = rect.pop().unwrap();
+                        let x = rect.pop().unwrap();
+                        for dy in 0..h {
+                            for dx in 0..w {
+                                out.water_cells.push((x + dx, y + dy));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                "water_cells" => {
+                    // Flat list of `[x, y]` pairs (PyYAML block form):
+                    //   water_cells:
+                    //     - [10, 5]
+                    //     - [10, 6]
+                    // OR inline list-of-lists:
+                    //   water_cells: [[10, 5], [10, 6]]
+                    if !v.trim().is_empty() {
+                        // Inline form (`[[x, y], [x, y]]`).
+                        for pair in parse_inline_pair_list(v) {
+                            out.water_cells.push(pair);
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    // Block form — list items at indent > 0.
+                    let detected_indent = detect_list_indent(&lines, i + 1).unwrap_or(0);
+                    let (cells, ni) =
+                        read_water_cell_list(&lines, i + 1, detected_indent);
+                    out.water_cells.extend(cells);
+                    i = ni;
                     continue;
                 }
                 _ => {}
@@ -1089,6 +1161,178 @@ fn parse_inline_xy(s: &str) -> Option<(i32, i32)> {
     let x: i32 = parts.next()?.trim().parse().ok()?;
     let y: i32 = parts.next()?.trim().parse().ok()?;
     Some((x, y))
+}
+
+/// Parse `[A, B, C, ...]` flow-list of ints. Empty `Vec` on malformed.
+/// Used by naval-MVP `water_rect: [x, y, w, h]` parsing.
+fn parse_inline_int_list(s: &str) -> Option<Vec<i32>> {
+    let trim = s.trim();
+    let inner = trim.strip_prefix('[')?.strip_suffix(']')?;
+    let mut out = Vec::new();
+    for tok in inner.split(',') {
+        out.push(tok.trim().parse::<i32>().ok()?);
+    }
+    Some(out)
+}
+
+/// Parse `[[X, Y], [X, Y], ...]` flow-list of pairs. Returns an empty
+/// `Vec` on malformed input. Used by naval-MVP inline `water_cells:`.
+fn parse_inline_pair_list(s: &str) -> Vec<(i32, i32)> {
+    let trim = s.trim();
+    let inner = match trim.strip_prefix('[').and_then(|x| x.strip_suffix(']')) {
+        Some(x) => x,
+        None => return Vec::new(),
+    };
+    // Walk char-by-char, splitting on `]` then trimming the `, [`.
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut buf = String::new();
+    for ch in inner.chars() {
+        match ch {
+            '[' => {
+                depth += 1;
+                if depth == 1 {
+                    buf.clear();
+                    continue;
+                }
+                buf.push(ch);
+            }
+            ']' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(pair) = parse_inline_xy(&format!("[{buf}]")) {
+                        out.push(pair);
+                    }
+                    buf.clear();
+                    continue;
+                }
+                buf.push(ch);
+            }
+            _ => {
+                if depth >= 1 {
+                    buf.push(ch);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Read a flat list of `- N` integer entries (PyYAML block form for
+/// a top-level scalar list). Stops at the first non-list, non-blank
+/// line at indent `<= expected_indent`. Used by naval-MVP block-form
+/// `water_rect:`.
+fn read_int_scalar_list(
+    lines: &[&str],
+    start: usize,
+    expected_indent: usize,
+) -> (Vec<i32>, usize) {
+    let mut out = Vec::new();
+    let mut i = start;
+    while i < lines.len() {
+        let raw = lines[i];
+        let trimmed = strip_yaml_comment(raw).trim_end();
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+        let indent = leading_spaces(raw);
+        if indent < expected_indent {
+            break;
+        }
+        let lead = trimmed.trim_start();
+        if let Some(rest) = lead.strip_prefix("- ") {
+            if let Ok(v) = rest.trim().parse::<i32>() {
+                out.push(v);
+                i += 1;
+                continue;
+            }
+            break;
+        }
+        break;
+    }
+    (out, i)
+}
+
+/// Read a flat list of `- [X, Y]` water-cell entries (PyYAML block form).
+/// Stops at the first non-list, non-blank line at indent `<= expected_indent`.
+///
+/// Two shapes accepted:
+///   - `- [X, Y]`                   (inline-pair items)
+///   - `- - X\n  - Y`               (PyYAML block-block form: each
+///                                   item is itself a 2-element list)
+fn read_water_cell_list(
+    lines: &[&str],
+    start: usize,
+    expected_indent: usize,
+) -> (Vec<(i32, i32)>, usize) {
+    let mut out = Vec::new();
+    let mut i = start;
+    while i < lines.len() {
+        let raw = lines[i];
+        let trimmed = strip_yaml_comment(raw).trim_end();
+        if trimmed.is_empty() {
+            i += 1;
+            continue;
+        }
+        let indent = leading_spaces(raw);
+        if indent < expected_indent {
+            break;
+        }
+        let lead = trimmed.trim_start();
+        if let Some(rest) = lead.strip_prefix("- ") {
+            // Inline pair `[x, y]` after `- `.
+            if let Some(pair) = parse_inline_xy(rest.trim()) {
+                out.push(pair);
+                i += 1;
+                continue;
+            }
+            // PyYAML block-block form: `- - X` (the `- ` is followed
+            // by another `- ` opening a nested 2-element scalar list).
+            // The first scalar lives on the same line; the second lives
+            // on the next sibling line at `indent` + 2 (or whatever
+            // sub-indent PyYAML chose). Reuse `read_xy_list` on the
+            // tail.
+            if let Some(inner_first) = rest.strip_prefix("- ") {
+                if let Ok(x) = inner_first.trim().parse::<i32>() {
+                    // Parse the second scalar at the same nested-list
+                    // indent as `- `, which sits at `indent + 2`.
+                    let nested_indent = indent + 2;
+                    let mut vals = vec![x];
+                    i += 1;
+                    while i < lines.len() && vals.len() < 2 {
+                        let sub = lines[i];
+                        let st = strip_yaml_comment(sub).trim_end();
+                        if st.is_empty() {
+                            i += 1;
+                            continue;
+                        }
+                        let sind = leading_spaces(sub);
+                        if sind < nested_indent {
+                            break;
+                        }
+                        let sl = st.trim_start();
+                        if let Some(r) = sl.strip_prefix("- ") {
+                            if let Ok(v) = r.trim().parse::<i32>() {
+                                vals.push(v);
+                                i += 1;
+                                continue;
+                            }
+                        }
+                        break;
+                    }
+                    if vals.len() == 2 {
+                        out.push((vals[0], vals[1]));
+                    }
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        break;
+    }
+    (out, i)
 }
 
 /// Read a 2-element scalar list. Items must be at indent
