@@ -2098,7 +2098,7 @@ impl World {
     /// Apply nuclear-strike AoE damage at `(target_x, target_y)` and
     /// return the number of actors hit. Damage falls off linearly with
     /// Chebyshev distance to the centre; dead actors are removed.
-    fn detonate_nuke(&mut self, _owner: u32, target_x: i32, target_y: i32) -> usize {
+    fn detonate_nuke(&mut self, owner: u32, target_x: i32, target_y: i32) -> usize {
         let radius = crate::superweapon::NUKE_RADIUS_CELLS;
         let base = crate::superweapon::NUKE_BASE_DAMAGE;
         let mut damaged: Vec<(u32, i32)> = Vec::new();
@@ -2135,6 +2135,13 @@ impl World {
                 if let Some(loc) = a.location {
                     self.terrain.clear_occupant(loc.0, loc.1);
                 }
+                // Credit the kill to the firing player. Mirrors the
+                // data-driven combat path at world.rs ~line 4237 which
+                // bumps `kills_per_player` whenever a fatal hit removes
+                // a victim. Without this, bench packs scoring on
+                // `units_killed_gte` saw nuke kills as uncounted.
+                let _ = a; // a moved into local for clarity
+                *self.kills_per_player.entry(owner).or_insert(0) += 1;
             }
         }
         hit
