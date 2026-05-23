@@ -92,8 +92,14 @@ impl GameRules {
                 .and_then(|t| t.get_i32("HP"))
                 .unwrap_or(0);
 
+            // Ground units carry `Mobile.Speed`; aircraft carry
+            // `Aircraft.Speed` (they never have a Mobile trait). Read both
+            // so heli/hind/mig/yak pick up their real cruise speed from
+            // the vendored YAML instead of falling to 0 (which would
+            // freeze every aircraft on the map).
             let speed = info.trait_info("Mobile")
                 .and_then(|t| t.get_i32("Speed"))
+                .or_else(|| info.trait_info("Aircraft").and_then(|t| t.get_i32("Speed")))
                 .unwrap_or(0);
 
             let cost = info.trait_info("Valued")
@@ -358,11 +364,16 @@ impl GameRules {
         actor!("ttnk", ActorKind::Vehicle, 100000, 71, 1500, 0, 1, 1, false);
         actor!("ctnk", ActorKind::Vehicle, 100000, 71, 2000, 0, 1, 1, false);
 
-        // Aircraft
-        actor!("heli", ActorKind::Aircraft, 100000, 0, 1200, 0, 1, 1, false);
-        actor!("hind", ActorKind::Aircraft, 100000, 0, 1200, 0, 1, 1, false);
-        actor!("mig", ActorKind::Aircraft, 100000, 0, 2000, 0, 1, 1, false);
-        actor!("yak", ActorKind::Aircraft, 100000, 0, 800, 0, 1, 1, false);
+        // Aircraft — MVP air units. Speed is set ~1.5x a Vehicle (128 vs 85)
+        // so a heli outpaces ground armour but doesn't trivialise scout
+        // distance, matching the heli-as-flanker scenario brief. Aircraft
+        // never gain a `Mobile` trait (they aren't ground units), so their
+        // Speed lives only here in gamerules and is consulted by
+        // World::actor_speed via the `rules.actor(type).speed` lookup.
+        actor!("heli", ActorKind::Aircraft, 120000, 128, 1200, 0, 1, 1, false);
+        actor!("hind", ActorKind::Aircraft, 100000, 128, 1200, 0, 1, 1, false);
+        actor!("mig", ActorKind::Aircraft, 100000, 180, 2000, 0, 1, 1, false);
+        actor!("yak", ActorKind::Aircraft, 100000, 149, 800, 0, 1, 1, false);
 
         // Naval
         actor!("ss", ActorKind::Ship, 100000, 0, 950, 0, 1, 1, false);
@@ -476,6 +487,58 @@ impl GameRules {
             projectile_speed: 0,
             splash_radius: 0,
         });
+
+        // Aircraft armaments for the no-vendor defaults() path. Real
+        // gameplay loads HellfireAG / ChainGun from the vendored RA YAML
+        // via `from_ruleset`; these stubs let the defaults-only test path
+        // (and the test_aircraft regression) exercise heli combat without
+        // depending on the submodule. Versus None=150 gives bonus damage
+        // versus unarmored infantry (matching ChainGun anti-personnel).
+        let mut hellfire_ag_versus = BTreeMap::new();
+        hellfire_ag_versus.insert(ArmorType::None, 30);
+        hellfire_ag_versus.insert(ArmorType::Wood, 90);
+        hellfire_ag_versus.insert(ArmorType::Light, 90);
+        hellfire_ag_versus.insert(ArmorType::Heavy, 100);
+        hellfire_ag_versus.insert(ArmorType::Concrete, 100);
+        weapons.insert("HellfireAG".to_string(), WeaponStats {
+            damage: 6000,
+            range: 5 * 1024,
+            reload_delay: 34,
+            burst: 2,
+            versus: hellfire_ag_versus,
+            projectile_speed: 0, // model as InstantHit in defaults
+            splash_radius: 0,
+        });
+        let mut chaingun_versus = BTreeMap::new();
+        chaingun_versus.insert(ArmorType::None, 144);
+        weapons.insert("ChainGun".to_string(), WeaponStats {
+            damage: 1500,
+            range: 5 * 1024,
+            reload_delay: 10,
+            burst: 2,
+            versus: chaingun_versus,
+            projectile_speed: 0,
+            splash_radius: 0,
+        });
+
+        // Attach weapons to aircraft defaults so heli/hind/mig/yak can
+        // engage without depending on the vendored ruleset.
+        if let Some(a) = actors.get_mut("heli") {
+            a.weapons = vec!["HellfireAG".to_string()];
+            a.prerequisites = vec!["hpad".to_string()];
+        }
+        if let Some(a) = actors.get_mut("hind") {
+            a.weapons = vec!["ChainGun".to_string()];
+            a.prerequisites = vec!["hpad".to_string()];
+        }
+        if let Some(a) = actors.get_mut("mig") {
+            a.weapons = vec!["HellfireAG".to_string()];
+            a.prerequisites = vec!["afld".to_string()];
+        }
+        if let Some(a) = actors.get_mut("yak") {
+            a.weapons = vec!["ChainGun".to_string()];
+            a.prerequisites = vec!["afld".to_string()];
+        }
 
         GameRules { actors, weapons }
     }

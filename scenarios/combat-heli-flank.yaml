@@ -1,0 +1,283 @@
+# combat-heli-flank — air-mobility cell: WIN by flying a `heli` over a
+# wall of buildings (pbox line) and killing the enemy e1 cluster
+# parked behind it; LOSE by trying to push ground units through the
+# wall (no detour exists wide enough inside the tick budget).
+#
+# MVP air-units pack. Demonstrates `ActorKind::Aircraft` straight-line
+# movement: heli ignores ground-impassable cells AND building
+# footprints, so the direct (5..40) lane the wall blocks for tanks is
+# wide-open airspace for the heli.
+#
+# Engine fixtures pinned by `OpenRA-Rust/openra-sim/tests/test_aircraft.rs`:
+#   * `heli_flies_over_impassable_terrain` — heli traverses a column
+#     of impassable cells that no ground unit can cross.
+#   * `heli_kills_vehicle_behind_obstacle_wall` — heli + `attack_unit`
+#     on an enemy behind the wall depletes the target to 0 HP.
+#
+# Real-world / benchmark anchor:
+#   - Vertical envelopment doctrine: airmobile assault bypasses a
+#     contested ground corridor (e.g. Op. Eagle Claw planning, AH-64
+#     deep-attack profiles). The agent must recognise the terrain
+#     denies a ground push and pick the air arm instead.
+#
+# Engine guardrails (per OpenRA-Bench/CLAUDE.md):
+#   - Map: rush-hour-arena (128 × 40, playable x ∈ [2..126],
+#     y ∈ [2..38]). All actor coords inside bounds.
+#   - Agent owns a `fact` at (4,20): prevents engine auto-`done` on
+#     own-side wipe if the air arm dies before the kill bar fires.
+#   - Far persistent enemy `fact` at (124,20): second engine auto-
+#     `done` mitigation (a MustBeDestroyed building stays alive on
+#     the enemy side so the episode persists to the win/fail
+#     evaluator). Out of reach inside any tick budget here.
+#   - Enemy `bot_type: ''` (no scripted pursuit): the e1 cluster sits
+#     stance:0 so a stall policy never bait-pulls the line into
+#     engaging the heli on its own — stall remains a clean LOSS.
+#   - `within_ticks` / `after_ticks` are inside the
+#     `93 + 90·(max_turns − 1)` reachable tick — the deadline bites.
+#   - The pbox wall is built from BUILDING actors (footprint
+#     occupies the cell as impassable terrain); a ground tank cannot
+#     path through. The wall spans y=10..30 so the only "round it"
+#     route is ≥20 cells of detour both ways AND the ends are
+#     blocked by additional pbox at (50,9) / (50,31) so a ground
+#     detour is closed inside the budget. The heli's straight-line
+#     air path crosses the wall in ~30 ticks.
+
+meta:
+  id: combat-heli-flank
+  title: 'Heli Flank — Air Mobility Over a Ground Wall'
+  capability: action
+  real_world_meaning: >
+    A two-helicopter strike must engage an enemy infantry cluster
+    pinned behind a contiguous wall of pillboxes — a barrier that
+    denies any ground push inside the tick budget. The decision under
+    test is air-mobility recognition: only the helicopter
+    `move_units` / `attack_unit` flight path crosses the wall;
+    sending a ground unit at the same target stalls against the
+    impassable footprint and never reaches the cluster. Stall
+    (`observe` only) never engages; a ground brute push (no air
+    units exist in the agent force, so this degenerates to "no
+    valid plan") fails the kill bar.
+  robotics_analogue: >
+    Vertical envelopment / airmobile assault doctrine — the
+    helicopter exists to bypass terrain that denies the ground
+    arm. The same logic as a UAV swarm routing over a denied
+    surface corridor: pick the right modality for the obstacle.
+  benchmark_anchor:
+    - "AH-64 deep-attack flight profile"
+    - "airmobile vertical envelopment"
+  author: openra-bench
+
+base_map: rush-hour-arena
+starting_cash: 0
+
+base:
+  agent: {faction: allies, cash: 0}
+  enemy: {faction: soviet, cash: 0, bot_type: ''}
+  tools: [move_units, attack_unit, attack_move, stop]
+  planning: true
+  interrupts:
+    enemy_unit_spotted: true
+    own_unit_destroyed: true
+  termination: {max_ticks: 3000}
+  actors: []
+
+levels:
+  # ── EASY ─────────────────────────────────────────────────────────────
+  # Bare air-mobility skill: 2 heli vs a small e1 cluster (3 infantry)
+  # behind a pbox wall. Heli MUST fly over the wall and engage; ground-
+  # only orders accomplish nothing because no ground unit is in the
+  # agent force. Stall LOSES on the kill bar; the intended policy
+  # (`move_units` heli to a cell over the cluster + `attack_unit`)
+  # WINS by clearing all 3 infantry before tick 1800.
+  easy:
+    description: >
+      Two helicopters (heli, allies) at (30, 19) and (30, 21) face a
+      cluster of THREE enemy riflemen (e1, soviet) at
+      (60, 19..21) — but a wall of pillboxes runs vertically at x=50
+      from y=10..30, with capped pbox at (50, 9) and (50, 31), so
+      every ground route is denied inside the tick budget. Fly the
+      helis over the wall and `attack_unit` the e1 cluster down.
+      Win when at least 3 enemy units are killed AND your base is
+      intact, before tick 1800.
+    overrides:
+      actors:
+        # Agent base anchor — engine auto-done mitigation.
+        - {type: fact, owner: agent, position: [4, 20]}
+        # Strike force — TWO heli, the only mobile agent units.
+        - {type: heli, owner: agent, position: [30, 19], stance: 2}
+        - {type: heli, owner: agent, position: [30, 21], stance: 2}
+        # Pillbox wall at x=50, y=10..30 (21 cells). 1×1 footprint
+        # per pbox, so each cell becomes impassable building terrain.
+        # The "cap" pbox at y=9 / y=31 closes the ends inside the
+        # detour budget so a ground policy cannot path around.
+        # stance:0 so the wall holds fire — they exist as terrain,
+        # not as combatants. (The heli flies over them; engagement
+        # against the e1 cluster is the load-bearing test.)
+        - {type: pbox, owner: enemy, position: [50, 9],  stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 10], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 11], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 12], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 13], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 14], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 15], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 16], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 17], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 18], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 19], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 20], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 21], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 22], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 23], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 24], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 25], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 26], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 27], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 28], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 29], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 30], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 31], stance: 0}
+        # Target cluster — three e1 infantry behind the wall.
+        # stance:0 so they don't bait-pull a stall policy into kills.
+        - {type: e1, owner: enemy, position: [60, 19], stance: 0}
+        - {type: e1, owner: enemy, position: [60, 20], stance: 0}
+        - {type: e1, owner: enemy, position: [60, 21], stance: 0}
+        # Far persistent enemy fact — engine auto-done mitigation
+        # so the wall cluster doesn't take the whole side with it.
+        - {type: fact, owner: enemy, position: [124, 20]}
+    win_condition:
+      all_of:
+        - {units_killed_gte: 3}
+        - {has_building: fact}
+        - {within_ticks: 1800}
+    fail_condition:
+      any_of:
+        - {after_ticks: 1801}
+        - {not: {has_building: fact}}
+    max_turns: 21
+
+  # ── MEDIUM ──────────────────────────────────────────────────────────
+  # +1 controlled variable vs easy: the cluster grows from 3 to 5 e1
+  # and the kill bar tightens to 5 — the heli pair must do a second
+  # pass to clear the line. Stall and ground-brute remain LOSS.
+  medium:
+    description: >
+      Two helicopters (heli, allies) at (30, 19) and (30, 21) face a
+      cluster of FIVE enemy riflemen (e1, soviet) at
+      (60, 18..22). A pillbox wall at x=50, y=10..30 (capped at y=9
+      and y=31) denies the ground route. Fly the helis over the wall
+      and clear the line. Win when at least 5 enemy units are killed
+      AND your base is intact, before tick 2100.
+    overrides:
+      actors:
+        - {type: fact, owner: agent, position: [4, 20]}
+        - {type: heli, owner: agent, position: [30, 19], stance: 2}
+        - {type: heli, owner: agent, position: [30, 21], stance: 2}
+        - {type: pbox, owner: enemy, position: [50, 9],  stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 10], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 11], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 12], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 13], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 14], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 15], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 16], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 17], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 18], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 19], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 20], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 21], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 22], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 23], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 24], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 25], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 26], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 27], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 28], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 29], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 30], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 31], stance: 0}
+        - {type: e1, owner: enemy, position: [60, 18], stance: 0}
+        - {type: e1, owner: enemy, position: [60, 19], stance: 0}
+        - {type: e1, owner: enemy, position: [60, 20], stance: 0}
+        - {type: e1, owner: enemy, position: [60, 21], stance: 0}
+        - {type: e1, owner: enemy, position: [60, 22], stance: 0}
+        - {type: fact, owner: enemy, position: [124, 20]}
+    win_condition:
+      all_of:
+        - {units_killed_gte: 5}
+        - {has_building: fact}
+        - {within_ticks: 2100}
+    fail_condition:
+      any_of:
+        - {after_ticks: 2101}
+        - {not: {has_building: fact}}
+    max_turns: 24
+
+  # ── HARD ────────────────────────────────────────────────────────────
+  # +1 controlled variable vs medium: TWO seed-driven spawn corridors
+  # (NORTH y=11..13 / SOUTH y=27..29) so the air-approach axis cannot
+  # be memorised. Cluster stays at 5; the deadline tightens to
+  # within_ticks=1800. Heli pair must close the cluster on the
+  # correct side of the map within budget.
+  hard:
+    description: >
+      Two helicopters (heli, allies) stage at ONE of two corridors
+      (NORTH y=11..13 OR SOUTH y=27..29, chosen by seed) at x=30 on
+      adjacent rows. They face a cluster of FIVE enemy riflemen at
+      (60, 18..22) behind a pbox wall (x=50, y=10..30, capped). Fly
+      the helis over the wall and clear the line. Win when at least
+      5 enemy units are killed AND your base is intact, before tick
+      1800.
+    overrides:
+      actors:
+        # Agent base anchor — duplicated under BOTH spawn_point
+        # groups because ANY agent actor with spawn_point causes
+        # agent actors WITHOUT spawn_point to be filtered out.
+        - {type: fact, owner: agent, position: [4, 20], spawn_point: 0}
+        - {type: fact, owner: agent, position: [4, 20], spawn_point: 1}
+        # spawn_point 0 — NORTH staging (y=11/y=13). Two heli.
+        - {type: heli, owner: agent, position: [30, 11], stance: 2, spawn_point: 0}
+        - {type: heli, owner: agent, position: [30, 13], stance: 2, spawn_point: 0}
+        # spawn_point 1 — SOUTH staging (y=27/y=29). Two heli.
+        - {type: heli, owner: agent, position: [30, 27], stance: 2, spawn_point: 1}
+        - {type: heli, owner: agent, position: [30, 29], stance: 2, spawn_point: 1}
+        # Enemy actors don't honour spawn_point, so the SAME wall +
+        # cluster places regardless of which agent group is chosen.
+        - {type: pbox, owner: enemy, position: [50, 9],  stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 10], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 11], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 12], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 13], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 14], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 15], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 16], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 17], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 18], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 19], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 20], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 21], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 22], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 23], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 24], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 25], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 26], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 27], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 28], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 29], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 30], stance: 0}
+        - {type: pbox, owner: enemy, position: [50, 31], stance: 0}
+        - {type: e1, owner: enemy, position: [60, 18], stance: 0}
+        - {type: e1, owner: enemy, position: [60, 19], stance: 0}
+        - {type: e1, owner: enemy, position: [60, 20], stance: 0}
+        - {type: e1, owner: enemy, position: [60, 21], stance: 0}
+        - {type: e1, owner: enemy, position: [60, 22], stance: 0}
+        - {type: fact, owner: enemy, position: [124, 20]}
+    win_condition:
+      all_of:
+        - {units_killed_gte: 5}
+        - {has_building: fact}
+        - {within_ticks: 1800}
+    fail_condition:
+      any_of:
+        - {after_ticks: 1801}
+        - {not: {has_building: fact}}
+    max_turns: 21

@@ -1213,6 +1213,36 @@ impl World {
             Some(loc) => loc,
             None => return,
         };
+        // Aircraft MVP: helicopters / planes do not interact with the
+        // ground passability grid. They fly straight from current cell
+        // to target, ignoring impassable terrain AND ground-unit /
+        // building occupancy. We skip the unclaimed-cell resolver (which
+        // exists to prevent ground units stacking on the same destination
+        // cell) because multiple aircraft can share airspace freely.
+        let is_aircraft = self
+            .actors
+            .get(&actor_id)
+            .map(|a| a.kind == ActorKind::Aircraft)
+            .unwrap_or(false);
+        if is_aircraft {
+            // Clamp target into map bounds; outside that, refuse.
+            if !self.terrain.contains(target.0, target.1) {
+                return;
+            }
+            let path = pathfinder::straight_line_path(from, target);
+            if path.len() > 1 {
+                let speed = self.actor_speed(actor_id);
+                let move_activity = Activity::Move {
+                    path,
+                    path_index: 1,
+                    speed,
+                };
+                if let Some(actor) = self.actors.get_mut(&actor_id) {
+                    actor.activity = Some(move_activity);
+                }
+            }
+            return;
+        }
         // Resolve destination: spread to nearest unoccupied cell if target
         // is taken (by terrain occupancy or by another unit's pending move
         // destination this frame). The reservation set prevents N concurrent
@@ -3542,21 +3572,29 @@ impl World {
                 }
                 let target_cell = path[*path_index];
                 let target_center = center_of_cell(target_cell.0, target_cell.1);
+                let is_aircraft = actor.kind == ActorKind::Aircraft;
 
                 // C# TurnsWhileMoving=false: at each path cell, if facing doesn't
                 // match the next segment, stop and Turn in place first.
                 // Reference: OpenRA Move.cs lines 207-213.
-                if let Some(current_loc) = actor.location {
-                    let desired_facing = pathfinder::facing_between(current_loc, target_cell);
-                    let current_facing = actor.traits.iter()
-                        .find_map(|t| {
-                            if let TraitState::Mobile { facing, .. } = t { Some(*facing) } else { None }
-                        })
-                        .unwrap_or(0);
-                    if current_facing != desired_facing {
-                        // Need to turn first — convert Move to Turn→Move
-                        turn_before_move.push(actor.id);
-                        continue;
+                //
+                // Aircraft MVP: skip the turn-in-place gate entirely — a
+                // helicopter using `CanSlide: True` rotates while moving
+                // and never stalls mid-flight to align. This keeps the
+                // straight-line air path single-segment continuous.
+                if !is_aircraft {
+                    if let Some(current_loc) = actor.location {
+                        let desired_facing = pathfinder::facing_between(current_loc, target_cell);
+                        let current_facing = actor.traits.iter()
+                            .find_map(|t| {
+                                if let TraitState::Mobile { facing, .. } = t { Some(*facing) } else { None }
+                            })
+                            .unwrap_or(0);
+                        if current_facing != desired_facing {
+                            // Need to turn first — convert Move to Turn→Move
+                            turn_before_move.push(actor.id);
+                            continue;
+                        }
                     }
                 }
 
@@ -3601,7 +3639,12 @@ impl World {
 
                 if arrived {
                     let old_loc = actor.location.unwrap_or(target_cell);
-                    if old_loc != target_cell {
+                    if old_loc != target_cell && !is_aircraft {
+                        // Aircraft skip terrain occupancy entirely — they
+                        // don't block ground units and ground units don't
+                        // block them. Tracking their "cell" via
+                        // `actor.location` is still useful for range /
+                        // sight queries.
                         occupancy_updates.push((actor.id, old_loc, target_cell));
                     }
                     actor.location = Some(target_cell);
@@ -4156,6 +4199,8 @@ impl World {
                             .unwrap_or((2, 2));
                         self.terrain.clear_footprint(loc.0, loc.1, fw, fh);
                     }
+                } else if dead.kind == ActorKind::Aircraft {
+                    // Aircraft never claimed ground occupancy.
                 } else if let Some(loc) = dead.location {
                     self.terrain.clear_occupant(loc.0, loc.1);
                 }
@@ -4204,11 +4249,35 @@ impl World {
                 Some(loc) => loc,
                 None => continue,
             };
-            // Find nearest passable cell adjacent to the target (for attacking buildings)
-            let chase_dest = self.find_adjacent_passable(target_loc, attacker_id)
-                .unwrap_or(target_loc);
-            // Pathfind toward target
-            if let Some(path) = pathfinder::find_path(&self.terrain, from, chase_dest, Some(attacker_id)) {
+            // Aircraft: chase in a straight line, ignoring terrain. The
+            // ground-unit branch (below) uses A* + passable-adjacent
+            // resolution because tanks can't path into a building cell;
+            // a heli can hover anywhere, so the straight-line chase puts
+            // it directly over the target.
+            let attacker_is_aircraft = self
+                .actors
+                .get(&attacker_id)
+                .map(|a| a.kind == ActorKind::Aircraft)
+                .unwrap_or(false);
+            let chase_dest = if attacker_is_aircraft {
+                target_loc
+            } else {
+                self.find_adjacent_passable(target_loc, attacker_id)
+                    .unwrap_or(target_loc)
+            };
+            // Pathfind toward target. Aircraft use the straight-line
+            // helper directly (always succeeds in-bounds); ground units
+            // path via A*.
+            let path_opt = if attacker_is_aircraft {
+                if !self.terrain.contains(chase_dest.0, chase_dest.1) {
+                    None
+                } else {
+                    Some(pathfinder::straight_line_path(from, chase_dest))
+                }
+            } else {
+                pathfinder::find_path(&self.terrain, from, chase_dest, Some(attacker_id))
+            };
+            if let Some(path) = path_opt {
                 if path.len() > 1 {
                     // Advance toward the next path cell at the actor's
                     // real movement speed (world units/tick), lerping the
@@ -4220,8 +4289,9 @@ impl World {
                     // decision frame instead of pathing normally.
                     let speed = self.actor_speed(attacker_id);
                     let next_cell = path[1];
+                    // Aircraft ignore ground occupancy — they're airborne.
                     let occ = self.terrain.occupant(next_cell.0, next_cell.1);
-                    if occ == 0 || occ == attacker_id {
+                    if attacker_is_aircraft || occ == 0 || occ == attacker_id {
                         let next_center = center_of_cell(next_cell.0, next_cell.1);
                         let mut arrived = false;
                         if let Some(actor) = self.actors.get_mut(&attacker_id) {
@@ -4282,9 +4352,15 @@ impl World {
                         // the interpolated position actually reaches the
                         // next cell center.
                         if arrived {
-                            self.terrain.clear_occupant(from.0, from.1);
-                            self.terrain
-                                .set_occupant(next_cell.0, next_cell.1, attacker_id);
+                            // Aircraft don't claim ground cells (see Move
+                            // tick comment); skip both the clear and the
+                            // set so the air unit's path leaves the ground
+                            // occupancy grid untouched.
+                            if !attacker_is_aircraft {
+                                self.terrain.clear_occupant(from.0, from.1);
+                                self.terrain
+                                    .set_occupant(next_cell.0, next_cell.1, attacker_id);
+                            }
                             if let Some(actor) = self.actors.get_mut(&attacker_id) {
                                 actor.location = Some(next_cell);
                             }
@@ -4675,6 +4751,10 @@ impl World {
                             .unwrap_or((2, 2));
                         self.terrain.clear_footprint(loc.0, loc.1, fw, fh);
                     }
+                } else if dead.kind == ActorKind::Aircraft {
+                    // Aircraft never claimed ground occupancy — leave the
+                    // grid alone so a ground unit beneath the wreck isn't
+                    // erased.
                 } else if let Some(loc) = dead.location {
                     self.terrain.clear_occupant(loc.0, loc.1);
                 }
@@ -4764,7 +4844,10 @@ impl World {
             kills: 0, rank: 0,
         };
         self.actors.insert(unit_id, actor);
-        self.terrain.set_occupant(x, y, unit_id);
+        // Aircraft don't claim ground cells (see Move tick / insert_test_actor).
+        if kind != ActorKind::Aircraft {
+            self.terrain.set_occupant(x, y, unit_id);
+        }
         eprintln!("SPAWN: {} id={} at ({},{}) owner={} speed={} hp={}",
             unit_type, unit_id, x, y, owner_player_id, speed, hp);
 
@@ -5839,6 +5922,10 @@ pub fn insert_test_actor(world: &mut World, actor: Actor) {
                 .map(|s| s.footprint)
                 .unwrap_or((1, 1));
             world.terrain.occupy_footprint(loc.0, loc.1, fw, fh, id);
+        } else if actor.kind == ActorKind::Aircraft {
+            // Aircraft are airborne — they don't claim ground cells, so
+            // tests / scenarios can spawn a heli over a building footprint
+            // or impassable terrain without corrupting the occupancy grid.
         } else {
             world.terrain.set_occupant(loc.0, loc.1, id);
         }
@@ -5862,6 +5949,8 @@ pub fn remove_test_actor(world: &mut World, id: u32) -> Option<Actor> {
                 .map(|s| s.footprint)
                 .unwrap_or((1, 1));
             world.terrain.clear_footprint(loc.0, loc.1, fw, fh);
+        } else if actor.kind == ActorKind::Aircraft {
+            // Aircraft never occupied — nothing to clear.
         } else {
             world.terrain.clear_occupant(loc.0, loc.1);
         }

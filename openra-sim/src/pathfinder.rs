@@ -231,6 +231,45 @@ pub fn find_path(
     None // No path found
 }
 
+/// Straight-line cell-by-cell path from `from` to `to`, ignoring terrain
+/// passability and occupancy entirely. Used by `ActorKind::Aircraft`:
+/// helicopters / planes fly over ground obstacles, so the MVP air-unit
+/// movement model bypasses the A* grid-traversal and just lays down a
+/// Bresenham-style stair-stepped path between the two cells.
+///
+/// Returns a path inclusive of both endpoints. Always succeeds (no
+/// `None` case) — aircraft can always reach any in-bounds cell because
+/// nothing on the ground blocks them.
+pub fn straight_line_path(from: (i32, i32), to: (i32, i32)) -> Vec<(i32, i32)> {
+    if from == to {
+        return vec![from];
+    }
+    let mut path = Vec::new();
+    let dx = (to.0 - from.0).abs();
+    let dy = -(to.1 - from.1).abs();
+    let sx: i32 = if from.0 < to.0 { 1 } else { -1 };
+    let sy: i32 = if from.1 < to.1 { 1 } else { -1 };
+    let mut err = dx + dy;
+    let (mut x, mut y) = from;
+    path.push((x, y));
+    loop {
+        if (x, y) == to {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
+        }
+        path.push((x, y));
+    }
+    path
+}
+
 /// Compute the WAngle facing from cell `from` to cell `to`.
 ///
 /// OpenRA WAngle: 0-1023 angles, counter-clockwise:
