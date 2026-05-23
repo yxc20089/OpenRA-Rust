@@ -15,6 +15,7 @@ pub mod pathfinder;
 pub mod projectile;
 pub mod rng;
 pub mod scripted_bot;
+pub mod superweapon;
 pub mod sync;
 pub mod terrain;
 pub mod traits;

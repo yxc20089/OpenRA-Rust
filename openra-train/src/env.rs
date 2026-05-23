@@ -1306,6 +1306,40 @@ impl Env {
                         extra_data: None,
                     });
                 }
+                Command::FireSuperweapon { kind, target_cell, target_id } => {
+                    // Resolve and validate the (typed) actor id for
+                    // iron-curtain / chrono targets. Nuke ignores
+                    // `target_id`.
+                    let resolved_target: Option<u32> = match target_id {
+                        Some(id_str) => match parse_actor_id(id_str) {
+                            Some(v) => Some(v),
+                            None => {
+                                self.last_warnings.push(format!(
+                                    "FireSuperweapon: invalid target_id {id_str:?}"
+                                ));
+                                continue;
+                            }
+                        },
+                        None => None,
+                    };
+                    // Encode payload into target_string for the engine
+                    // order handler: "kind|tx,ty|tid" where any of tx,ty,
+                    // tid can be empty (`-`) when not provided.
+                    let cell_part = match target_cell {
+                        Some((x, y)) => format!("{x},{y}"),
+                        None => "-".into(),
+                    };
+                    let tid_part = match resolved_target {
+                        Some(v) => v.to_string(),
+                        None => "-".into(),
+                    };
+                    orders.push(GameOrder {
+                        order_string: "FireSuperweapon".into(),
+                        subject_id: Some(issuing_player),
+                        target_string: Some(format!("{kind}|{cell_part}|{tid_part}")),
+                        extra_data: None,
+                    });
+                }
             }
         }
         orders

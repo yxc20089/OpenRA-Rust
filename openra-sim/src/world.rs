@@ -329,8 +329,19 @@ pub struct World {
     /// the legacy "engage what wanders into range" default.
     hunt_enabled: HashSet<u32>,
     /// Superweapon charge timers: (building_type, owner_player_id) → ticks_remaining.
+    /// Legacy string-keyed table for the existing ActivateSuperweapon
+    /// order path (kept for back-compat — `dome` GPS still uses it).
     superweapon_timers: HashMap<(String, u32), i32>,
+    /// Typed superweapon charge state for the Nuke / IronCurtain /
+    /// Chronosphere weapons (see `crate::superweapon`). Each entry is
+    /// keyed by (kind, owner_player_id); seeded when the player owns the
+    /// matching launcher building, ticks down on every World::tick, and
+    /// reset on fire.
+    pub superweapons: crate::superweapon::SuperweaponManager,
     /// Actors with invulnerability ticks remaining (Iron Curtain).
+    /// The HashMap is the de-facto `invulnerable_until_tick` for each
+    /// actor — entries are decremented every tick and removed at 0. The
+    /// damage application paths skip any actor present in this map.
     invulnerable: HashMap<u32, i32>,
     /// Player faction mapping: player_actor_id → faction name.
     player_factions: HashMap<u32, String>,
@@ -1037,6 +1048,59 @@ impl World {
                     self.stances.insert(subject_id, s);
                 }
             }
+            "FireSuperweapon" => {
+                // target_string format: "kind|tx,ty|tid" (tx/ty/tid may
+                // each be "-" to indicate "not provided").
+                let owner = match order.subject_id {
+                    Some(v) => v,
+                    None => return,
+                };
+                let payload = match &order.target_string {
+                    Some(s) => s.clone(),
+                    None => return,
+                };
+                let parts: Vec<&str> = payload.splitn(3, '|').collect();
+                if parts.len() < 3 {
+                    eprintln!("FireSuperweapon: malformed payload {payload:?}");
+                    return;
+                }
+                let kind = match crate::superweapon::SuperweaponKind::from_building_type(parts[0]) {
+                    Some(k) => k,
+                    None => {
+                        eprintln!("FireSuperweapon: unknown kind {:?}", parts[0]);
+                        return;
+                    }
+                };
+                let target_cell: Option<(i32, i32)> = if parts[1] == "-" {
+                    None
+                } else {
+                    let xy: Vec<&str> = parts[1].split(',').collect();
+                    if xy.len() == 2 {
+                        match (xy[0].parse::<i32>(), xy[1].parse::<i32>()) {
+                            (Ok(x), Ok(y)) => Some((x, y)),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    }
+                };
+                let target_id: Option<u32> = if parts[2] == "-" {
+                    None
+                } else {
+                    parts[2].parse::<u32>().ok()
+                };
+                match self.fire_superweapon(kind, owner, target_cell, target_id) {
+                    Ok(n) => {
+                        eprintln!(
+                            "SUPERWEAPON FIRED: {} player={} cell={:?} target={:?} hit={}",
+                            kind.building_type(), owner, target_cell, target_id, n
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("FireSuperweapon rejected: {e}");
+                    }
+                }
+            }
             // C# parity: PATROL defined but unimplemented — accept
             // silently (no warn, no behaviour change).
             "Patrol" => {}
@@ -1713,6 +1777,177 @@ impl World {
                 *ticks -= 1;
             }
         }
+
+        // Typed manager (Nuke / IronCurtain / Chronosphere) — seed a
+        // charge timer for every (kind, owner) pair where the owner
+        // owns at least one live launcher building, then tick down.
+        {
+            use crate::superweapon::SuperweaponKind;
+            let pairs: Vec<(SuperweaponKind, u32)> = self.actors.values()
+                .filter(|a| a.kind == ActorKind::Building)
+                .filter_map(|a| {
+                    let t = a.actor_type.as_deref()?;
+                    let kind = SuperweaponKind::from_building_type(t)?;
+                    Some((kind, a.owner_id?))
+                })
+                .collect();
+            for (kind, owner) in pairs {
+                self.superweapons.ensure_timer(kind, owner);
+            }
+            self.superweapons.tick();
+        }
+    }
+
+    /// Fire a typed superweapon for `owner`. Validates ownership of a
+    /// launcher building of the matching kind and that the weapon is
+    /// fully charged. Returns Ok with the number of affected actors
+    /// (for nuke: actors damaged/killed; for iron: 1 if applied, 0
+    /// otherwise; for chrono: 1 if teleported, 0 otherwise) or an Err
+    /// describing the validation failure.
+    ///
+    /// `target_cell` is required for Nuke and Chronosphere (the
+    /// destination cell). `target_id` is required for Iron Curtain and
+    /// Chronosphere (the friendly actor being affected).
+    pub fn fire_superweapon(
+        &mut self,
+        kind: crate::superweapon::SuperweaponKind,
+        owner: u32,
+        target_cell: Option<(i32, i32)>,
+        target_id: Option<u32>,
+    ) -> Result<usize, String> {
+        // Validate launcher ownership.
+        let has_launcher = self.actors.values().any(|a| {
+            a.kind == ActorKind::Building
+                && a.owner_id == Some(owner)
+                && a.actor_type.as_deref() == Some(kind.building_type())
+        });
+        if !has_launcher {
+            return Err(format!(
+                "player {owner} owns no {} launcher",
+                kind.building_type()
+            ));
+        }
+        // Validate charge.
+        if !self.superweapons.is_ready(kind, owner) {
+            return Err(format!(
+                "{} not charged for player {owner}",
+                kind.building_type()
+            ));
+        }
+
+        use crate::superweapon::SuperweaponKind;
+        let affected = match kind {
+            SuperweaponKind::Nuke => {
+                let (tx, ty) = target_cell.ok_or_else(|| "nuke needs target_cell".to_string())?;
+                self.detonate_nuke(owner, tx, ty)
+            }
+            SuperweaponKind::IronCurtain => {
+                let tid = target_id.ok_or_else(|| "iron curtain needs target_id".to_string())?;
+                let actor = self.actors.get(&tid)
+                    .ok_or_else(|| format!("iron curtain target {tid} not found"))?;
+                if actor.owner_id != Some(owner) {
+                    return Err(format!("iron curtain target {tid} not owned by {owner}"));
+                }
+                self.invulnerable
+                    .insert(tid, crate::superweapon::IRON_CURTAIN_TICKS as i32);
+                1
+            }
+            SuperweaponKind::Chronosphere => {
+                let tid = target_id.ok_or_else(|| "chronosphere needs target_id".to_string())?;
+                let (tx, ty) = target_cell.ok_or_else(|| "chronosphere needs target_cell".to_string())?;
+                let actor = self.actors.get(&tid)
+                    .ok_or_else(|| format!("chrono target {tid} not found"))?;
+                if actor.owner_id != Some(owner) {
+                    return Err(format!("chrono target {tid} not owned by {owner}"));
+                }
+                if self.teleport_actor(tid, tx, ty) { 1 } else { 0 }
+            }
+        };
+
+        self.superweapons.reset(kind, owner);
+        Ok(affected)
+    }
+
+    /// Apply nuclear-strike AoE damage at `(target_x, target_y)` and
+    /// return the number of actors hit. Damage falls off linearly with
+    /// Chebyshev distance to the centre; dead actors are removed.
+    fn detonate_nuke(&mut self, _owner: u32, target_x: i32, target_y: i32) -> usize {
+        let radius = crate::superweapon::NUKE_RADIUS_CELLS;
+        let base = crate::superweapon::NUKE_BASE_DAMAGE;
+        let mut damaged: Vec<(u32, i32)> = Vec::new();
+        for actor in self.actors.values() {
+            if let Some((ax, ay)) = actor.location {
+                let dist = (ax - target_x).abs().max((ay - target_y).abs());
+                if dist <= radius {
+                    let dmg = base * (radius + 1 - dist) / (radius + 1);
+                    damaged.push((actor.id, dmg));
+                }
+            }
+        }
+        let hit = damaged.len();
+        let mut dead: Vec<u32> = Vec::new();
+        for (aid, dmg) in damaged {
+            // Invulnerable actors (e.g. under Iron Curtain) take no damage.
+            if self.invulnerable.contains_key(&aid) {
+                continue;
+            }
+            if let Some(actor) = self.actors.get_mut(&aid) {
+                for t in &mut actor.traits {
+                    if let TraitState::Health { hp } = t {
+                        *hp -= dmg;
+                        if *hp <= 0 {
+                            dead.push(aid);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        for id in dead {
+            if let Some(a) = self.actors.remove(&id) {
+                if let Some(loc) = a.location {
+                    self.terrain.clear_occupant(loc.0, loc.1);
+                }
+            }
+        }
+        hit
+    }
+
+    /// Teleport an actor to `(x, y)`. Cancels any in-flight activity,
+    /// updates the terrain occupant map, and updates the Mobile trait's
+    /// from/to cell. Returns true on success, false if the destination
+    /// is out of bounds, impassable, or already occupied by another
+    /// actor.
+    pub fn teleport_actor(&mut self, actor_id: u32, x: i32, y: i32) -> bool {
+        if !self.terrain.contains(x, y) || !self.terrain.is_terrain_passable(x, y) {
+            return false;
+        }
+        let occ = self.terrain.occupant(x, y);
+        if occ != 0 && occ != actor_id {
+            return false;
+        }
+        let old_loc = match self.actors.get(&actor_id) {
+            Some(a) => a.location,
+            None => return false,
+        };
+        if let Some((ox, oy)) = old_loc {
+            self.terrain.clear_occupant(ox, oy);
+        }
+        self.terrain.set_occupant(x, y, actor_id);
+        if let Some(actor) = self.actors.get_mut(&actor_id) {
+            actor.location = Some((x, y));
+            actor.activity = None;
+            let new_cell = crate::math::CPos::new(x, y);
+            let new_center = center_of_cell(x, y);
+            for t in &mut actor.traits {
+                if let TraitState::Mobile { from_cell, to_cell, center_position, .. } = t {
+                    *from_cell = new_cell;
+                    *to_cell = new_cell;
+                    *center_position = new_center;
+                }
+            }
+        }
+        true
     }
 
     fn tick_harvesters(&mut self) {
@@ -5262,6 +5497,7 @@ pub fn build_world(
         recently_received_fire: HashMap::new(),
         hunt_enabled: HashSet::new(),
         superweapon_timers: HashMap::new(),
+        superweapons: crate::superweapon::SuperweaponManager::new(),
         invulnerable: HashMap::new(),
         player_factions,
         typed_shroud: BTreeMap::new(),
