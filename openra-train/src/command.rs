@@ -62,6 +62,12 @@ pub enum Command {
     Surrender,
     /// No-op; the env still ticks N frames.
     Observe,
+    /// Order an engineer (`e6`) to walk to an enemy building and
+    /// capture it (C# `Captures`). On arrival the target's ownership
+    /// transfers to the capturer's player and the engineer is consumed.
+    /// `unit_ids` holds engineer id(s); `target_id` is the enemy
+    /// building id.
+    CaptureActor { unit_ids: Vec<String>, target_id: String },
 }
 
 /// Python-facing shim around `Command`.
@@ -179,6 +185,15 @@ impl PyCommand {
     #[staticmethod]
     fn patrol(unit_ids: Vec<String>) -> Self {
         Self { inner: Command::Patrol { unit_ids } }
+    }
+
+    /// Order engineer(s) to capture an enemy building. The capturer
+    /// walks to the target building's cell; on arrival the building's
+    /// owner is transferred to the capturer's player and the engineer
+    /// is consumed.
+    #[staticmethod]
+    fn capture_actor(unit_ids: Vec<String>, target_id: String) -> Self {
+        Self { inner: Command::CaptureActor { unit_ids, target_id } }
     }
 
     fn __repr__(&self) -> String {
