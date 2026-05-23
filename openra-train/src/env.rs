@@ -899,6 +899,19 @@ impl Env {
             self.map_def.spawn_mcvs,
         );
 
+        // Naval-MVP overlay: stamp scenario-declared `water_cells:` into
+        // the live terrain. Each cell becomes ground-impassable and
+        // ship-passable. Done AFTER `build_world` so the engine's
+        // `apply_temperat_passability` pass (which has no water concept,
+        // only "fully impassable") runs first; the overlay is the
+        // authoritative source for naval scenarios that use the YAML
+        // path. Out-of-bounds entries are silently ignored.
+        for &(wx, wy) in &self.map_def.water_cells {
+            if world.terrain.contains(wx, wy) {
+                world.terrain.set_water(wx, wy, true);
+            }
+        }
+
         // Resolve player ids: `build_world` allocates the World actor
         // (id 0), then non-playable players, then playable players, then
         // the "Everyone" spectator. With one Neutral + two playable,
@@ -2508,6 +2521,7 @@ pub fn build_test_env_with_no_enemies(map_size: (i32, i32), seed: u64) -> Env {
         scheduled_events: Vec::new(),
         reveal_map: false,
         ore_patches: Vec::new(),
+        water_cells: Vec::new(),
     };
     let mut env = Env {
         scenario_path: PathBuf::from("<test>"),

@@ -132,11 +132,28 @@ pub fn find_nearest_unoccupied(
 ///
 /// `ignore_actor` optionally allows pathing through cells occupied by
 /// a specific actor (e.g., the moving unit itself).
+///
+/// Delegates to [`find_path_for_kind`] with `naval = false` (ground-
+/// locomotor semantics: water cells are impassable). Call
+/// `find_path_for_kind(.., true)` for ships.
 pub fn find_path(
     terrain: &TerrainMap,
     from: (i32, i32),
     to: (i32, i32),
     ignore_actor: Option<u32>,
+) -> Option<Vec<(i32, i32)>> {
+    find_path_for_kind(terrain, from, to, ignore_actor, false)
+}
+
+/// Naval-aware variant of [`find_path`]. `naval = true` ⇒ only water
+/// cells are walkable; `naval = false` ⇒ only non-water passable cells
+/// are walkable.
+pub fn find_path_for_kind(
+    terrain: &TerrainMap,
+    from: (i32, i32),
+    to: (i32, i32),
+    ignore_actor: Option<u32>,
+    naval: bool,
 ) -> Option<Vec<(i32, i32)>> {
     if from == to {
         return Some(vec![from]);
@@ -196,9 +213,16 @@ pub fn find_path(
                 continue;
             }
 
-            // Check passability
+            // Check passability — kind-aware. Ground units treat water
+            // as impassable; ships treat non-water as impassable. Both
+            // honour the per-cell cost gate (buildings/cliffs) and the
+            // occupancy gate below.
             let terrain_cost = terrain.cost(nx, ny);
             if terrain_cost == crate::terrain::COST_IMPASSABLE {
+                continue;
+            }
+            let cell_is_water = terrain.is_water(nx, ny);
+            if naval != cell_is_water {
                 continue;
             }
 
@@ -342,6 +366,36 @@ mod tests {
         let terrain = TerrainMap::new(10, 10);
         let path = find_path(&terrain, (5, 5), (5, 5), None).unwrap();
         assert_eq!(path, vec![(5, 5)]);
+    }
+
+    #[test]
+    fn ship_paths_water_only_ground_cannot_enter_water() {
+        // 10×10 board. Carve a 1-cell-thick water column at x=5 from
+        // y=0..10. Ship should path along the column; a ground unit
+        // should fail to traverse it.
+        let mut t = TerrainMap::new(10, 10);
+        for y in 0..10 {
+            t.set_water(5, y, true);
+        }
+        // Naval: from (5,0) to (5,9) along the water column — should succeed.
+        let nav = find_path_for_kind(&t, (5, 0), (5, 9), None, true).expect("ship path");
+        assert!(nav.iter().all(|&(x, _)| x == 5), "ship strayed off water: {nav:?}");
+
+        // Naval: from (0,0) to (5,5) — start cell is grass, ship can't move.
+        // But naval pathfinder requires every step to be water. (0,0) is the
+        // start so we never check it; the very first neighbour must be water.
+        // (4,5) is grass; (5,5) is water. From (0,0) there is no water-adjacent
+        // step at all, so the path should fail.
+        assert!(find_path_for_kind(&t, (0, 0), (5, 5), None, true).is_none());
+
+        // Ground: try to cross the water column from (0,5) to (9,5) — A*
+        // should refuse to step into x=5 and (because the water column spans
+        // the full height) no detour exists.
+        assert!(find_path(&t, (0, 5), (9, 5), None).is_none());
+
+        // Ground unit walking on grass left of the water still works.
+        let g = find_path(&t, (0, 0), (4, 9), None).expect("ground path off water");
+        assert!(g.iter().all(|&(x, _)| x < 5));
     }
 
     #[test]
