@@ -90,7 +90,11 @@ pub enum DefenseKind {
     /// having a 3-charge salvo we approximate as plain reload-gated
     /// shots in Phase 7.
     Tesla,
-    /// AA-only: not yet wired to fire at anything (no aircraft yet).
+    /// AA-only (sam, agun) — auto-fires on `ActorKind::Aircraft`
+    /// targets only, via the `world.rs` defense scan. Filter is
+    /// classifier-driven (this enum), not weapon `versus` table
+    /// driven — see commit 8688bad. Fixtures without vendored RA
+    /// YAML get a default `AAStub` weapon from `gamerules.rs`.
     AntiAirOnly,
     /// Has a primary weapon trait but it is intentionally unmapped
     /// (e.g. SAM whose weapon name we don't include).
@@ -108,7 +112,7 @@ pub fn classify_defense(actor_type: &str) -> Option<DefenseKind> {
         "gun" | "pbox" | "hbox" | "ftur" => Some(DefenseKind::GroundTurret),
         // Tesla coil — special charge cycle, approximated as a turret.
         "tsla" => Some(DefenseKind::Tesla),
-        // AA-only — inert until aircraft exist.
+        // AA-only — auto-fires on Aircraft kind targets only.
         "agun" | "sam" => Some(DefenseKind::AntiAirOnly),
         // Gap generator — has no offensive weapon.
         "gap" => Some(DefenseKind::InertWeapon),

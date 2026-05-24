@@ -3826,9 +3826,14 @@ impl World {
             let defense_kind = match crate::traits::classify_defense(actor_type) {
                 Some(crate::traits::DefenseKind::GroundTurret) => "turret",
                 Some(crate::traits::DefenseKind::Tesla) => "tesla",
-                _ => continue, // AA-only / inert / cosmetic — never auto-fire
+                // AA-only (sam/agun) defenses auto-fire too — but at
+                // AIRCRAFT only. The candidate-filter below honours
+                // `is_anti_air` to include `ActorKind::Aircraft` in
+                // the scan and exclude ground targets.
+                Some(crate::traits::DefenseKind::AntiAirOnly) => "antiair",
+                _ => continue, // inert / cosmetic — never auto-fire
             };
-            let _ = defense_kind; // currently both behave identically
+            let is_anti_air = defense_kind == "antiair";
             let owner = match actor.owner_id {
                 Some(o) => o,
                 None => continue,
@@ -3865,13 +3870,33 @@ impl World {
                 if cand_owner == owner {
                     continue;
                 }
-                if !matches!(
-                    cand.kind,
-                    ActorKind::Infantry
-                        | ActorKind::Vehicle
-                        | ActorKind::Mcv
-                        | ActorKind::Building
-                ) {
+                // AA-only defenses target ONLY aircraft. Ground
+                // defenses target everything except aircraft (heli /
+                // mig / yak / hind fly above ground armament arcs in
+                // RA; the engine MVP mirrors the discrimination by
+                // excluding ActorKind::Aircraft from ground-defense
+                // scans). A future SAM-equivalent stance could allow
+                // SAM-fires-on-ground; not needed for F11.
+                //
+                // Filter is classifier-driven (`is_anti_air` from
+                // DefenseKind), NOT weapon `versus` table driven —
+                // a defense that someone gave an air-capable weapon
+                // would still NOT engage aircraft unless its
+                // classifier is `AntiAirOnly`. Extending SAM-on-
+                // ground requires updating `classify_defense`, not
+                // adjusting weapon versus tables.
+                let cand_ok = if is_anti_air {
+                    cand.kind == ActorKind::Aircraft
+                } else {
+                    matches!(
+                        cand.kind,
+                        ActorKind::Infantry
+                            | ActorKind::Vehicle
+                            | ActorKind::Mcv
+                            | ActorKind::Building
+                    )
+                };
+                if !cand_ok {
                     continue;
                 }
                 // Skip dead actors (defensive).
@@ -5372,10 +5397,28 @@ impl World {
     }
 
     /// Find a spawn location near a production building for the given owner.
+    ///
+    /// Per-kind spawn semantics:
+    ///   * Infantry: spawn next to a `tent`/`barr` on a ground-passable
+    ///     cell.
+    ///   * Vehicles (incl. `harv`): spawn next to a `weap`/`proc` on a
+    ///     ground-passable cell.
+    ///   * Aircraft (`heli`/`hind`/`yak`/`mig`): spawn next to a
+    ///     `hpad`/`afld` on a ground-passable cell (aircraft are not
+    ///     placed in the terrain occupancy grid, so the cell only
+    ///     needs to be in-bounds — `is_passable` is a conservative
+    ///     proxy).
+    ///   * Ships (`dd`/`sub`/...): spawn next to a `syrd`/`spen` on a
+    ///     WATER cell (ground cells are invalid for ships). Without
+    ///     this, a built destroyer materialises on dry land and is
+    ///     stuck (Mobile::Ship can only enter water).
     fn find_spawn_location(&self, owner_player_id: u32, unit_type: &str) -> Option<(i32, i32)> {
-        let is_infantry = self.rules.actor(unit_type)
-            .map(|s| s.kind == ActorKind::Infantry)
-            .unwrap_or(false);
+        let unit_kind = self.rules.actor(unit_type)
+            .map(|s| s.kind)
+            .unwrap_or(ActorKind::Vehicle);
+        let is_infantry = unit_kind == ActorKind::Infantry;
+        let is_aircraft = unit_kind == ActorKind::Aircraft;
+        let is_ship = unit_kind == ActorKind::Ship;
 
         // Collect all production buildings of the right type. C#
         // `PrimaryBuilding`: if one of them is flagged primary, it
@@ -5393,12 +5436,12 @@ impl World {
                             matches!(btype, "tent" | "barr")
                         } else if unit_type == "harv" {
                             matches!(btype, "proc" | "weap" | "weap.ukraine")
+                        } else if is_aircraft {
+                            matches!(btype, "hpad" | "afld")
+                        } else if is_ship {
+                            matches!(btype, "spen" | "syrd")
                         } else {
-                            matches!(
-                                btype,
-                                "weap" | "weap.ukraine" | "hpad" | "afld"
-                                    | "spen" | "syrd"
-                            )
+                            matches!(btype, "weap" | "weap.ukraine")
                         }
                     }
             })
@@ -5407,18 +5450,45 @@ impl World {
             (!self.primary_buildings.contains(&a.id), a.id)
         });
 
+        // Ships need a water-adjacent search; we scan ONE cell further
+        // out than the building footprint so a 3×3 shipyard placed
+        // directly against the shoreline can spawn its dd in the
+        // first water cell off any face.
+        let scan_radius_extra = if is_ship { 2 } else { 1 };
+
         for actor in candidates {
             let btype = actor.actor_type.as_deref().unwrap_or("");
-            {
-                if let Some((bx, by)) = actor.location {
-                    let (fw, fh) = self.rules.actor(btype)
-                        .map(|s| s.footprint)
-                        .unwrap_or((2, 2));
-                    for dy in -1..=fh {
-                        for dx in -1..=fw {
+            if let Some((bx, by)) = actor.location {
+                let (fw, fh) = self.rules.actor(btype)
+                    .map(|s| s.footprint)
+                    .unwrap_or((2, 2));
+                // Spiral outward from the building footprint by 1 cell
+                // at a time so the closest valid spawn wins.
+                for ring in 1..=scan_radius_extra {
+                    for dy in -ring..=(fh - 1 + ring) {
+                        for dx in -ring..=(fw - 1 + ring) {
+                            // Stay on the ring perimeter so we visit
+                            // each new ring once (skip interior cells
+                            // covered by earlier rings).
+                            let on_perim =
+                                dy == -ring
+                                || dy == fh - 1 + ring
+                                || dx == -ring
+                                || dx == fw - 1 + ring;
+                            if !on_perim { continue; }
                             let sx = bx + dx;
                             let sy = by + dy;
-                            if self.terrain.is_passable(sx, sy) {
+                            if is_ship {
+                                // Ships need a water cell (and an empty
+                                // occupancy slot — water cells are
+                                // independently occupiable like ground).
+                                if self.terrain.contains(sx, sy)
+                                    && self.terrain.is_water(sx, sy)
+                                    && self.terrain.occupant(sx, sy) == 0
+                                {
+                                    return Some((sx, sy));
+                                }
+                            } else if self.terrain.is_passable(sx, sy) {
                                 return Some((sx, sy));
                             }
                         }

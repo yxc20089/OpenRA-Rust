@@ -590,6 +590,35 @@ impl GameRules {
             a.prerequisites = vec!["afld".to_string()];
         }
 
+        // Anti-air defenses (`sam`, `agun`) default to a stub AA weapon
+        // so the auto-target / damage path fires on aircraft when the
+        // vendored ruleset is absent. The vendor-loaded path attaches
+        // the real `Nike` (sam) / `ZSU-23` (agun) armaments from the
+        // RA YAML via `from_ruleset`'s `Armament` reader.
+        let mut aa_versus = BTreeMap::new();
+        aa_versus.insert(ArmorType::None, 100);
+        aa_versus.insert(ArmorType::Light, 100);
+        aa_versus.insert(ArmorType::Heavy, 80);
+        weapons.insert("AAStub".to_string(), WeaponStats {
+            damage: 2000,
+            range: 8 * 1024,
+            reload_delay: 12,
+            burst: 2,
+            versus: aa_versus,
+            projectile_speed: 0,
+            splash_radius: 0,
+        });
+        if let Some(a) = actors.get_mut("sam") {
+            if a.weapons.is_empty() {
+                a.weapons = vec!["AAStub".to_string()];
+            }
+        }
+        if let Some(a) = actors.get_mut("agun") {
+            if a.weapons.is_empty() {
+                a.weapons = vec!["AAStub".to_string()];
+            }
+        }
+
         GameRules { actors, weapons }
     }
 
