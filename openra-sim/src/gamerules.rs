@@ -268,72 +268,83 @@ impl GameRules {
         GameRules { actors, weapons }
     }
 
-    /// Load GameRules from the vendored RA YAML (the single source of
-    /// truth for actor / weapon stats). Panics with a clear message if
-    /// the vendor directory cannot be located or parsed — there is no
-    /// hardcoded fallback. Callers in test code that need rules without
-    /// loading vendor for every test typically share a `OnceLock` cache.
+    /// Load GameRules from the canonical RA YAML data. By default this
+    /// reads the YAML bytes embedded inside the binary (originally
+    /// seeded from OpenRA `0938a27` — see
+    /// `openra-data/src/embedded.rs`); callers can override this by
+    /// setting `OPENRA_VENDOR_DIR` to point at an alternative vendor
+    /// snapshot for testing.
     ///
-    /// Search order:
-    /// 1. `OPENRA_VENDOR_DIR` env var (production deployments).
-    /// 2. `$CARGO_MANIFEST_DIR/../vendor/OpenRA/mods/ra` (works in `cargo
-    ///    test` since `CARGO_MANIFEST_DIR` is set per crate).
-    /// 3. `$HOME/Projects/OpenRA-Rust/vendor/OpenRA/mods/ra` (developer
-    ///    machine fallback).
-    /// 4. `$HOME/workspace/OpenRA-Rust/vendor/OpenRA/mods/ra` (server).
-    /// 5. `./vendor/OpenRA/mods/ra` and walks up two parents.
+    /// Override search order (only consulted if `OPENRA_VENDOR_DIR` is
+    /// set, or the in-tree vendor checkout still exists for tests):
+    /// 1. `OPENRA_VENDOR_DIR` env var.
+    /// 2. `$CARGO_MANIFEST_DIR/../vendor/OpenRA/mods/ra` (legacy in-tree
+    ///    checkout — present in older clones, ignored when absent).
+    /// 3. `$HOME/Projects/OpenRA-Rust/vendor/OpenRA/mods/ra`.
+    /// 4. `$HOME/workspace/OpenRA-Rust/vendor/OpenRA/mods/ra`.
+    ///
+    /// If nothing in the override chain matches, the embedded data is
+    /// used. This function therefore CANNOT FAIL — the previous panic
+    /// path (and the `try_from_vendor` Result return) was kept for API
+    /// compatibility but only fires when an EXPLICITLY-specified
+    /// `OPENRA_VENDOR_DIR` is broken.
     pub fn from_vendor() -> Self {
         match Self::try_from_vendor() {
             Ok(r) => r,
             Err(e) => panic!(
-                "GameRules::from_vendor: {e}\n\
-                 The hardcoded `defaults()` fallback was removed; vendor RA \
-                 YAML at `vendor/OpenRA/mods/ra/rules/` is now the single \
-                 source of truth. Set `OPENRA_VENDOR_DIR` or run from a tree \
-                 that contains the bundled vendor directory."
+                "GameRules::from_vendor: explicit override failed: {e}\n\
+                 (Unset OPENRA_VENDOR_DIR to fall back to the embedded \
+                  RA data baked into the binary.)"
             ),
         }
     }
 
-    /// Fallible vendor loader. Returns `Err(message)` if no candidate
-    /// path contains a parseable RA ruleset.
+    /// Fallible vendor loader. Returns the embedded ruleset when no
+    /// override is configured; honours `OPENRA_VENDOR_DIR` (and the
+    /// legacy in-tree paths) when present. Returns `Err` only when an
+    /// explicit override is set but unreadable.
     pub fn try_from_vendor() -> Result<Self, String> {
-        let mut candidates: Vec<PathBuf> = Vec::new();
+        // Explicit override — if the env var is set, it MUST resolve to
+        // a parseable ruleset. We don't silently fall back to embedded
+        // for a broken override, because that would hide configuration
+        // bugs from power users intentionally pointing at a different
+        // snapshot.
         if let Ok(p) = std::env::var("OPENRA_VENDOR_DIR") {
-            candidates.push(PathBuf::from(p));
+            let path = PathBuf::from(&p);
+            if !path.exists() {
+                return Err(format!("OPENRA_VENDOR_DIR points at non-existent path: {p}"));
+            }
+            return openra_data::rules::load_ruleset(&path)
+                .map(|rs| Self::from_ruleset(&rs))
+                .map_err(|e| format!("OPENRA_VENDOR_DIR {p}: parse failed: {e}"));
         }
-        // Each crate's own CARGO_MANIFEST_DIR at compile time. Tests in
-        // openra-sim/tests inherit the openra-sim manifest dir.
+
+        // Implicit legacy in-tree vendor — if a clone happens to still
+        // have `vendor/OpenRA/mods/ra/` populated, honour it. This keeps
+        // the parity / determinism tests in `openra-sim/tests/` that
+        // build their own ruleset directly via `load_ruleset(mod_dir)`
+        // working even before they're switched over to the embedded
+        // loader. Absence is NOT an error — fall through to embedded.
+        let mut candidates: Vec<PathBuf> = Vec::new();
         let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         candidates.push(crate_dir.join("../vendor/OpenRA/mods/ra"));
         if let Ok(home) = std::env::var("HOME") {
             candidates.push(PathBuf::from(&home).join("Projects/OpenRA-Rust/vendor/OpenRA/mods/ra"));
             candidates.push(PathBuf::from(&home).join("workspace/OpenRA-Rust/vendor/OpenRA/mods/ra"));
         }
-        candidates.push(PathBuf::from("vendor/OpenRA/mods/ra"));
-        candidates.push(PathBuf::from("../vendor/OpenRA/mods/ra"));
-        candidates.push(PathBuf::from("../../vendor/OpenRA/mods/ra"));
-
-        let mut tried = Vec::new();
         for c in &candidates {
-            tried.push(c.display().to_string());
-            if !c.exists() {
-                continue;
-            }
-            match openra_data::rules::load_ruleset(c) {
-                Ok(rs) => return Ok(Self::from_ruleset(&rs)),
-                Err(e) => {
-                    return Err(format!(
-                        "found vendor at {} but failed to parse ruleset: {e}",
-                        c.display()
-                    ));
-                }
+            if c.exists()
+                && let Ok(rs) = openra_data::rules::load_ruleset(c)
+            {
+                return Ok(Self::from_ruleset(&rs));
             }
         }
-        Err(format!(
-            "vendor RA YAML not found; tried: {}",
-            tried.join(", ")
-        ))
+
+        // Default path — embedded RA YAML baked into the binary at build
+        // time. Cannot fail (parse errors would surface as compile-time
+        // panics inside the unit-test for `load_ruleset_embedded`).
+        let rs = openra_data::embedded::load_ruleset_embedded();
+        Ok(Self::from_ruleset(&rs))
     }
 
     /// Test-friendly cached vendor loader. The first call parses the

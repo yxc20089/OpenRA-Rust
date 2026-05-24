@@ -7,6 +7,7 @@
 
 pub mod aud;
 pub mod blowfish;
+pub mod embedded;
 pub mod miniyaml;
 pub mod mix;
 pub mod oramap;
