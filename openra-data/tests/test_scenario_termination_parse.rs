@@ -9,8 +9,9 @@
 //! layer's `is_terminal` check.
 //!
 //! The end-to-end "wipe doesn't end the run" behaviour is tested
-//! engine-side in `openra-sim/tests/test_termination_flags.rs` and
-//! over the Python boundary in `tests/test_termination_flags_python.py`.
+//! engine-side in `openra-train/tests/env_termination_flags.rs` and
+//! over the Python boundary in the bench repo at
+//! `tests/test_termination_flags_python.py`.
 
 use openra_data::oramap::load_rush_hour_map_with_spawn;
 use std::fs;
