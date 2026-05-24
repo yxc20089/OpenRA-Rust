@@ -723,8 +723,10 @@ pub fn load_rush_hour_map_with_spawn(
     let base_bytes = std::fs::read(&base_path)?;
     let base = parse(&base_bytes)?;
 
-    // Expand actors.
-    let actors = expand_scenario_actors(&scenario.actors, spawn_point);
+    // Expand actors. Thread the base-map's playable rectangle so
+    // `count: N` spirals reject out-of-bounds candidates (the engine
+    // panics on out-of-bounds actor placement).
+    let actors = expand_scenario_actors(&scenario.actors, spawn_point, Some(base.bounds));
 
     Ok(MapDef {
         title: base.title,
@@ -1587,11 +1589,23 @@ fn read_xy_list(lines: &[&str], start: usize, expected_indent: usize) -> ((i32, 
 /// Nearest cell to `(ax, ay)` not already in `used`, searched in
 /// outward Chebyshev rings (deterministic: row-major within each ring).
 /// Used to spread a `count:` group so its units do not spawn stacked.
+///
+/// When `bounds` is `Some((bx, by, bw, bh))` candidate cells outside
+/// the rectangle `[bx, bx+bw) × [by, by+bh)` are rejected — this
+/// guards against `count: N` near a map edge silently placing actors
+/// off-map (the engine panics on out-of-bounds actor placement).
+///
+/// Returns `None` if the spiral exhausts `r = 64` without finding a
+/// valid cell — the caller is responsible for the fallback. The
+/// historical behaviour (return the anchor itself on exhaustion) is
+/// preserved at the [`push_count_spread`] call site, together with a
+/// `eprintln!` warning so the underlying issue surfaces.
 fn next_free_spiral(
     ax: i32,
     ay: i32,
     used: &HashSet<(i32, i32)>,
-) -> (i32, i32) {
+    bounds: Option<(i32, i32, i32, i32)>,
+) -> Option<(i32, i32)> {
     let mut r = 1i32;
     while r <= 64 {
         for dy in -r..=r {
@@ -1600,14 +1614,20 @@ fn next_free_spiral(
                     continue;
                 }
                 let p = (ax + dx, ay + dy);
-                if !used.contains(&p) {
-                    return p;
+                if used.contains(&p) {
+                    continue;
                 }
+                if let Some((bx, by, bw, bh)) = bounds {
+                    if p.0 < bx || p.0 >= bx + bw || p.1 < by || p.1 >= by + bh {
+                        continue;
+                    }
+                }
+                return Some(p);
             }
         }
         r += 1;
     }
-    (ax, ay)
+    None
 }
 
 /// Expand one raw actor's `count: N` into N `ScenarioActor`s. Copy 0
@@ -1618,10 +1638,18 @@ fn next_free_spiral(
 /// groups) never spawn stacked on one cell. A tile-based RTS gives each
 /// ground unit its own cell; `count: N` previously copied `position`
 /// verbatim, piling all N units on the anchor.
+///
+/// When `bounds` is `Some(map_rect)` the spiral search rejects
+/// out-of-bounds cells (the engine panics on out-of-bounds actor
+/// placement). If the spiral exhausts without finding any valid cell
+/// we fall back to the anchor position and emit a warning — preserving
+/// the historical behaviour but surfacing the underlying issue rather
+/// than silently corrupting placement.
 fn push_count_spread(
     out: &mut Vec<ScenarioActor>,
     used: &mut HashSet<(i32, i32)>,
     r: &RawScenarioActor,
+    bounds: Option<(i32, i32, i32, i32)>,
 ) {
     let n = r.count.max(1);
     let (ax, ay) = r.position;
@@ -1629,7 +1657,20 @@ fn push_count_spread(
         let pos = if k == 0 {
             (ax, ay)
         } else {
-            next_free_spiral(ax, ay, used)
+            match next_free_spiral(ax, ay, used, bounds) {
+                Some(p) => p,
+                None => {
+                    eprintln!(
+                        "warning: scenario actor type={} owner={} count={} \
+                         exhausted spiral search around anchor ({},{}) \
+                         within bounds {:?} — falling back to anchor cell \
+                         (copy {} of {}). Consider lowering count: or \
+                         moving the anchor further from the map edge.",
+                        r.actor_type, r.owner, n, ax, ay, bounds, k, n
+                    );
+                    (ax, ay)
+                }
+            }
         };
         used.insert(pos);
         out.push(ScenarioActor {
@@ -1642,7 +1683,11 @@ fn push_count_spread(
     }
 }
 
-fn expand_scenario_actors(raw: &[RawScenarioActor], spawn_point: i32) -> Vec<ScenarioActor> {
+fn expand_scenario_actors(
+    raw: &[RawScenarioActor],
+    spawn_point: i32,
+    bounds: Option<(i32, i32, i32, i32)>,
+) -> Vec<ScenarioActor> {
     let any_agent_has_spawn = raw
         .iter()
         .any(|r| r.owner == "agent" && r.spawn_point.is_some());
@@ -1666,7 +1711,7 @@ fn expand_scenario_actors(raw: &[RawScenarioActor], spawn_point: i32) -> Vec<Sce
         }
         // `count: N` expands to N actors on N distinct cells — units
         // of a group no longer spawn stacked on the anchor.
-        push_count_spread(&mut out, &mut used, r);
+        push_count_spread(&mut out, &mut used, r, bounds);
     }
     out
 }
@@ -1755,10 +1800,18 @@ fn read_scheduled_events(
                         // scheduled-event injection (the seed-axis filter
                         // is consumed once at episode start), so we drop
                         // it here.
+                        // Scheduled-event expansion happens at YAML
+                        // parse time, before the base map is loaded, so
+                        // bounds aren't available here. Pass `None` —
+                        // the spiral falls back to its legacy
+                        // unbounded behaviour. Authors are responsible
+                        // for keeping scheduled-event anchors safely
+                        // inside the map; the same eprintln warning
+                        // surfaces if the spiral exhausts.
                         let mut used: HashSet<(i32, i32)> = HashSet::new();
                         for r in &raw_actors {
                             push_count_spread(
-                                &mut spawn_actors, &mut used, r,
+                                &mut spawn_actors, &mut used, r, None,
                             );
                         }
                         i = ni;
