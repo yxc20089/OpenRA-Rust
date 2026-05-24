@@ -437,6 +437,25 @@ pub struct MapDef {
     /// water cells. Used by the naval MVP to declare water bands
     /// without touching the `map.bin` tile encoding.
     pub water_cells: Vec<(i32, i32)>,
+    /// Termination flag: when `true` (default), the engine auto-`done`s
+    /// the episode the moment the agent has no surviving combat units
+    /// or MustBeDestroyed buildings. Set to `false` via
+    /// `termination.agent_units_killed: false` in the scenario YAML to
+    /// let the episode continue past an agent-side wipe (e.g. a
+    /// suicide-charge pack scoring on enemy kills before the strike
+    /// package dies). The win/fail predicates are still evaluated each
+    /// turn; absent a predicate trigger the run ends at the tick
+    /// deadline.
+    pub terminate_on_agent_units_killed: bool,
+    /// Termination flag: when `true` (default), the engine auto-`done`s
+    /// the episode the moment the enemy has no surviving combat units
+    /// or MustBeDestroyed buildings. Set to `false` via
+    /// `termination.enemy_units_killed: false` in the scenario YAML to
+    /// let the episode continue past an enemy-side wipe (e.g. a
+    /// "deny-and-keep-playing" pack whose win clause has additional
+    /// criteria beyond elimination). Win/fail predicates are still
+    /// evaluated each turn.
+    pub terminate_on_enemy_units_killed: bool,
 }
 
 /// A scenario-declared ore patch. Materialised by the env layer at
@@ -725,6 +744,12 @@ pub fn load_rush_hour_map_with_spawn(
         reveal_map: scenario.reveal_map.unwrap_or(false),
         ore_patches: scenario.ore_patches,
         water_cells: scenario.water_cells,
+        terminate_on_agent_units_killed: scenario
+            .terminate_on_agent_units_killed
+            .unwrap_or(true),
+        terminate_on_enemy_units_killed: scenario
+            .terminate_on_enemy_units_killed
+            .unwrap_or(true),
     })
 }
 
@@ -770,6 +795,15 @@ struct ScenarioYaml {
     /// path: lets a naval scenario declare water without touching
     /// `map.bin`. Empty when neither block is present.
     water_cells: Vec<(i32, i32)>,
+    /// Top-level `termination.agent_units_killed:` flag. None ⇒
+    /// default `true` (engine auto-`done`s on agent wipe). Set to
+    /// `false` to keep the run alive past an agent-side wipe so the
+    /// scenario's declarative win/fail predicates can still fire.
+    terminate_on_agent_units_killed: Option<bool>,
+    /// Top-level `termination.enemy_units_killed:` flag. None ⇒
+    /// default `true` (engine auto-`done`s on enemy wipe). Set to
+    /// `false` to keep the run alive past an enemy-side wipe.
+    terminate_on_enemy_units_killed: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -937,6 +971,80 @@ fn parse_scenario_yaml(text: &str) -> io::Result<ScenarioYaml> {
                     }
                     continue;
                 }
+                "termination" => {
+                    // Block form (PyYAML safe_dump default):
+                    //   termination:
+                    //     max_ticks: 5400
+                    //     agent_units_killed: false
+                    //     enemy_units_killed: false
+                    // Inline form (`termination: {max_ticks: 6000}`) is
+                    // ALSO accepted — PyYAML emits it for short blocks.
+                    // We honour only the two auto-`done` gating flags;
+                    // `max_ticks` / `max_time` are handled bench-side
+                    // (the env wrapper passes a separate `max_ticks`
+                    // argument) so they're parsed-but-ignored here.
+                    let inline_v = v.trim();
+                    if !inline_v.is_empty()
+                        && inline_v.starts_with('{')
+                        && inline_v.ends_with('}')
+                    {
+                        // Inline flow-form: parse `{k: v, k: v}`.
+                        let inner = &inline_v[1..inline_v.len() - 1];
+                        for kv in inner.split(',') {
+                            if let Some((k, vv)) = split_key_value(kv.trim()) {
+                                let vv = vv
+                                    .trim()
+                                    .trim_matches(|c: char| c == '"' || c == '\'');
+                                match k {
+                                    "agent_units_killed" => {
+                                        out.terminate_on_agent_units_killed =
+                                            parse_bool_str(vv);
+                                    }
+                                    "enemy_units_killed" => {
+                                        out.terminate_on_enemy_units_killed =
+                                            parse_bool_str(vv);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    // Block form — indented child keys until the next
+                    // unindented line.
+                    let mut j = i + 1;
+                    while j < lines.len() {
+                        let raw_j = lines[j];
+                        let tj = strip_yaml_comment(raw_j).trim_end();
+                        if tj.is_empty() {
+                            j += 1;
+                            continue;
+                        }
+                        if leading_spaces(raw_j) == 0 {
+                            break;
+                        }
+                        if let Some((k, vv)) = split_key_value(tj) {
+                            let vv = vv
+                                .trim()
+                                .trim_matches(|c: char| c == '"' || c == '\'');
+                            match k {
+                                "agent_units_killed" => {
+                                    out.terminate_on_agent_units_killed =
+                                        parse_bool_str(vv);
+                                }
+                                "enemy_units_killed" => {
+                                    out.terminate_on_enemy_units_killed =
+                                        parse_bool_str(vv);
+                                }
+                                _ => {}
+                            }
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
                 "water_cells" => {
                     // Flat list of `[x, y]` pairs (PyYAML block form):
                     //   water_cells:
@@ -997,6 +1105,16 @@ fn strip_yaml_comment(s: &str) -> &str {
 
 fn leading_spaces(line: &str) -> usize {
     line.bytes().take_while(|&b| b == b' ').count()
+}
+
+/// Parse YAML's permissive booleans into `Option<bool>`. Mirrors the
+/// inline `match` used by `spawn_mcvs:` / `reveal_map:`.
+fn parse_bool_str(v: &str) -> Option<bool> {
+    match v.trim() {
+        "true" | "True" | "yes" | "1" => Some(true),
+        "false" | "False" | "no" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 /// Inside a `agent:` or `enemy:` top-level block, read indented `faction:` line.
