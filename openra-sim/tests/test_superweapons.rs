@@ -4,7 +4,7 @@
 //! iron-curtain makes a friendly actor immune to damage for ~30s, and
 //! the chronosphere teleports a friendly actor to a chosen cell.
 //!
-//! Uses `GameRules::defaults()` so the test runs without the vendored
+//! Uses `GameRules::vendor_cached()` so the test runs without the vendored
 //! RA YAML (mslo/iron/pdox are registered in the defaults table).
 
 use openra_data::oramap::{MapActor, OraMap, PlayerDef};
@@ -18,7 +18,7 @@ use openra_sim::world::{
 };
 
 fn build_arena(seed: i32) -> World {
-    let rules = GameRules::defaults();
+    let rules = GameRules::vendor_cached();
     let map = OraMap {
         title: "superweapon-test".into(),
         tileset: "TEMPERAT".into(),

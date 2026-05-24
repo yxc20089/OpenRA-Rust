@@ -6415,7 +6415,10 @@ pub fn set_test_unpaused(world: &mut World) {
 }
 
 /// Build a World from parsed map data, game seed, and lobby info.
-/// If `rules` is Some, uses the provided GameRules; otherwise uses hardcoded defaults.
+/// If `rules` is Some, uses the provided GameRules; otherwise loads the
+/// vendored RA YAML ruleset (via `GameRules::vendor_cached`). The
+/// hardcoded `defaults()` ruleset was removed — vendor YAML is now the
+/// single source of truth.
 pub fn build_world(
     map: &openra_data::oramap::OraMap,
     random_seed: i32,
@@ -6623,8 +6626,8 @@ pub fn build_world(
     // Resolve the rules early so initial-build building footprints can
     // honour rules-derived dimensions (Phase 7 — pbox=1×1, fact=3×2 etc).
     // We materialise a temporary Rules clone for this lookup; the caller
-    // either passed `Some(rules)` or we fall back to defaults below.
-    let initial_rules: GameRules = rules.clone().unwrap_or_else(GameRules::defaults);
+    // either passed `Some(rules)` or we load the vendored ruleset below.
+    let initial_rules: GameRules = rules.clone().unwrap_or_else(GameRules::vendor_cached);
     for actor in actors.values() {
         if let Some((x, y)) = actor.location {
             match actor.kind {
@@ -6702,7 +6705,7 @@ pub fn build_world(
         map_width: map.map_size.0,
         map_height: map.map_size.1,
         shroud,
-        rules: rules.unwrap_or_else(GameRules::defaults),
+        rules: rules.unwrap_or_else(GameRules::vendor_cached),
         bots,
         scripted_bots: Vec::new(),
         repairing: HashSet::new(),

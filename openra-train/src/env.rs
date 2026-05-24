@@ -908,9 +908,10 @@ impl Env {
         // (TurretGun, TeslaZap, …) and proper footprints (pbox=1×1,
         // fact=3×2, proc=3×2) resolve correctly. Phase 8 also pulls a
         // typed `data_rules::Rules` view so we can attach Vehicle /
-        // Turret typed components per actor below. Falls back to
-        // `GameRules::defaults` when the vendor dir is missing.
-        let (rules, typed_rules) = load_rules_with_fallback();
+        // Turret typed components per actor below. Vendor YAML is the
+        // single source of truth — `load_rules_strict` panics if the
+        // vendor directory is unreachable.
+        let (rules, typed_rules) = load_rules_strict();
         let mut world = build_world(
             &ora,
             seed_i32,
@@ -1603,7 +1604,7 @@ impl Env {
         // Vehicle/Turret components (otherwise turreted tanks would
         // never aim at targets). Cached across the episode.
         if self.typed_rules_cache.is_none() {
-            let (_, typed_rules) = load_rules_with_fallback();
+            let (_, typed_rules) = load_rules_strict();
             self.typed_rules_cache = Some(typed_rules);
         }
         let typed_rules = self.typed_rules_cache.as_ref().expect("cached above");
@@ -2434,9 +2435,10 @@ fn build_scenario_actor(id: u32, sa: &ScenarioActor, owner: u32, world: &World) 
 /// returns the typed `data_rules::Rules` view so the env loader can
 /// attach `Vehicle` / `Turret` typed components per actor.
 ///
-/// Falls back to `GameRules::defaults()` (and an empty typed Rules)
-/// when the vendor dir is absent (e.g. CI without submodules).
-fn load_rules_with_fallback() -> (GameRules, data_rules::Rules) {
+/// Panics with a clear message if no vendor RA YAML can be located. The
+/// hardcoded `GameRules::defaults()` fallback was removed — vendor YAML
+/// at `vendor/OpenRA/mods/ra/rules/` is now the single source of truth.
+fn load_rules_strict() -> (GameRules, data_rules::Rules) {
     // Try common vendor locations relative to the runtime cwd, the
     // env's manifest dir, and HOME. The first hit wins.
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -2457,7 +2459,9 @@ fn load_rules_with_fallback() -> (GameRules, data_rules::Rules) {
     candidates.push(PathBuf::from("vendor/OpenRA/mods/ra"));
     candidates.push(PathBuf::from("../vendor/OpenRA/mods/ra"));
     candidates.push(PathBuf::from("../../vendor/OpenRA/mods/ra"));
+    let mut tried: Vec<String> = Vec::new();
     for c in &candidates {
+        tried.push(c.display().to_string());
         if c.exists()
             && let Ok(rs) = data_rules::load_ruleset(c)
         {
@@ -2465,14 +2469,13 @@ fn load_rules_with_fallback() -> (GameRules, data_rules::Rules) {
             return (GameRules::from_ruleset(&rs), typed);
         }
     }
-    (
-        GameRules::defaults(),
-        data_rules::Rules {
-            units: std::collections::BTreeMap::new(),
-            weapons: std::collections::BTreeMap::new(),
-            buildings: std::collections::BTreeMap::new(),
-            buildables: std::collections::BTreeMap::new(),
-        },
+    panic!(
+        "load_rules_strict: vendor RA YAML not found; tried: {}.\n\
+         The hardcoded `GameRules::defaults()` fallback was removed; \
+         vendor YAML is now the single source of truth. Set \
+         `OPENRA_VENDOR_DIR` or run from a tree that contains the \
+         bundled vendor directory.",
+        tried.join(", "),
     )
 }
 

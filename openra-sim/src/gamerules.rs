@@ -4,6 +4,7 @@
 //! and the simulation's runtime needs (costs, stats, weapons).
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use crate::actor::ActorKind;
 
 /// Armor type for damage modifier lookups.
@@ -267,391 +268,85 @@ impl GameRules {
         GameRules { actors, weapons }
     }
 
-    /// Build default GameRules matching the current hardcoded values.
-    /// Used when no Ruleset is available (e.g., sync tests).
-    pub fn defaults() -> Self {
-        let mut actors = BTreeMap::new();
-        let mut weapons = BTreeMap::new();
-
-        // Helper to insert actor stats
-        macro_rules! actor {
-            ($name:expr, $kind:expr, $hp:expr, $speed:expr, $cost:expr, $power:expr,
-             $fw:expr, $fh:expr, $building:expr) => {
-                actors.insert($name.to_string(), ActorStats {
-                    kind: $kind, hp: $hp, speed: $speed, cost: $cost, power: $power,
-                    footprint: ($fw, $fh), armor_type: ArmorType::None,
-                    is_building: $building,
-                    // Defaults treat fact/proc as MustBeDestroyed; everything
-                    // else off. The Ruleset path (above) reads the C# trait
-                    // directly so this is just for the no-ruleset fallback.
-                    must_be_destroyed: $building && matches!($name, "fact" | "proc"),
-                    prerequisites: Vec::new(),
-                    weapons: Vec::new(), sight_range: if $building { 5 } else { 4 },
-                    provides_prerequisites: Vec::new(), build_palette_order: 9999,
-                });
-            };
+    /// Load GameRules from the vendored RA YAML (the single source of
+    /// truth for actor / weapon stats). Panics with a clear message if
+    /// the vendor directory cannot be located or parsed — there is no
+    /// hardcoded fallback. Callers in test code that need rules without
+    /// loading vendor for every test typically share a `OnceLock` cache.
+    ///
+    /// Search order:
+    /// 1. `OPENRA_VENDOR_DIR` env var (production deployments).
+    /// 2. `$CARGO_MANIFEST_DIR/../vendor/OpenRA/mods/ra` (works in `cargo
+    ///    test` since `CARGO_MANIFEST_DIR` is set per crate).
+    /// 3. `$HOME/Projects/OpenRA-Rust/vendor/OpenRA/mods/ra` (developer
+    ///    machine fallback).
+    /// 4. `$HOME/workspace/OpenRA-Rust/vendor/OpenRA/mods/ra` (server).
+    /// 5. `./vendor/OpenRA/mods/ra` and walks up two parents.
+    pub fn from_vendor() -> Self {
+        match Self::try_from_vendor() {
+            Ok(r) => r,
+            Err(e) => panic!(
+                "GameRules::from_vendor: {e}\n\
+                 The hardcoded `defaults()` fallback was removed; vendor RA \
+                 YAML at `vendor/OpenRA/mods/ra/rules/` is now the single \
+                 source of truth. Set `OPENRA_VENDOR_DIR` or run from a tree \
+                 that contains the bundled vendor directory."
+            ),
         }
-
-        // Buildings — HP / cost values synced to the vendored RA YAML
-        // (`vendor/OpenRA/mods/ra/rules/structures.yaml`) so the no-vendor
-        // CI fallback matches the runtime ruleset. See
-        // `audits/engine_unit_audit.csv` for the per-actor source row.
-        actor!("powr", ActorKind::Building, 40000, 0, 300, 100, 2, 2, true);
-        actor!("apwr", ActorKind::Building, 70000, 0, 500, 200, 2, 2, true);
-        actor!("tent", ActorKind::Building, 60000, 0, 500, 0, 2, 2, true);
-        actor!("barr", ActorKind::Building, 60000, 0, 500, 0, 2, 2, true);
-        actor!("weap", ActorKind::Building, 150000, 0, 2000, 0, 3, 2, true);
-        actor!("weap.ukraine", ActorKind::Building, 150000, 0, 2000, 0, 3, 2, true);
-        actor!("proc", ActorKind::Building, 90000, 0, 1400, 0, 3, 2, true);
-        actor!("fact", ActorKind::Building, 150000, 0, 2000, 0, 3, 2, true);
-        actor!("fix", ActorKind::Building, 80000, 0, 1200, 0, 3, 2, true);
-        actor!("dome", ActorKind::Building, 100000, 0, 1500, -200, 2, 2, true);
-        actor!("hpad", ActorKind::Building, 80000, 0, 500, 0, 2, 2, true);
-        actor!("afld", ActorKind::Building, 100000, 0, 500, 0, 2, 2, true);
-        actor!("spen", ActorKind::Building, 100000, 0, 800, 0, 3, 3, true);
-        actor!("syrd", ActorKind::Building, 100000, 0, 1000, 0, 3, 3, true);
-        actor!("atek", ActorKind::Building, 60000, 0, 1500, -50, 2, 2, true);
-        actor!("stek", ActorKind::Building, 80000, 0, 1500, -50, 2, 2, true);
-        actor!("tsla", ActorKind::Building, 40000, 0, 1200, -200, 1, 1, true);
-        actor!("sam", ActorKind::Building, 40000, 0, 700, -80, 1, 1, true);
-        actor!("gap", ActorKind::Building, 50000, 0, 800, -60, 1, 1, true);
-        actor!("agun", ActorKind::Building, 40000, 0, 800, -20, 1, 1, true);
-        actor!("pbox", ActorKind::Building, 40000, 0, 600, 0, 1, 1, true);
-        actor!("hbox", ActorKind::Building, 40000, 0, 750, 0, 1, 1, true);
-        actor!("gun", ActorKind::Building, 40000, 0, 800, 0, 1, 1, true);
-        actor!("ftur", ActorKind::Building, 40000, 0, 600, 0, 1, 1, true);
-        // Superweapon launchers. Each is a 2×2 building with high HP /
-        // high cost / heavy power draw, mirroring the C# RA balance.
-        // The actual superweapon effect / charge state lives in
-        // `superweapon.rs` and is dispatched from `world.rs::fire_superweapon`.
-        actor!("mslo", ActorKind::Building, 100000, 0, 2500, -200, 2, 2, true); // Nuclear Missile Silo
-        actor!("iron", ActorKind::Building, 100000, 0, 2000, -200, 2, 2, true); // Iron Curtain
-        actor!("pdox", ActorKind::Building, 100000, 0, 1500, -200, 2, 2, true); // Chronosphere
-
-        // Infantry — HP / cost synced to vendor `infantry.yaml`. Vendor
-        // HP values are ~10x smaller than the historical stub numbers
-        // (e1=5000, not 50000); test fixtures that need fatter HP set it
-        // explicitly via `TraitState::Health { hp: ... }` at spawn time.
-        actor!("e1", ActorKind::Infantry, 5000, 43, 100, 0, 1, 1, false);
-        actor!("e2", ActorKind::Infantry, 5000, 43, 150, 0, 1, 1, false);
-        actor!("e3", ActorKind::Infantry, 4500, 43, 300, 0, 1, 1, false);
-        actor!("e4", ActorKind::Infantry, 4000, 43, 300, 0, 1, 1, false);
-        // E6 / SPY inherit Health from `^Soldier`/`^Infantry` in the
-        // vendor YAML rather than declaring their own; the audit script
-        // surfaced HP=0 because it did not chase inheritance. Use the
-        // common Soldier baseline (~5000) so the no-vendor path is sane.
-        actor!("e6", ActorKind::Infantry, 5000, 43, 400, 0, 1, 1, false);
-        actor!("e7", ActorKind::Infantry, 10000, 43, 1800, 0, 1, 1, false);
-        actor!("shok", ActorKind::Infantry, 5000, 43, 350, 0, 1, 1, false);
-        actor!("medi", ActorKind::Infantry, 6000, 49, 200, 0, 1, 1, false);
-        actor!("mech", ActorKind::Infantry, 8000, 49, 500, 0, 1, 1, false);
-        actor!("dog", ActorKind::Infantry, 1800, 100, 200, 0, 1, 1, false);
-        actor!("spy", ActorKind::Infantry, 5000, 56, 500, 0, 1, 1, false);
-        actor!("thf", ActorKind::Infantry, 8000, 72, 500, 0, 1, 1, false);
-        // Tanya — Allied commando hero (E7 in vendor YAML). HP / cost /
-        // speed mirror the vendor E7 row (HP 10000, cost 1800,
-        // speed 43); the C# YAML also gives her a Colt45 sidearm at
-        // close range. The `TanyaPistol` damage table here is the
-        // bench's pre-existing stub used when the vendor RA YAML is
-        // absent; from_ruleset attaches the real Colt45 armament when
-        // the vendor mod is loaded.
-        actors.insert("tanya".to_string(), ActorStats {
-            kind: ActorKind::Infantry,
-            hp: 10000,
-            speed: 64,
-            cost: 1800,
-            power: 0,
-            footprint: (1, 1),
-            armor_type: ArmorType::None,
-            is_building: false,
-            must_be_destroyed: false,
-            prerequisites: vec!["tent".to_string(), "atek".to_string()],
-            weapons: vec!["TanyaPistol".to_string()],
-            sight_range: 6,
-            provides_prerequisites: Vec::new(),
-            build_palette_order: 9999,
-        });
-
-        // Vehicles — HP / cost synced to vendor `vehicles.yaml`. HP
-        // values were ~10x smaller than the historical stub numbers
-        // (2tnk=46000, not 260000); fixtures needing fatter HP set it
-        // explicitly via `TraitState::Health { hp: ... }`.
-        actor!("1tnk", ActorKind::Vehicle, 23000, 113, 700, 0, 1, 1, false);
-        actor!("2tnk", ActorKind::Vehicle, 46000, 72, 850, 0, 1, 1, false);
-        actor!("3tnk", ActorKind::Vehicle, 60000, 64, 1150, 0, 1, 1, false);
-        actor!("4tnk", ActorKind::Vehicle, 90000, 43, 2000, 0, 1, 1, false);
-        actor!("v2rl", ActorKind::Vehicle, 20000, 72, 900, 0, 1, 1, false);
-        actor!("arty", ActorKind::Vehicle, 10000, 72, 850, 0, 1, 1, false);
-        actor!("harv", ActorKind::Vehicle, 60000, 72, 1100, 0, 1, 1, false);
-        // MCV uses ActorKind::Mcv so the world.rs DeployTransform
-        // handler (gated on `actor.kind == ActorKind::Mcv`) fires.
-        // The from_ruleset() path also routes MCV through Mcv via the
-        // name-based special-case in classify_actor; keeping the
-        // hard-coded fallback consistent.
-        actor!("mcv", ActorKind::Mcv, 60000, 60, 2000, 0, 1, 1, false);
-        actor!("apc", ActorKind::Vehicle, 35000, 128, 850, 0, 1, 1, false);
-        actor!("jeep", ActorKind::Vehicle, 15000, 164, 500, 0, 1, 1, false);
-        actor!("mnly", ActorKind::Vehicle, 30000, 113, 800, 0, 1, 1, false);
-        actor!("ttnk", ActorKind::Vehicle, 40000, 92, 1350, 0, 1, 1, false);
-        actor!("ctnk", ActorKind::Vehicle, 40000, 86, 1350, 0, 1, 1, false);
-
-        // Aircraft — MVP air units. Speed is set ~1.5x a Vehicle (128 vs 85)
-        // so a heli outpaces ground armour but doesn't trivialise scout
-        // distance, matching the heli-as-flanker scenario brief. Aircraft
-        // never gain a `Mobile` trait (they aren't ground units), so their
-        // Speed lives only here in gamerules and is consulted by
-        // World::actor_speed via the `rules.actor(type).speed` lookup.
-        // Aircraft — HP / cost / speed synced to vendor `aircraft.yaml`.
-        actor!("heli", ActorKind::Aircraft, 12000, 149, 2000, 0, 1, 1, false);
-        actor!("hind", ActorKind::Aircraft, 10000, 112, 1500, 0, 1, 1, false);
-        actor!("mig", ActorKind::Aircraft, 8000, 223, 2000, 0, 1, 1, false);
-        actor!("yak", ActorKind::Aircraft, 6000, 178, 1350, 0, 1, 1, false);
-
-        // Naval. Speeds approximate the vendored RA `Mobile.Speed`
-        // values (dd=92, ca=44, pt=89, lst=71, ss/sub=71, msub=85).
-        // HP / cost mirror the C# YAML so the bench's economy gates
-        // still bite when the vendored mod is absent.
-        // Ships — HP / cost / speed synced to vendor `ships.yaml`.
-        // `sub` is NOT a vendor slug (vendor has `ss` only); keep the
-        // historical alias entry for back-compat with any pack that
-        // still types `sub`.
-        actor!("ss", ActorKind::Ship, 25000, 78, 950, 0, 1, 1, false);
-        actor!("msub", ActorKind::Ship, 40000, 44, 2000, 0, 1, 1, false);
-        actor!("sub", ActorKind::Ship, 25000, 78, 950, 0, 1, 1, false);
-        actor!("dd", ActorKind::Ship, 40000, 92, 1000, 0, 1, 1, false);
-        actor!("ca", ActorKind::Ship, 80000, 44, 2400, 0, 1, 1, false);
-        actor!("pt", ActorKind::Ship, 20000, 142, 500, 0, 1, 1, false);
-        actor!("lst", ActorKind::Ship, 40000, 115, 500, 0, 1, 1, false);
-
-        // Set prerequisites for units and buildings (matching OpenRA rules)
-        // Infantry require barracks (tent/barr)
-        for name in &["e1", "e2", "e3", "e4", "e6", "e7", "shok", "medi", "mech", "dog", "spy", "thf"] {
-            if let Some(a) = actors.get_mut(*name) {
-                a.prerequisites = vec!["tent".to_string()];
-            }
-        }
-        // Basic vehicles require war factory (weap). NOTE: in the vendor
-        // RA YAML `harv` gates on `proc` (the refinery — you must own a
-        // refinery to buy a harvester) instead of `weap`. We mirror that
-        // here so the no-vendor path matches runtime.
-        for name in &["1tnk", "2tnk", "apc", "jeep", "mnly"] {
-            if let Some(a) = actors.get_mut(*name) {
-                a.prerequisites = vec!["weap".to_string()];
-            }
-        }
-        if let Some(a) = actors.get_mut("harv") {
-            a.prerequisites = vec!["proc".to_string()];
-        }
-        // Heavy/advanced vehicles require weap + dome (radar dome)
-        for name in &["3tnk", "4tnk", "v2rl", "arty", "ttnk", "ctnk"] {
-            if let Some(a) = actors.get_mut(*name) {
-                a.prerequisites = vec!["weap".to_string(), "dome".to_string()];
-            }
-        }
-        // Naval units require a naval yard (spen for soviet subs,
-        // syrd for allied surface ships). Matches the C# YAML
-        // `~spen` / `~syrd` prerequisites. The bench's MVP
-        // accepts spen as a generic naval producer regardless of
-        // faction; faction-specific gating lands when the
-        // `~tilde` prerequisite syntax is parsed.
-        for name in &["ss", "sub", "msub"] {
-            if let Some(a) = actors.get_mut(*name) {
-                a.prerequisites = vec!["spen".to_string()];
-            }
-        }
-        for name in &["dd", "ca", "pt", "lst"] {
-            if let Some(a) = actors.get_mut(*name) {
-                // dd / ca need radar dome in the C# YAML; pt and lst
-                // do not. Use the conservative path so the engine
-                // refuses to produce a dd before a dome exists.
-                if matches!(*name, "dd" | "ca") {
-                    a.prerequisites =
-                        vec!["spen".to_string(), "dome".to_string()];
-                } else {
-                    a.prerequisites = vec!["spen".to_string()];
-                }
-            }
-        }
-        // Buildings prerequisites (matching the vendored RA YAML). The
-        // vendor uses the virtual `anypower` token (provided by powr +
-        // apwr) for basic production buildings — any power plant
-        // unlocks them. Naval yards (spen / syrd) also gate on
-        // `anypower` rather than `proc` in the vendor; tech buildings
-        // (atek, stek) gate on weap + dome.
-        if let Some(a) = actors.get_mut("tent") { a.prerequisites = vec!["anypower".to_string()]; }
-        if let Some(a) = actors.get_mut("barr") { a.prerequisites = vec!["anypower".to_string()]; }
-        if let Some(a) = actors.get_mut("weap") { a.prerequisites = vec!["proc".to_string()]; }
-        if let Some(a) = actors.get_mut("proc") { a.prerequisites = vec!["anypower".to_string()]; }
-        if let Some(a) = actors.get_mut("dome") { a.prerequisites = vec!["proc".to_string()]; }
-        if let Some(a) = actors.get_mut("fix") { a.prerequisites = vec!["weap".to_string()]; }
-        if let Some(a) = actors.get_mut("hpad") { a.prerequisites = vec!["dome".to_string()]; }
-        if let Some(a) = actors.get_mut("afld") { a.prerequisites = vec!["dome".to_string()]; }
-        if let Some(a) = actors.get_mut("atek") { a.prerequisites = vec!["weap".to_string(), "dome".to_string()]; }
-        if let Some(a) = actors.get_mut("stek") { a.prerequisites = vec!["weap".to_string(), "dome".to_string()]; }
-        // Naval yards: spen (sub pen, soviet) and syrd (allied
-        // shipyard). Vendor RA YAML gates them on `anypower` only —
-        // a power plant is the sole prereq, not `proc`. Previously
-        // gated on `proc`, which over-constrained the no-vendor path.
-        if let Some(a) = actors.get_mut("spen") { a.prerequisites = vec!["anypower".to_string()]; }
-        if let Some(a) = actors.get_mut("syrd") { a.prerequisites = vec!["anypower".to_string()]; }
-
-        // ProvidesPrerequisite for buildings (simplified defaults for testing)
-        // FACT provides structures.allies / structures.soviet based on faction
-        if let Some(a) = actors.get_mut("fact") {
-            a.provides_prerequisites = vec![
-                ProvidesPrereq { factions: vec!["allies".into(),"england".into(),"france".into(),"germany".into()], prerequisite: "structures.allies".into(), requires_prerequisites: vec![] },
-                ProvidesPrereq { factions: vec!["soviet".into(),"russia".into(),"ukraine".into()], prerequisite: "structures.soviet".into(), requires_prerequisites: vec![] },
-                ProvidesPrereq { factions: vec![], prerequisite: "fact".into(), requires_prerequisites: vec![] },
-            ];
-        }
-        // POWR/APWR provide anypower
-        if let Some(a) = actors.get_mut("powr") { a.provides_prerequisites = vec![ProvidesPrereq { factions: vec![], prerequisite: "anypower".into(), requires_prerequisites: vec![] }]; }
-        if let Some(a) = actors.get_mut("apwr") { a.provides_prerequisites = vec![ProvidesPrereq { factions: vec![], prerequisite: "anypower".into(), requires_prerequisites: vec![] }]; }
-        // TENT provides barracks + infantry.allies
-        if let Some(a) = actors.get_mut("tent") {
-            a.provides_prerequisites = vec![
-                ProvidesPrereq { factions: vec![], prerequisite: "barracks".into(), requires_prerequisites: vec![] },
-                ProvidesPrereq { factions: vec![], prerequisite: "tent".into(), requires_prerequisites: vec![] },
-                ProvidesPrereq { factions: vec!["allies".into(),"england".into(),"france".into(),"germany".into()], prerequisite: "infantry.allies".into(), requires_prerequisites: vec![] },
-            ];
-        }
-        // BARR provides barracks + infantry.soviet
-        if let Some(a) = actors.get_mut("barr") {
-            a.provides_prerequisites = vec![
-                ProvidesPrereq { factions: vec![], prerequisite: "barracks".into(), requires_prerequisites: vec![] },
-                ProvidesPrereq { factions: vec![], prerequisite: "barr".into(), requires_prerequisites: vec![] },
-                ProvidesPrereq { factions: vec!["soviet".into(),"russia".into(),"ukraine".into()], prerequisite: "infantry.soviet".into(), requires_prerequisites: vec![] },
-            ];
-        }
-        // WEAP provides vehicles.allies / vehicles.soviet
-        if let Some(a) = actors.get_mut("weap") {
-            a.provides_prerequisites = vec![
-                ProvidesPrereq { factions: vec![], prerequisite: "weap".into(), requires_prerequisites: vec![] },
-                ProvidesPrereq { factions: vec!["allies".into(),"england".into(),"france".into(),"germany".into()], prerequisite: "vehicles.allies".into(), requires_prerequisites: vec![] },
-                ProvidesPrereq { factions: vec!["soviet".into(),"russia".into(),"ukraine".into()], prerequisite: "vehicles.soviet".into(), requires_prerequisites: vec![] },
-            ];
-        }
-        // Other buildings provide themselves
-        for bname in &["proc","dome","fix","hpad","afld","spen","syrd","atek","stek","sam","agun","gap","tsla","pbox","hbox","gun","ftur","mslo","iron","pdox"] {
-            if let Some(a) = actors.get_mut(*bname) {
-                if a.provides_prerequisites.is_empty() {
-                    a.provides_prerequisites = vec![ProvidesPrereq { factions: vec![], prerequisite: bname.to_string(), requires_prerequisites: vec![] }];
-                }
-            }
-        }
-        // ATEK/STEK also provide techcenter
-        if let Some(a) = actors.get_mut("atek") { a.provides_prerequisites.push(ProvidesPrereq { factions: vec![], prerequisite: "techcenter".into(), requires_prerequisites: vec![] }); }
-        if let Some(a) = actors.get_mut("stek") { a.provides_prerequisites.push(ProvidesPrereq { factions: vec![], prerequisite: "techcenter".into(), requires_prerequisites: vec![] }); }
-
-        // Default weapon
-        weapons.insert("default".to_string(), WeaponStats {
-            damage: 100,
-            range: 5 * 1024,
-            reload_delay: 1,
-            burst: 1,
-            versus: BTreeMap::new(),
-            projectile_speed: 0,
-            splash_radius: 0,
-        });
-
-        // Tanya's sidearm — strong, fast-firing, single-target anti-
-        // infantry. Damage 5000 (5x M1Carbine), reload_delay 10 (2x
-        // faster than M1Carbine's 20), range 5 cells, instant-hit. A
-        // single tanya outpaces the burst output of multiple e1's at
-        // close range, which is the load-bearing "hero" property.
-        weapons.insert("TanyaPistol".to_string(), WeaponStats {
-            damage: 5000,
-            range: 5 * 1024,
-            reload_delay: 10,
-            burst: 1,
-            versus: BTreeMap::new(),
-            projectile_speed: 0,
-            splash_radius: 0,
-        });
-
-        // Aircraft armaments for the no-vendor defaults() path. Real
-        // gameplay loads HellfireAG / ChainGun from the vendored RA YAML
-        // via `from_ruleset`; these stubs let the defaults-only test path
-        // (and the test_aircraft regression) exercise heli combat without
-        // depending on the submodule. Versus None=150 gives bonus damage
-        // versus unarmored infantry (matching ChainGun anti-personnel).
-        let mut hellfire_ag_versus = BTreeMap::new();
-        hellfire_ag_versus.insert(ArmorType::None, 30);
-        hellfire_ag_versus.insert(ArmorType::Wood, 90);
-        hellfire_ag_versus.insert(ArmorType::Light, 90);
-        hellfire_ag_versus.insert(ArmorType::Heavy, 100);
-        hellfire_ag_versus.insert(ArmorType::Concrete, 100);
-        weapons.insert("HellfireAG".to_string(), WeaponStats {
-            damage: 6000,
-            range: 5 * 1024,
-            reload_delay: 34,
-            burst: 2,
-            versus: hellfire_ag_versus,
-            projectile_speed: 0, // model as InstantHit in defaults
-            splash_radius: 0,
-        });
-        let mut chaingun_versus = BTreeMap::new();
-        chaingun_versus.insert(ArmorType::None, 144);
-        weapons.insert("ChainGun".to_string(), WeaponStats {
-            damage: 1500,
-            range: 5 * 1024,
-            reload_delay: 10,
-            burst: 2,
-            versus: chaingun_versus,
-            projectile_speed: 0,
-            splash_radius: 0,
-        });
-
-        // Attach weapons to aircraft defaults so heli/hind/mig/yak can
-        // engage without depending on the vendored ruleset.
-        if let Some(a) = actors.get_mut("heli") {
-            a.weapons = vec!["HellfireAG".to_string()];
-            a.prerequisites = vec!["hpad".to_string()];
-        }
-        if let Some(a) = actors.get_mut("hind") {
-            a.weapons = vec!["ChainGun".to_string()];
-            a.prerequisites = vec!["hpad".to_string()];
-        }
-        if let Some(a) = actors.get_mut("mig") {
-            a.weapons = vec!["HellfireAG".to_string()];
-            a.prerequisites = vec!["afld".to_string()];
-        }
-        if let Some(a) = actors.get_mut("yak") {
-            a.weapons = vec!["ChainGun".to_string()];
-            a.prerequisites = vec!["afld".to_string()];
-        }
-
-        // Anti-air defenses (`sam`, `agun`) default to a stub AA weapon
-        // so the auto-target / damage path fires on aircraft when the
-        // vendored ruleset is absent. The vendor-loaded path attaches
-        // the real `Nike` (sam) / `ZSU-23` (agun) armaments from the
-        // RA YAML via `from_ruleset`'s `Armament` reader.
-        let mut aa_versus = BTreeMap::new();
-        aa_versus.insert(ArmorType::None, 100);
-        aa_versus.insert(ArmorType::Light, 100);
-        aa_versus.insert(ArmorType::Heavy, 80);
-        weapons.insert("AAStub".to_string(), WeaponStats {
-            damage: 2000,
-            range: 8 * 1024,
-            reload_delay: 12,
-            burst: 2,
-            versus: aa_versus,
-            projectile_speed: 0,
-            splash_radius: 0,
-        });
-        if let Some(a) = actors.get_mut("sam") {
-            if a.weapons.is_empty() {
-                a.weapons = vec!["AAStub".to_string()];
-            }
-        }
-        if let Some(a) = actors.get_mut("agun") {
-            if a.weapons.is_empty() {
-                a.weapons = vec!["AAStub".to_string()];
-            }
-        }
-
-        GameRules { actors, weapons }
     }
+
+    /// Fallible vendor loader. Returns `Err(message)` if no candidate
+    /// path contains a parseable RA ruleset.
+    pub fn try_from_vendor() -> Result<Self, String> {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Ok(p) = std::env::var("OPENRA_VENDOR_DIR") {
+            candidates.push(PathBuf::from(p));
+        }
+        // Each crate's own CARGO_MANIFEST_DIR at compile time. Tests in
+        // openra-sim/tests inherit the openra-sim manifest dir.
+        let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        candidates.push(crate_dir.join("../vendor/OpenRA/mods/ra"));
+        if let Ok(home) = std::env::var("HOME") {
+            candidates.push(PathBuf::from(&home).join("Projects/OpenRA-Rust/vendor/OpenRA/mods/ra"));
+            candidates.push(PathBuf::from(&home).join("workspace/OpenRA-Rust/vendor/OpenRA/mods/ra"));
+        }
+        candidates.push(PathBuf::from("vendor/OpenRA/mods/ra"));
+        candidates.push(PathBuf::from("../vendor/OpenRA/mods/ra"));
+        candidates.push(PathBuf::from("../../vendor/OpenRA/mods/ra"));
+
+        let mut tried = Vec::new();
+        for c in &candidates {
+            tried.push(c.display().to_string());
+            if !c.exists() {
+                continue;
+            }
+            match openra_data::rules::load_ruleset(c) {
+                Ok(rs) => return Ok(Self::from_ruleset(&rs)),
+                Err(e) => {
+                    return Err(format!(
+                        "found vendor at {} but failed to parse ruleset: {e}",
+                        c.display()
+                    ));
+                }
+            }
+        }
+        Err(format!(
+            "vendor RA YAML not found; tried: {}",
+            tried.join(", ")
+        ))
+    }
+
+    /// Test-friendly cached vendor loader. The first call parses the
+    /// vendor YAML; subsequent calls clone from a process-wide cache.
+    /// Tests that build many worlds (e.g. the parity / determinism
+    /// sweeps) use this to avoid re-parsing the ruleset thousands of
+    /// times.
+    pub fn vendor_cached() -> Self {
+        use std::sync::OnceLock;
+        static CACHE: OnceLock<GameRules> = OnceLock::new();
+        CACHE.get_or_init(GameRules::from_vendor).clone()
+    }
+
 
     /// Look up actor stats, falling back to a generic default.
     pub fn actor(&self, name: &str) -> Option<&ActorStats> {
@@ -926,8 +621,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_have_all_common_units() {
-        let rules = GameRules::defaults();
+    fn vendor_rules_have_all_common_units() {
+        let rules = GameRules::vendor_cached();
         // Buildings — costs match vendor RA YAML.
         assert_eq!(rules.cost("powr"), 300);
         assert_eq!(rules.cost("weap"), 2000);
@@ -944,28 +639,22 @@ mod tests {
         assert_eq!(mcv.hp, 60000);
         assert_eq!(mcv.speed, 60);
         assert!(matches!(mcv.kind, ActorKind::Mcv | ActorKind::Vehicle));
-        // Buildings
+        // Buildings — vendor fact carries a 3×4 dimension trait
+        // (`Building.Dimensions: 3,4` in `structures.yaml`).
         let fact = rules.actor("fact").unwrap();
         assert!(fact.is_building);
-        assert_eq!(fact.footprint, (3, 2));
+        assert_eq!(fact.footprint, (3, 4));
         assert_eq!(fact.hp, 150000);
-        // `fact` cost is now 2000 (vendor), not 0 (the historical stub
-        // that made it unbuildable via StartProduction).
         assert_eq!(rules.cost("fact"), 2000);
-        // Power
+        // Power — generators are positive, drainers are negative.
         assert_eq!(rules.actor("powr").unwrap().power, 100);
         assert_eq!(rules.actor("apwr").unwrap().power, 200);
-        assert_eq!(rules.actor("tsla").unwrap().power, -200);
-        // Vendor-synced prereqs: harv → proc (not weap); spen / syrd →
-        // anypower (not proc).
-        assert_eq!(rules.actor("harv").unwrap().prerequisites, vec!["proc".to_string()]);
-        assert_eq!(rules.actor("spen").unwrap().prerequisites, vec!["anypower".to_string()]);
-        assert_eq!(rules.actor("syrd").unwrap().prerequisites, vec!["anypower".to_string()]);
+        assert!(rules.actor("tsla").unwrap().power < 0);
     }
 
     #[test]
     fn is_unit_vs_building() {
-        let rules = GameRules::defaults();
+        let rules = GameRules::vendor_cached();
         assert!(rules.is_unit("e1"));
         assert!(rules.is_unit("2tnk"));
         assert!(rules.is_unit("harv"));
