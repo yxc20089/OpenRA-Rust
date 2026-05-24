@@ -2435,33 +2435,42 @@ fn build_scenario_actor(id: u32, sa: &ScenarioActor, owner: u32, world: &World) 
 /// returns the typed `data_rules::Rules` view so the env loader can
 /// attach `Vehicle` / `Turret` typed components per actor.
 ///
-/// Panics with a clear message if no vendor RA YAML can be located. The
-/// hardcoded `GameRules::defaults()` fallback was removed — vendor YAML
-/// at `vendor/OpenRA/mods/ra/rules/` is now the single source of truth.
+/// Backed by the embedded RA YAML in `openra_data::embedded`
+/// (`include_str!`-ed from `openra-data/src/embedded/{rules,weapons}/*.yaml`).
+/// The previous strict-required `OPENRA_VENDOR_DIR` lookup is now an
+/// OPTIONAL override: when the env var is set, the loader parses YAML
+/// from that path (panicking if it's malformed — explicit overrides are
+/// expected to work); when unset, the in-binary data is used.
 fn load_rules_strict() -> (GameRules, data_rules::Rules) {
-    // Try common vendor locations relative to the runtime cwd, the
-    // env's manifest dir, and HOME. The first hit wins.
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    // Explicit env var override takes precedence (production deployments).
+    // Explicit override — production deployments / power users pointing
+    // at a different RA snapshot for testing. We deliberately do NOT
+    // fall back to embedded for a broken override: a misconfigured env
+    // var should fail loudly, not silently load a different ruleset.
     if let Ok(p) = std::env::var("OPENRA_VENDOR_DIR") {
-        candidates.push(PathBuf::from(p));
+        let path = PathBuf::from(&p);
+        if !path.exists() {
+            panic!("OPENRA_VENDOR_DIR points at non-existent path: {p}");
+        }
+        match data_rules::load_ruleset(&path) {
+            Ok(rs) => {
+                let typed = data_rules::Rules::from_ruleset(&rs);
+                return (GameRules::from_ruleset(&rs), typed);
+            }
+            Err(e) => panic!("OPENRA_VENDOR_DIR {p}: parse failed: {e}"),
+        }
     }
-    // Resolve relative to the openra-train crate's compile-time manifest
-    // dir — this works regardless of where the wheel ends up installed,
-    // as long as the source tree is intact alongside the binary.
+
+    // Implicit legacy in-tree vendor — if a clone happens to still have
+    // `vendor/OpenRA/mods/ra/` populated (older trees, the
+    // openra-sim/tests parity sweeps), use it transparently. Missing is
+    // NOT an error.
     let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    candidates.push(crate_dir.join("../vendor/OpenRA/mods/ra"));
+    let mut candidates: Vec<PathBuf> = vec![crate_dir.join("../vendor/OpenRA/mods/ra")];
     if let Ok(home) = std::env::var("HOME") {
         candidates.push(PathBuf::from(&home).join("Projects/OpenRA-Rust/vendor/OpenRA/mods/ra"));
-        // Production deployment: workspace-rooted source tree.
         candidates.push(PathBuf::from(&home).join("workspace/OpenRA-Rust/vendor/OpenRA/mods/ra"));
     }
-    candidates.push(PathBuf::from("vendor/OpenRA/mods/ra"));
-    candidates.push(PathBuf::from("../vendor/OpenRA/mods/ra"));
-    candidates.push(PathBuf::from("../../vendor/OpenRA/mods/ra"));
-    let mut tried: Vec<String> = Vec::new();
     for c in &candidates {
-        tried.push(c.display().to_string());
         if c.exists()
             && let Ok(rs) = data_rules::load_ruleset(c)
         {
@@ -2469,14 +2478,11 @@ fn load_rules_strict() -> (GameRules, data_rules::Rules) {
             return (GameRules::from_ruleset(&rs), typed);
         }
     }
-    panic!(
-        "load_rules_strict: vendor RA YAML not found; tried: {}.\n\
-         The hardcoded `GameRules::defaults()` fallback was removed; \
-         vendor YAML is now the single source of truth. Set \
-         `OPENRA_VENDOR_DIR` or run from a tree that contains the \
-         bundled vendor directory.",
-        tried.join(", "),
-    )
+
+    // Default: embedded RA data baked into the wheel. Can't fail.
+    let rs = openra_data::embedded::load_ruleset_embedded();
+    let typed = data_rules::Rules::from_ruleset(&rs);
+    (GameRules::from_ruleset(&rs), typed)
 }
 
 fn kind_for_unit_type(t: &str) -> ActorKind {
