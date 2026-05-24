@@ -3877,6 +3877,14 @@ impl World {
                 // excluding ActorKind::Aircraft from ground-defense
                 // scans). A future SAM-equivalent stance could allow
                 // SAM-fires-on-ground; not needed for F11.
+                //
+                // Filter is classifier-driven (`is_anti_air` from
+                // DefenseKind), NOT weapon `versus` table driven —
+                // a defense that someone gave an air-capable weapon
+                // would still NOT engage aircraft unless its
+                // classifier is `AntiAirOnly`. Extending SAM-on-
+                // ground requires updating `classify_defense`, not
+                // adjusting weapon versus tables.
                 let cand_ok = if is_anti_air {
                     cand.kind == ActorKind::Aircraft
                 } else {

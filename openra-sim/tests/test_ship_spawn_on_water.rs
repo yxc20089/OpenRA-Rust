@@ -193,3 +193,138 @@ fn built_dd_spawns_on_water_adjacent_to_syrd() {
         world.terrain.is_water(sx, sy)
     );
 }
+
+/// Negative case: a `spen` placed in an arena with NO water must NOT
+/// spawn a destroyer on dry ground. The engine fix MUST refuse to
+/// place a ship outside water (the historical bug was placing the
+/// ship on land, where Mobile::Ship cannot enter → stuck-on-land
+/// soft-fail). Production stays stalled until a valid water cell
+/// becomes available.
+///
+/// This pins the safety claim — without this test a future change
+/// that drops the `is_water` filter would still pass
+/// `built_dd_spawns_on_water_adjacent_to_syrd` (which would happily
+/// accept a ship spawned on any cell).
+#[test]
+fn built_dd_does_not_spawn_when_no_water_adjacent() {
+    let mut world = arena();
+    let p1 = world.player_ids().get(1).copied().expect("P1 player id");
+
+    // INTENTIONALLY leave the entire arena as ground — no water_rect.
+    // The spen at (7,6) has no water-adjacent cell anywhere in its
+    // search radius.
+
+    insert_building(&mut world, 1001, p1, "fact", (2, 2));
+    insert_building(&mut world, 1002, p1, "powr", (6, 2));
+    insert_building(&mut world, 1003, p1, "proc", (2, 6));
+    insert_building(&mut world, 1004, p1, "dome", (2, 10));
+    insert_building(&mut world, 1005, p1, "spen", (7, 6));
+
+    if let Some(player_actor) = world.actor_mut(p1) {
+        player_actor.set_cash(5000);
+    }
+
+    let order = GameOrder {
+        order_string: "StartProduction".into(),
+        subject_id: Some(p1),
+        target_string: Some("dd".into()),
+        extra_data: None,
+    };
+    world.process_frame(&[order]);
+
+    // Advance further than the happy-path window so a slow spawn
+    // wouldn't be missed. The bug would have placed a dd on ground
+    // within the first ~200 frames.
+    for _ in 0..1200 {
+        world.process_frame(&[]);
+    }
+
+    for aid in world::all_actor_ids(&world) {
+        let a = match world.actor(aid) {
+            Some(a) => a,
+            None => continue,
+        };
+        if a.owner_id == Some(p1) && a.actor_type.as_deref() == Some("dd") {
+            panic!(
+                "engine spawned a dd on dry ground (no water in arena); \
+                 location={:?}",
+                a.location
+            );
+        }
+    }
+}
+
+/// Exercises the wider `scan_radius_extra = 2` ring search: the spen
+/// at (7,6) has its eastern face at x=10 (footprint 3×3 → x ∈ [7..10),
+/// east face at x=10). We place the water column at x=11..12, which
+/// is 1 cell beyond ring=1. Only ring=2 reaches the water, so this
+/// test verifies the wider scan radius for ships is actually used.
+///
+/// Without `scan_radius_extra=2` for ships (or with it accidentally
+/// downgraded to 1), this test would fail: the closest water cell
+/// would be unreachable by the ring=1 ground-default search.
+#[test]
+fn built_dd_finds_water_at_ring_two() {
+    let mut world = arena();
+    let p1 = world.player_ids().get(1).copied().expect("P1 player id");
+
+    // Water column at x=11..12 — one cell offset from the spen's east
+    // face (which sits at x=10). Ring=1 perimeter touches x=10, ring=2
+    // reaches x=11.
+    for y in 2..38 {
+        for x in 11..13 {
+            world.terrain.set_water(x, y, true);
+        }
+    }
+
+    insert_building(&mut world, 1001, p1, "fact", (2, 2));
+    insert_building(&mut world, 1002, p1, "powr", (6, 2));
+    insert_building(&mut world, 1003, p1, "proc", (2, 6));
+    insert_building(&mut world, 1004, p1, "dome", (2, 10));
+    insert_building(&mut world, 1005, p1, "spen", (7, 6));
+
+    if let Some(player_actor) = world.actor_mut(p1) {
+        player_actor.set_cash(5000);
+    }
+
+    let order = GameOrder {
+        order_string: "StartProduction".into(),
+        subject_id: Some(p1),
+        target_string: Some("dd".into()),
+        extra_data: None,
+    };
+    world.process_frame(&[order]);
+
+    let mut spawn_pos: Option<(i32, i32)> = None;
+    for _ in 0..800 {
+        world.process_frame(&[]);
+        for aid in world::all_actor_ids(&world) {
+            let a = match world.actor(aid) {
+                Some(a) => a,
+                None => continue,
+            };
+            if a.owner_id == Some(p1)
+                && a.actor_type.as_deref() == Some("dd")
+                && let Some(loc) = a.location
+            {
+                spawn_pos = Some(loc);
+                break;
+            }
+        }
+        if spawn_pos.is_some() {
+            break;
+        }
+    }
+
+    let (sx, sy) = spawn_pos.expect(
+        "built dd never appeared — production stalled or ring=2 scan failed",
+    );
+    assert!(
+        world.terrain.is_water(sx, sy),
+        "ring=2 spawn must land on water; got ({sx},{sy})"
+    );
+    assert!(
+        sx >= 11,
+        "spawn must be on the ring=2 water column (x≥11); got x={sx}"
+    );
+}
