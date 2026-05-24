@@ -203,10 +203,11 @@ fn tanya_beats_four_e1_riflemen() {
     );
 }
 
-/// Property pin: Tanya's actor-table stats match the spec — high HP
-/// (~3x e1), fast speed (~1.5x e1), strong sidearm bound, on the
-/// Infantry kind. Pins the chosen numbers so a future drift breaks
-/// loud.
+/// Property pin: Tanya's actor-table stats match the vendored RA E7
+/// spec — fatter than e1 (HP 2x), faster (speed ~1.4x), strong sidearm
+/// bound, on the Infantry kind. The HP / cost multipliers are looser
+/// than the historical stub (which had Tanya at 150000 HP, ~30x e1)
+/// so the no-vendor defaults stay aligned with the vendored E7 row.
 #[test]
 fn tanya_actor_stats_match_spec() {
     let rules = GameRules::defaults();
@@ -216,8 +217,8 @@ fn tanya_actor_stats_match_spec() {
     assert_eq!(tanya.kind, ActorKind::Infantry, "tanya is Infantry");
     assert!(!tanya.is_building, "tanya is not a building");
     assert!(
-        tanya.hp >= 3 * e1.hp,
-        "tanya HP ({}) should be ≥ 3x e1 HP ({})",
+        tanya.hp >= 2 * e1.hp,
+        "tanya HP ({}) should be ≥ 2x e1 HP ({})",
         tanya.hp,
         e1.hp
     );
