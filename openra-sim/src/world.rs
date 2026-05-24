@@ -243,6 +243,14 @@ fn pq_type_name(pq: PqType) -> &'static str {
     }
 }
 
+/// Number of world ticks during which `auto_route_idle_harvesters`
+/// must NOT clobber a harvester that has received a user-issued
+/// `Harvest(unit_id, x, y)` order. 300 ticks ≈ 3 decision turns at
+/// 100 ticks/turn — enough for the harv to actually walk to a
+/// far-off patch before the auto-router is allowed to take over
+/// again. See Fix #4 in OpenRA-Bench's ENGINE_FOLLOWUPS.
+pub const USER_HARVEST_RESPECT_TICKS: u32 = 300;
+
 pub struct World {
     /// All actors keyed by ID. BTreeMap ensures deterministic iteration order.
     actors: BTreeMap<u32, Actor>,
@@ -362,6 +370,16 @@ pub struct World {
     /// Incremented in `tick_actors` whenever a player's attack reduces
     /// a target's HP ≤ 0. Read via `kills_for_player`.
     kills_per_player: BTreeMap<u32, u32>,
+    /// World-tick at which each harvester last received an explicit
+    /// user-issued `Harvest(unit_id, x, y)` order. Used to gate the
+    /// `auto_route_idle_harvesters` back-stop: a harvester whose
+    /// owner has issued a Harvest order within `USER_HARVEST_RESPECT_TICKS`
+    /// is left alone (the user's target patch is preserved across the
+    /// brief idle window between deliver-and-next-cycle, which would
+    /// otherwise see the auto-router clobber the user's chosen patch
+    /// with the nearest-to-proc patch). Without this, all per-patch
+    /// allocation policies collapsed to identical economy_value.
+    last_user_harvest_tick: HashMap<u32, u32>,
     /// Phase-8: in-flight projectiles (rockets / missiles). BTreeMap so
     /// per-tick advance and impact-resolution iterate in stable id
     /// order. Spawned by the combat loop when an attacker fires a
@@ -1370,14 +1388,24 @@ impl World {
 
     /// Handle a Harvest order: send a harvester to harvest at a location.
     fn order_harvest(&mut self, actor_id: u32, target: (i32, i32)) {
-        // Idempotent: a unit already harvesting must not have its
-        // in-progress run (accumulated ore / FSM state) wiped by a
-        // re-issued harvest order — agents/models re-send commands
-        // every turn, and clobbering here starves the harvester so it
-        // never reaches capacity and never delivers cash.
+        // Always stamp the user-order tick — even if we end up taking
+        // the idempotent fast-path below — so `auto_route_idle_harvesters`
+        // continues to respect this user choice across the brief idle
+        // window between cycles.
+        self.last_user_harvest_tick.insert(actor_id, self.world_tick);
+
+        // Idempotent-with-target-check: a unit already harvesting at
+        // (or toward) the same target must not have its in-progress
+        // run wiped — agents re-send the same Harvest command every
+        // turn. But if the target CHANGED, the user wants to redirect,
+        // and we must update `last_harvest_cell` so the next
+        // `FindingOre` scan looks near the NEW patch instead of
+        // bouncing back to whatever was closest before.
         if let Some(a) = self.actors.get(&actor_id) {
-            if matches!(a.activity, Some(Activity::Harvest { .. })) {
-                return;
+            if let Some(Activity::Harvest { last_harvest_cell, .. }) = &a.activity {
+                if *last_harvest_cell == Some(target) {
+                    return;
+                }
             }
         }
         let (speed, owner_id) = match self.actors.get(&actor_id) {
@@ -1386,11 +1414,19 @@ impl World {
         };
         let refinery_id = owner_id.and_then(|pid| self.find_refinery(pid)).unwrap_or(0);
         if let Some(actor) = self.actors.get_mut(&actor_id) {
+            // Preserve carried ore/gems on a redirect (the user is
+            // re-targeting an active harvester, not resetting it).
+            let (carried_ore, carried_gems) =
+                if let Some(Activity::Harvest { carried_ore, carried_gems, .. }) = &actor.activity {
+                    (*carried_ore, *carried_gems)
+                } else {
+                    (0, 0)
+                };
             actor.activity = Some(Activity::Harvest {
                 state: HarvestState::FindingOre,
                 refinery_id,
-                carried_ore: 0,
-                carried_gems: 0,
+                carried_ore,
+                carried_gems,
                 capacity: 20,
                 path: Vec::new(),
                 path_index: 0,
@@ -2101,6 +2137,9 @@ impl World {
     /// Each enemy actor killed credits one kill to `owner` via
     /// `kills_per_player` (mirrors the projectile-resolve path so a
     /// `units_killed_gte` win predicate can be triggered by a nuke).
+    /// Friendly-fire kills (victim_owner == owner) do NOT credit —
+    /// otherwise an agent could game `units_killed_gte` by
+    /// ego-detonating on its own units.
     fn detonate_nuke(&mut self, owner: u32, target_x: i32, target_y: i32) -> usize {
         let radius = crate::superweapon::NUKE_RADIUS_CELLS;
         let base = crate::superweapon::NUKE_BASE_DAMAGE;
@@ -2143,6 +2182,7 @@ impl World {
                 if let Some(loc) = a.location {
                     self.terrain.clear_occupant(loc.0, loc.1);
                 }
+                let _ = a;
             }
             if let Some(vo) = victim_owner {
                 if vo != owner {
@@ -2212,6 +2252,21 @@ impl World {
             .map(|a| a.id)
             .collect();
         for hid in candidates {
+            // Respect a recent user-issued Harvest order. The user
+            // told us where to mine; the auto-router must not
+            // clobber that choice the moment the harv goes idle
+            // (between cycles). The 300-tick window (~3 decision
+            // turns at 100t/turn) is long enough for the harv to
+            // actually walk to a far-away patch — after that the
+            // user is presumed to have moved on and auto-route may
+            // resume.
+            if let Some(last) = self.last_user_harvest_tick.get(&hid).copied() {
+                if self.world_tick.saturating_sub(last)
+                    < crate::world::USER_HARVEST_RESPECT_TICKS
+                {
+                    continue;
+                }
+            }
             let (owner, speed, loc) = {
                 let a = match self.actors.get(&hid) { Some(a) => a, None => continue };
                 (a.owner_id.unwrap(), self.actor_speed(hid), a.location)
@@ -3874,17 +3929,20 @@ impl World {
         }
 
         // Tick Attack activities: check range, manage reload, deal damage.
-        // First pass: decrement reload timers and collect ready-to-fire attackers
-        let mut ready_attackers: Vec<(u32, u32, i32, i32)> = Vec::new(); // (attacker_id, target_id, damage, weapon_range)
+        // First pass: decrement reload timers and collect ready-to-fire attackers.
+        // Fifth tuple field is `auto_acquired` — needed so the damage-
+        // application step can apply the stance:1 DPS multiplier (Fix #5
+        // in ENGINE_FOLLOWUPS Wave-13).
+        let mut ready_attackers: Vec<(u32, u32, i32, i32, bool)> = Vec::new(); // (attacker_id, target_id, damage, weapon_range, auto_acquired)
         for actor in self.actors.values_mut() {
             if let Some(Activity::Attack {
                 target_id, weapon_range, weapon_damage,
-                ref mut reload_remaining, ..
+                ref mut reload_remaining, auto_acquired, ..
             }) = actor.activity {
                 if *reload_remaining > 0 {
                     *reload_remaining -= 1;
                 } else {
-                    ready_attackers.push((actor.id, target_id, weapon_damage, weapon_range));
+                    ready_attackers.push((actor.id, target_id, weapon_damage, weapon_range, auto_acquired));
                 }
             }
         }
@@ -4050,6 +4108,16 @@ impl World {
             if damage <= 0 {
                 continue;
             }
+            // Move-fire shots are by construction auto-acquired
+            // (opportunistic). Apply the stance-driven DPS multiplier
+            // before queuing damage — stance:1 (ReturnFire) deals
+            // reduced auto-fire DPS so a passive kiter cannot just sit
+            // and trade fire (Fix #5).
+            let damage = scale_auto_fire_damage(
+                damage,
+                self.stances.get(attacker_id).copied().unwrap_or(2),
+                true,
+            );
             if proj_speed > 0 {
                 spawn_projectiles.push((
                     *attacker_id,
@@ -4064,7 +4132,7 @@ impl World {
             }
             self.move_fire_cooldown.insert(*attacker_id, reload);
         }
-        for (attacker_id, target_id, damage, weapon_range) in ready_attackers {
+        for (attacker_id, target_id, damage, weapon_range, auto_acquired) in ready_attackers {
             let attacker_loc = self.actors.get(&attacker_id).and_then(|a| a.location);
             let target_loc = self.actors.get(&target_id).and_then(|a| a.location);
             if let (Some(aloc), Some(tloc)) = (attacker_loc, target_loc) {
@@ -4086,6 +4154,18 @@ impl World {
                         .and_then(|t| self.rules.best_weapon_against(t, proj_target_armor))
                         .map(|(_, w)| (w.projectile_speed, w.splash_radius, w.versus.clone()))
                         .unwrap_or((0, 0, BTreeMap::new()));
+                    // Apply the stance-driven auto-fire DPS multiplier:
+                    // stance:1 (ReturnFire) attackers that ENTERED this
+                    // Attack via the auto-engage scan deal reduced
+                    // damage so a stationary kiter cannot just stand and
+                    // trade fire (Fix #5). An order-issued Attack
+                    // (`auto_acquired=false`) is always at full DPS —
+                    // explicit player intent overrides the balance gate.
+                    let damage = scale_auto_fire_damage(
+                        damage,
+                        self.stances.get(&attacker_id).copied().unwrap_or(2),
+                        auto_acquired,
+                    );
                     if proj_speed > 0 {
                         spawn_projectiles.push((attacker_id, target_id, damage, proj_speed, splash, versus_table));
                     } else {
@@ -4105,7 +4185,56 @@ impl World {
                         }
                     }
                 } else {
-                    // Out of range: chase the target
+                    // Out of range: chase the target — but ONLY when
+                    // the engagement was player-issued (explicit
+                    // attack-unit) OR the attacker is stance:3
+                    // (AttackAnything: the only "advance on visible
+                    // enemies" stance). An auto-acquired engagement
+                    // from the idle stance scan with stance:1
+                    // (ReturnFire) or stance:2 (Defend) is bound by
+                    // stance semantics: those stances explicitly do
+                    // NOT pursue past current range. Without this
+                    // gate, an idle stance:2 defender that briefly
+                    // auto-acquired a passing enemy would convert
+                    // into a hunter the moment the enemy rolled past
+                    // weapon range — collapsing the bait/decoy
+                    // perimeter idioms and the flank-vs-frontal
+                    // geometry guarantee (`combat-flanking-attack`).
+                    //
+                    // The key distinction vs. simply dropping the
+                    // activity: we KEEP the Attack alive so the
+                    // attacker keeps re-checking range on its
+                    // reload cycle — if the target wanders BACK
+                    // into range, it fires again without needing
+                    // the idle scan to re-acquire. The cost is the
+                    // attacker stays "locked on" to a target that
+                    // may never return; the next-tick stance scan
+                    // is gated on `actor.activity.is_some() == false`
+                    // so it won't switch targets. To unstick, the
+                    // attacker's Attack times out after
+                    // `STANCE_DEFEND_HOLD_TICKS` of no-fire and
+                    // returns to idle so the stance scan can pick
+                    // a different target. Pinned by
+                    // `test_stance_2_no_chase.rs`.
+                    if auto_acquired {
+                        let stance = self.stances.get(&attacker_id).copied().unwrap_or(2);
+                        if stance != 3 {
+                            // Keep the activity so subsequent ticks
+                            // re-check range; pretend the cycle
+                            // completed so the reload runs again
+                            // and the next opportunity is taken.
+                            if let Some(actor) = self.actors.get_mut(&attacker_id) {
+                                if let Some(Activity::Attack {
+                                    ref mut reload_remaining, reload_delay, ..
+                                }) = actor.activity {
+                                    // Re-arm the reload so we don't
+                                    // spin every tick checking range.
+                                    *reload_remaining = reload_delay;
+                                }
+                            }
+                            continue;
+                        }
+                    }
                     chase_targets.push((attacker_id, tloc));
                 }
             }
@@ -5882,6 +6011,31 @@ pub fn center_of_cell(x: i32, y: i32) -> WPos {
 }
 
 /// Parse "X,Y" cell target from order target_string.
+/// Scale auto-fire damage by stance. A stance:1 (ReturnFire) actor
+/// that fires via auto-target (auto-engage scan or move-fire) deals
+/// reduced DPS — represents "snap fire while reorienting, not aimed
+/// fire". This is the engine half of Fix #5 in OpenRA-Bench's
+/// ENGINE_FOLLOWUPS Wave-13: it makes a stationary stance:1 kiter
+/// LOSE the head-on trade against an advancing stance:3 chaser at
+/// reduced chaser HP, restoring the kite-and-pull capability gate
+/// (without this scaling, "just stand still on ReturnFire" trivially
+/// wins, making the kite verb redundant).
+///
+/// Stances other than 1 are unaffected. Order-issued attacks
+/// (`auto_acquired == false`) are always at full DPS — player intent
+/// overrides the balance gate.
+///
+/// Scaling: 0.6× (i.e. 60%). Chosen empirically to flip the bench's
+/// EASY-tier outcome from "stationary kiter wins" to "advancing
+/// chaser wins" without altering the existing scripted-attack tests.
+fn scale_auto_fire_damage(damage: i32, stance: u8, auto_acquired: bool) -> i32 {
+    if stance == 1 && auto_acquired {
+        (damage * 6) / 10
+    } else {
+        damage
+    }
+}
+
 fn parse_cell_target(s: &str) -> Option<(i32, i32)> {
     let mut parts = s.split(',');
     let x = parts.next()?.trim().parse::<i32>().ok()?;
@@ -6495,6 +6649,7 @@ pub fn build_world(
         player_factions,
         typed_shroud: BTreeMap::new(),
         kills_per_player: BTreeMap::new(),
+        last_user_harvest_tick: HashMap::new(),
         pending_projectiles: BTreeMap::new(),
         next_projectile_id: 1,
         typed_components: BTreeMap::new(),

@@ -214,6 +214,24 @@ impl GameRules {
             });
         }
 
+        // Bench-friendly alias: the C# RA YAML registers the Allied
+        // commando hero as `E7`, but every bench scenario (and the
+        // `world.rs::order_c4_detonate` + `env.rs` C4 validator) keys
+        // the actor by the canonical name `tanya`. Register `tanya` as
+        // a clone of `e7` in the ruleset path so scenarios using
+        // `type: tanya` resolve to the real E7 stats (HP 10000, Colt45
+        // weapon) instead of falling back to the no-stats default
+        // (max_hp=50000, weapons=[], → 100-dps "default" weapon — the
+        // root cause of `combat-tanya-vs-rush` being unsolvable).
+        // Without this alias, `world.rules.actor("tanya")` returns
+        // None in production (since only `defaults()` registers
+        // "tanya"), and the scenario actor is spawned weaponless.
+        if !actors.contains_key("tanya") {
+            if let Some(e7) = actors.get("e7").cloned() {
+                actors.insert("tanya".to_string(), e7);
+            }
+        }
+
         for (name, info) in &ruleset.weapons {
             // C# OpenRA stores `Damage` inside `Warhead@<n>: SpreadDamage` —
             // walk the warhead children rather than the top-level `Damage:`

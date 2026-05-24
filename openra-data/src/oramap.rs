@@ -346,6 +346,7 @@ impl ScenarioActor {
                 | "e4"
                 | "e6"
                 | "e7"
+                | "tanya"
                 | "medi"
                 | "mech"
                 | "shok"
@@ -436,6 +437,25 @@ pub struct MapDef {
     /// water cells. Used by the naval MVP to declare water bands
     /// without touching the `map.bin` tile encoding.
     pub water_cells: Vec<(i32, i32)>,
+    /// Termination flag: when `true` (default), the engine auto-`done`s
+    /// the episode the moment the agent has no surviving combat units
+    /// or MustBeDestroyed buildings. Set to `false` via
+    /// `termination.agent_units_killed: false` in the scenario YAML to
+    /// let the episode continue past an agent-side wipe (e.g. a
+    /// suicide-charge pack scoring on enemy kills before the strike
+    /// package dies). The win/fail predicates are still evaluated each
+    /// turn; absent a predicate trigger the run ends at the tick
+    /// deadline.
+    pub terminate_on_agent_units_killed: bool,
+    /// Termination flag: when `true` (default), the engine auto-`done`s
+    /// the episode the moment the enemy has no surviving combat units
+    /// or MustBeDestroyed buildings. Set to `false` via
+    /// `termination.enemy_units_killed: false` in the scenario YAML to
+    /// let the episode continue past an enemy-side wipe (e.g. a
+    /// "deny-and-keep-playing" pack whose win clause has additional
+    /// criteria beyond elimination). Win/fail predicates are still
+    /// evaluated each turn.
+    pub terminate_on_enemy_units_killed: bool,
 }
 
 /// A scenario-declared ore patch. Materialised by the env layer at
@@ -703,8 +723,10 @@ pub fn load_rush_hour_map_with_spawn(
     let base_bytes = std::fs::read(&base_path)?;
     let base = parse(&base_bytes)?;
 
-    // Expand actors.
-    let actors = expand_scenario_actors(&scenario.actors, spawn_point);
+    // Expand actors. Thread the base-map's playable rectangle so
+    // `count: N` spirals reject out-of-bounds candidates (the engine
+    // panics on out-of-bounds actor placement).
+    let actors = expand_scenario_actors(&scenario.actors, spawn_point, Some(base.bounds));
 
     Ok(MapDef {
         title: base.title,
@@ -724,6 +746,12 @@ pub fn load_rush_hour_map_with_spawn(
         reveal_map: scenario.reveal_map.unwrap_or(false),
         ore_patches: scenario.ore_patches,
         water_cells: scenario.water_cells,
+        terminate_on_agent_units_killed: scenario
+            .terminate_on_agent_units_killed
+            .unwrap_or(true),
+        terminate_on_enemy_units_killed: scenario
+            .terminate_on_enemy_units_killed
+            .unwrap_or(true),
     })
 }
 
@@ -769,6 +797,15 @@ struct ScenarioYaml {
     /// path: lets a naval scenario declare water without touching
     /// `map.bin`. Empty when neither block is present.
     water_cells: Vec<(i32, i32)>,
+    /// Top-level `termination.agent_units_killed:` flag. None ⇒
+    /// default `true` (engine auto-`done`s on agent wipe). Set to
+    /// `false` to keep the run alive past an agent-side wipe so the
+    /// scenario's declarative win/fail predicates can still fire.
+    terminate_on_agent_units_killed: Option<bool>,
+    /// Top-level `termination.enemy_units_killed:` flag. None ⇒
+    /// default `true` (engine auto-`done`s on enemy wipe). Set to
+    /// `false` to keep the run alive past an enemy-side wipe.
+    terminate_on_enemy_units_killed: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -936,6 +973,80 @@ fn parse_scenario_yaml(text: &str) -> io::Result<ScenarioYaml> {
                     }
                     continue;
                 }
+                "termination" => {
+                    // Block form (PyYAML safe_dump default):
+                    //   termination:
+                    //     max_ticks: 5400
+                    //     agent_units_killed: false
+                    //     enemy_units_killed: false
+                    // Inline form (`termination: {max_ticks: 6000}`) is
+                    // ALSO accepted — PyYAML emits it for short blocks.
+                    // We honour only the two auto-`done` gating flags;
+                    // `max_ticks` / `max_time` are handled bench-side
+                    // (the env wrapper passes a separate `max_ticks`
+                    // argument) so they're parsed-but-ignored here.
+                    let inline_v = v.trim();
+                    if !inline_v.is_empty()
+                        && inline_v.starts_with('{')
+                        && inline_v.ends_with('}')
+                    {
+                        // Inline flow-form: parse `{k: v, k: v}`.
+                        let inner = &inline_v[1..inline_v.len() - 1];
+                        for kv in inner.split(',') {
+                            if let Some((k, vv)) = split_key_value(kv.trim()) {
+                                let vv = vv
+                                    .trim()
+                                    .trim_matches(|c: char| c == '"' || c == '\'');
+                                match k {
+                                    "agent_units_killed" => {
+                                        out.terminate_on_agent_units_killed =
+                                            parse_bool_str(vv);
+                                    }
+                                    "enemy_units_killed" => {
+                                        out.terminate_on_enemy_units_killed =
+                                            parse_bool_str(vv);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        i += 1;
+                        continue;
+                    }
+                    // Block form — indented child keys until the next
+                    // unindented line.
+                    let mut j = i + 1;
+                    while j < lines.len() {
+                        let raw_j = lines[j];
+                        let tj = strip_yaml_comment(raw_j).trim_end();
+                        if tj.is_empty() {
+                            j += 1;
+                            continue;
+                        }
+                        if leading_spaces(raw_j) == 0 {
+                            break;
+                        }
+                        if let Some((k, vv)) = split_key_value(tj) {
+                            let vv = vv
+                                .trim()
+                                .trim_matches(|c: char| c == '"' || c == '\'');
+                            match k {
+                                "agent_units_killed" => {
+                                    out.terminate_on_agent_units_killed =
+                                        parse_bool_str(vv);
+                                }
+                                "enemy_units_killed" => {
+                                    out.terminate_on_enemy_units_killed =
+                                        parse_bool_str(vv);
+                                }
+                                _ => {}
+                            }
+                        }
+                        j += 1;
+                    }
+                    i = j;
+                    continue;
+                }
                 "water_cells" => {
                     // Flat list of `[x, y]` pairs (PyYAML block form):
                     //   water_cells:
@@ -996,6 +1107,16 @@ fn strip_yaml_comment(s: &str) -> &str {
 
 fn leading_spaces(line: &str) -> usize {
     line.bytes().take_while(|&b| b == b' ').count()
+}
+
+/// Parse YAML's permissive booleans into `Option<bool>`. Mirrors the
+/// inline `match` used by `spawn_mcvs:` / `reveal_map:`.
+fn parse_bool_str(v: &str) -> Option<bool> {
+    match v.trim() {
+        "true" | "True" | "yes" | "1" => Some(true),
+        "false" | "False" | "no" | "0" => Some(false),
+        _ => None,
+    }
 }
 
 /// Inside a `agent:` or `enemy:` top-level block, read indented `faction:` line.
@@ -1468,11 +1589,23 @@ fn read_xy_list(lines: &[&str], start: usize, expected_indent: usize) -> ((i32, 
 /// Nearest cell to `(ax, ay)` not already in `used`, searched in
 /// outward Chebyshev rings (deterministic: row-major within each ring).
 /// Used to spread a `count:` group so its units do not spawn stacked.
+///
+/// When `bounds` is `Some((bx, by, bw, bh))` candidate cells outside
+/// the rectangle `[bx, bx+bw) × [by, by+bh)` are rejected — this
+/// guards against `count: N` near a map edge silently placing actors
+/// off-map (the engine panics on out-of-bounds actor placement).
+///
+/// Returns `None` if the spiral exhausts `r = 64` without finding a
+/// valid cell — the caller is responsible for the fallback. The
+/// historical behaviour (return the anchor itself on exhaustion) is
+/// preserved at the [`push_count_spread`] call site, together with a
+/// `eprintln!` warning so the underlying issue surfaces.
 fn next_free_spiral(
     ax: i32,
     ay: i32,
     used: &HashSet<(i32, i32)>,
-) -> (i32, i32) {
+    bounds: Option<(i32, i32, i32, i32)>,
+) -> Option<(i32, i32)> {
     let mut r = 1i32;
     while r <= 64 {
         for dy in -r..=r {
@@ -1481,14 +1614,20 @@ fn next_free_spiral(
                     continue;
                 }
                 let p = (ax + dx, ay + dy);
-                if !used.contains(&p) {
-                    return p;
+                if used.contains(&p) {
+                    continue;
                 }
+                if let Some((bx, by, bw, bh)) = bounds {
+                    if p.0 < bx || p.0 >= bx + bw || p.1 < by || p.1 >= by + bh {
+                        continue;
+                    }
+                }
+                return Some(p);
             }
         }
         r += 1;
     }
-    (ax, ay)
+    None
 }
 
 /// Expand one raw actor's `count: N` into N `ScenarioActor`s. Copy 0
@@ -1499,10 +1638,18 @@ fn next_free_spiral(
 /// groups) never spawn stacked on one cell. A tile-based RTS gives each
 /// ground unit its own cell; `count: N` previously copied `position`
 /// verbatim, piling all N units on the anchor.
+///
+/// When `bounds` is `Some(map_rect)` the spiral search rejects
+/// out-of-bounds cells (the engine panics on out-of-bounds actor
+/// placement). If the spiral exhausts without finding any valid cell
+/// we fall back to the anchor position and emit a warning — preserving
+/// the historical behaviour but surfacing the underlying issue rather
+/// than silently corrupting placement.
 fn push_count_spread(
     out: &mut Vec<ScenarioActor>,
     used: &mut HashSet<(i32, i32)>,
     r: &RawScenarioActor,
+    bounds: Option<(i32, i32, i32, i32)>,
 ) {
     let n = r.count.max(1);
     let (ax, ay) = r.position;
@@ -1510,7 +1657,20 @@ fn push_count_spread(
         let pos = if k == 0 {
             (ax, ay)
         } else {
-            next_free_spiral(ax, ay, used)
+            match next_free_spiral(ax, ay, used, bounds) {
+                Some(p) => p,
+                None => {
+                    eprintln!(
+                        "warning: scenario actor type={} owner={} count={} \
+                         exhausted spiral search around anchor ({},{}) \
+                         within bounds {:?} — falling back to anchor cell \
+                         (copy {} of {}). Consider lowering count: or \
+                         moving the anchor further from the map edge.",
+                        r.actor_type, r.owner, n, ax, ay, bounds, k, n
+                    );
+                    (ax, ay)
+                }
+            }
         };
         used.insert(pos);
         out.push(ScenarioActor {
@@ -1523,7 +1683,11 @@ fn push_count_spread(
     }
 }
 
-fn expand_scenario_actors(raw: &[RawScenarioActor], spawn_point: i32) -> Vec<ScenarioActor> {
+fn expand_scenario_actors(
+    raw: &[RawScenarioActor],
+    spawn_point: i32,
+    bounds: Option<(i32, i32, i32, i32)>,
+) -> Vec<ScenarioActor> {
     let any_agent_has_spawn = raw
         .iter()
         .any(|r| r.owner == "agent" && r.spawn_point.is_some());
@@ -1547,7 +1711,7 @@ fn expand_scenario_actors(raw: &[RawScenarioActor], spawn_point: i32) -> Vec<Sce
         }
         // `count: N` expands to N actors on N distinct cells — units
         // of a group no longer spawn stacked on the anchor.
-        push_count_spread(&mut out, &mut used, r);
+        push_count_spread(&mut out, &mut used, r, bounds);
     }
     out
 }
@@ -1636,10 +1800,18 @@ fn read_scheduled_events(
                         // scheduled-event injection (the seed-axis filter
                         // is consumed once at episode start), so we drop
                         // it here.
+                        // Scheduled-event expansion happens at YAML
+                        // parse time, before the base map is loaded, so
+                        // bounds aren't available here. Pass `None` —
+                        // the spiral falls back to its legacy
+                        // unbounded behaviour. Authors are responsible
+                        // for keeping scheduled-event anchors safely
+                        // inside the map; the same eprintln warning
+                        // surfaces if the spiral exhausts.
                         let mut used: HashSet<(i32, i32)> = HashSet::new();
                         for r in &raw_actors {
                             push_count_spread(
-                                &mut spawn_actors, &mut used, r,
+                                &mut spawn_actors, &mut used, r, None,
                             );
                         }
                         i = ni;

@@ -2117,10 +2117,15 @@ impl Env {
         //         Without this branch, my earlier maginot fix collapses
         //         rush-hour to "no buildings → enemy_alive=False from
         //         turn 0 → instant terminal".
-        // A surrendered agent is defeated regardless of remaining force.
-        let agent_alive = !world.is_surrendered(self.agent_player_id)
-            && (has_combat_units(world, self.agent_player_id)
-                || has_must_be_destroyed_buildings(world, self.agent_player_id));
+        // A surrendered agent is always defeated (the surrender path
+        // is an explicit player action, not the units-killed auto-done
+        // — so the `terminate_on_agent_units_killed` flag does NOT gate
+        // it).
+        if world.is_surrendered(self.agent_player_id) {
+            return true;
+        }
+        let agent_alive = has_combat_units(world, self.agent_player_id)
+            || has_must_be_destroyed_buildings(world, self.agent_player_id);
         let enemy_alive = if !self.enemy_started_present {
             // No enemy in this scenario: enemy-elimination is not a
             // victory/terminal condition. Termination is driven solely
@@ -2132,7 +2137,18 @@ impl Env {
         } else {
             has_combat_units(world, self.enemy_player_id)
         };
-        !agent_alive || !enemy_alive
+        // Scenario-declared opt-outs (`termination.agent_units_killed:
+        // false` / `termination.enemy_units_killed: false`) suppress the
+        // corresponding side's auto-`done`. Used by sacrifice / decoy /
+        // forlorn-hope packs where the win or fail predicate scores on
+        // events that happen AFTER one side's force is wiped — without
+        // the opt-out, the engine ends the run before those predicates
+        // can fire. Default for both flags is `true` (back-compat).
+        let agent_terminates = self.map_def.terminate_on_agent_units_killed;
+        let enemy_terminates = self.map_def.terminate_on_enemy_units_killed;
+        let agent_wipe_ends = agent_terminates && !agent_alive;
+        let enemy_wipe_ends = enemy_terminates && !enemy_alive;
+        agent_wipe_ends || enemy_wipe_ends
     }
 }
 
@@ -2534,6 +2550,8 @@ pub fn build_test_env_with_no_enemies(map_size: (i32, i32), seed: u64) -> Env {
         reveal_map: false,
         ore_patches: Vec::new(),
         water_cells: Vec::new(),
+        terminate_on_agent_units_killed: true,
+        terminate_on_enemy_units_killed: true,
     };
     let mut env = Env {
         scenario_path: PathBuf::from("<test>"),
