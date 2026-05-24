@@ -135,14 +135,17 @@ fn five_tick_east_move_matches_reference() {
         assert!(w[1] >= w[0], "x must not decrease while moving east: {:?}", xs);
     }
     // Reference: between xs[0] (after frame 1, 3 ticks of move) and
-    // xs[4] (after frame 5, 12 more ticks of move at speed=43), the
-    // actor advances by 12*43 = 516 world units along the east axis
-    // until it reaches the next cell centre and crosses into cell (3,5).
-    // Allow a small slack for the cell-boundary snap.
+    // xs[4] (after frame 5, 12 more ticks of move at vendor e1
+    // speed=54), the actor advances by 12*54 = 648 world units along
+    // the east axis until it reaches the next cell centre and crosses
+    // into cell (3,5). The stub e1 speed was 43 (12*43 = 516); the
+    // vendor speed comes from `infantry.yaml ^Soldier.Mobile.Speed`
+    // and is the truth now that `defaults()` is removed. Allow a
+    // small slack for the cell-boundary snap.
     let total_dx = xs.last().unwrap() - xs.first().unwrap();
     assert!(
-        (500..=560).contains(&total_dx),
-        "expected dx ≈ 516 world units after 12 more ticks at speed 43, got {} (xs={:?})",
+        (630..=690).contains(&total_dx),
+        "expected dx ≈ 648 world units after 12 more ticks at vendor e1 speed 54, got {} (xs={:?})",
         total_dx,
         xs,
     );

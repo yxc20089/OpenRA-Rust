@@ -11,7 +11,7 @@
 //! 3. A `dd` with weapon and Mobile.Speed can engage a ground target
 //!    standing on the shore (Activity::Attack + chase + damage).
 //!
-//! The test runs entirely on `GameRules::defaults()` so it never
+//! The test runs entirely on `GameRules::vendor_cached()` so it never
 //! touches the vendored RA mod (the worktree lacks the submodule).
 //! It manually constructs a small World with hand-built actors and
 //! stamps a water column into the terrain. The default `dd` entry
@@ -102,7 +102,7 @@ fn arena() -> World {
             },
         ],
     };
-    let mut w = world::build_world(&map, 0, &lobby, Some(GameRules::defaults()), 0, false);
+    let mut w = world::build_world(&map, 0, &lobby, Some(GameRules::vendor_cached()), 0, false);
     set_test_unpaused(&mut w);
     let strip: Vec<u32> = world::all_actor_ids(&w)
         .into_iter()

@@ -456,6 +456,14 @@ pub struct MapDef {
     /// criteria beyond elimination). Win/fail predicates are still
     /// evaluated each turn.
     pub terminate_on_enemy_units_killed: bool,
+    /// Scenario-declared hard tick deadline from
+    /// `termination.max_ticks:`. `None` means the YAML did not declare
+    /// one; the env layer falls back to `DEFAULT_MAX_TICKS`. When
+    /// present the value is honoured EXACTLY (no clamp) — long-horizon
+    /// packs (F11 vertical-strike, etc.) may declare any
+    /// budget their capability requires. The env layer applies this in
+    /// `Env::new_with_spawn_point`.
+    pub max_ticks: Option<u32>,
 }
 
 /// A scenario-declared ore patch. Materialised by the env layer at
@@ -752,6 +760,7 @@ pub fn load_rush_hour_map_with_spawn(
         terminate_on_enemy_units_killed: scenario
             .terminate_on_enemy_units_killed
             .unwrap_or(true),
+        max_ticks: scenario.max_ticks,
     })
 }
 
@@ -806,6 +815,11 @@ struct ScenarioYaml {
     /// default `true` (engine auto-`done`s on enemy wipe). Set to
     /// `false` to keep the run alive past an enemy-side wipe.
     terminate_on_enemy_units_killed: Option<bool>,
+    /// Top-level `termination.max_ticks:` — scenario-declared hard
+    /// tick deadline. None ⇒ the env layer falls back to
+    /// `DEFAULT_MAX_TICKS`. When set, the value is honoured exactly
+    /// (no clamp): long-horizon packs may declare any budget.
+    max_ticks: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -981,10 +995,10 @@ fn parse_scenario_yaml(text: &str) -> io::Result<ScenarioYaml> {
                     //     enemy_units_killed: false
                     // Inline form (`termination: {max_ticks: 6000}`) is
                     // ALSO accepted — PyYAML emits it for short blocks.
-                    // We honour only the two auto-`done` gating flags;
-                    // `max_ticks` / `max_time` are handled bench-side
-                    // (the env wrapper passes a separate `max_ticks`
-                    // argument) so they're parsed-but-ignored here.
+                    // We honour the two auto-`done` gating flags and
+                    // `max_ticks` (the scenario's hard tick deadline,
+                    // honoured exactly — no clamp). `max_time` is
+                    // still parsed-but-ignored.
                     let inline_v = v.trim();
                     if !inline_v.is_empty()
                         && inline_v.starts_with('{')
@@ -1005,6 +1019,11 @@ fn parse_scenario_yaml(text: &str) -> io::Result<ScenarioYaml> {
                                     "enemy_units_killed" => {
                                         out.terminate_on_enemy_units_killed =
                                             parse_bool_str(vv);
+                                    }
+                                    "max_ticks" => {
+                                        if let Ok(n) = vv.parse::<u32>() {
+                                            out.max_ticks = Some(n);
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -1038,6 +1057,11 @@ fn parse_scenario_yaml(text: &str) -> io::Result<ScenarioYaml> {
                                 "enemy_units_killed" => {
                                     out.terminate_on_enemy_units_killed =
                                         parse_bool_str(vv);
+                                }
+                                "max_ticks" => {
+                                    if let Ok(n) = vv.parse::<u32>() {
+                                        out.max_ticks = Some(n);
+                                    }
                                 }
                                 _ => {}
                             }

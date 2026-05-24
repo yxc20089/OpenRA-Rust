@@ -55,7 +55,13 @@ fn from_ruleset_loads_real_ra_rules() {
 }
 
 #[test]
-fn from_ruleset_matches_defaults_for_common_units() {
+fn from_ruleset_yields_nonzero_costs_for_common_units() {
+    // The `from_ruleset_matches_defaults_for_common_units` test was
+    // retired together with `GameRules::defaults()` — vendor RA YAML is
+    // now the single source of truth, so there is nothing to compare
+    // against. Keep a tighter sanity check that the vendor-loaded
+    // ruleset surfaces non-zero costs for every common unit (catches
+    // YAML-parser regressions).
     if !ra_mod_available() {
         eprintln!("Skipping: vendor/OpenRA not found");
         return;
@@ -64,18 +70,11 @@ fn from_ruleset_matches_defaults_for_common_units() {
     let mod_dir = Path::new(RA_MOD_DIR);
     let ruleset = openra_data::rules::load_ruleset(mod_dir).expect("Failed to load RA ruleset");
     let from_yaml = openra_sim::gamerules::GameRules::from_ruleset(&ruleset);
-    let defaults = openra_sim::gamerules::GameRules::defaults();
 
-    // Compare costs for common units between YAML-loaded and hardcoded defaults
     let units_to_check = ["e1", "e3", "2tnk", "harv", "mcv", "powr", "weap", "proc"];
     for name in &units_to_check {
-        let yaml_cost = from_yaml.cost(name);
-        let default_cost = defaults.cost(name);
-        eprintln!("{}: yaml_cost={} default_cost={}", name, yaml_cost, default_cost);
-        // These should be close (YAML may differ slightly from our hardcoded guesses)
-        if yaml_cost != default_cost {
-            eprintln!("  NOTE: {} cost differs: yaml={} vs default={}", name, yaml_cost, default_cost);
-        }
+        let cost = from_yaml.cost(name);
+        assert!(cost > 0, "{} should have positive cost from vendor YAML, got {}", name, cost);
     }
 }
 

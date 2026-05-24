@@ -32,9 +32,14 @@ use crate::observation::{EnemyBuilding, EnemyPos, Observation, UnitPos};
 /// number and to align with the C# rush-hour reference).
 pub const DEFAULT_TICKS_PER_STEP: u32 = 30;
 
-/// Hard cap on episode length. 10000 ticks = 400 game-seconds at the
-/// engine's 25 ticks/second cadence, matching the "of 400s" budget the
-/// briefing displays to the model.
+/// Fallback episode length when neither the scenario YAML nor an
+/// explicit `with_max_ticks` / `OpenRAEnv(..., max_ticks=N)` override
+/// declares one. 10000 ticks = 400 game-seconds at the engine's 25
+/// ticks/second cadence, matching the "of 400s" budget the briefing
+/// displays to the model. This is NOT a hard cap: a scenario that
+/// declares `termination.max_ticks: N` in its YAML is honoured EXACTLY
+/// (no clamp) — long-horizon packs (F11 vertical-strike etc.) may
+/// declare any budget their capability requires.
 pub const DEFAULT_MAX_TICKS: u32 = 10000;
 
 /// Default per-signal cooldown — minimum ticks between consecutive fires
@@ -253,6 +258,12 @@ impl Env {
             map_def.map_size.0 * map_def.map_size.1
         };
 
+        // Honour scenario-declared `termination.max_ticks` EXACTLY (no
+        // clamp). Falls back to `DEFAULT_MAX_TICKS` when the YAML omits
+        // the field. A later `with_max_ticks(...)` or `OpenRAEnv(...,
+        // max_ticks=...)` override still wins via the builder path.
+        let scenario_max_ticks = map_def.max_ticks.unwrap_or(DEFAULT_MAX_TICKS).max(1);
+
         Ok(Env {
             scenario_path,
             seed,
@@ -264,7 +275,7 @@ impl Env {
             explored_cells: HashSet::new(),
             map_total_cells,
             ticks_per_step: DEFAULT_TICKS_PER_STEP,
-            max_ticks: DEFAULT_MAX_TICKS,
+            max_ticks: scenario_max_ticks,
             last_warnings: Vec::new(),
             interrupt_state: InterruptState::default(),
             enabled_signals: HashSet::new(),
@@ -897,9 +908,10 @@ impl Env {
         // (TurretGun, TeslaZap, …) and proper footprints (pbox=1×1,
         // fact=3×2, proc=3×2) resolve correctly. Phase 8 also pulls a
         // typed `data_rules::Rules` view so we can attach Vehicle /
-        // Turret typed components per actor below. Falls back to
-        // `GameRules::defaults` when the vendor dir is missing.
-        let (rules, typed_rules) = load_rules_with_fallback();
+        // Turret typed components per actor below. Vendor YAML is the
+        // single source of truth — `load_rules_strict` panics if the
+        // vendor directory is unreachable.
+        let (rules, typed_rules) = load_rules_strict();
         let mut world = build_world(
             &ora,
             seed_i32,
@@ -1592,7 +1604,7 @@ impl Env {
         // Vehicle/Turret components (otherwise turreted tanks would
         // never aim at targets). Cached across the episode.
         if self.typed_rules_cache.is_none() {
-            let (_, typed_rules) = load_rules_with_fallback();
+            let (_, typed_rules) = load_rules_strict();
             self.typed_rules_cache = Some(typed_rules);
         }
         let typed_rules = self.typed_rules_cache.as_ref().expect("cached above");
@@ -2423,9 +2435,10 @@ fn build_scenario_actor(id: u32, sa: &ScenarioActor, owner: u32, world: &World) 
 /// returns the typed `data_rules::Rules` view so the env loader can
 /// attach `Vehicle` / `Turret` typed components per actor.
 ///
-/// Falls back to `GameRules::defaults()` (and an empty typed Rules)
-/// when the vendor dir is absent (e.g. CI without submodules).
-fn load_rules_with_fallback() -> (GameRules, data_rules::Rules) {
+/// Panics with a clear message if no vendor RA YAML can be located. The
+/// hardcoded `GameRules::defaults()` fallback was removed — vendor YAML
+/// at `vendor/OpenRA/mods/ra/rules/` is now the single source of truth.
+fn load_rules_strict() -> (GameRules, data_rules::Rules) {
     // Try common vendor locations relative to the runtime cwd, the
     // env's manifest dir, and HOME. The first hit wins.
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -2446,7 +2459,9 @@ fn load_rules_with_fallback() -> (GameRules, data_rules::Rules) {
     candidates.push(PathBuf::from("vendor/OpenRA/mods/ra"));
     candidates.push(PathBuf::from("../vendor/OpenRA/mods/ra"));
     candidates.push(PathBuf::from("../../vendor/OpenRA/mods/ra"));
+    let mut tried: Vec<String> = Vec::new();
     for c in &candidates {
+        tried.push(c.display().to_string());
         if c.exists()
             && let Ok(rs) = data_rules::load_ruleset(c)
         {
@@ -2454,14 +2469,13 @@ fn load_rules_with_fallback() -> (GameRules, data_rules::Rules) {
             return (GameRules::from_ruleset(&rs), typed);
         }
     }
-    (
-        GameRules::defaults(),
-        data_rules::Rules {
-            units: std::collections::BTreeMap::new(),
-            weapons: std::collections::BTreeMap::new(),
-            buildings: std::collections::BTreeMap::new(),
-            buildables: std::collections::BTreeMap::new(),
-        },
+    panic!(
+        "load_rules_strict: vendor RA YAML not found; tried: {}.\n\
+         The hardcoded `GameRules::defaults()` fallback was removed; \
+         vendor YAML is now the single source of truth. Set \
+         `OPENRA_VENDOR_DIR` or run from a tree that contains the \
+         bundled vendor directory.",
+        tried.join(", "),
     )
 }
 
@@ -2552,6 +2566,7 @@ pub fn build_test_env_with_no_enemies(map_size: (i32, i32), seed: u64) -> Env {
         water_cells: Vec::new(),
         terminate_on_agent_units_killed: true,
         terminate_on_enemy_units_killed: true,
+        max_ticks: None,
     };
     let mut env = Env {
         scenario_path: PathBuf::from("<test>"),

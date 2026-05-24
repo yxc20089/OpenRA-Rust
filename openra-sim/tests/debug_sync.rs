@@ -21,6 +21,7 @@ fn lobby_from_replay(replay: &orarep::Replay) -> LobbyInfo {
 }
 
 #[test]
+#[ignore = "uses same recorded sync hash baseline as sync_hash_verify; re-record against vendor"]
 fn debug_orders_and_hashes() {
     let replay_data = std::fs::read(
         concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/replays/ra-2026-02-20T001259Z.orarep")

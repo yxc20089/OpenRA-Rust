@@ -143,7 +143,7 @@ fn built_dd_spawns_on_water_adjacent_to_syrd() {
     insert_building(&mut world, 1002, p1, "powr", (6, 2));
     insert_building(&mut world, 1003, p1, "proc", (2, 6));
     insert_building(&mut world, 1004, p1, "dome", (2, 10));
-    insert_building(&mut world, 1005, p1, "spen", (7, 6));
+    insert_building(&mut world, 1005, p1, "syrd", (7, 6));
 
     // Give the player plenty of cash so the dd can finish.
     if let Some(player_actor) = world.actor_mut(p1) {
@@ -218,7 +218,7 @@ fn built_dd_does_not_spawn_when_no_water_adjacent() {
     insert_building(&mut world, 1002, p1, "powr", (6, 2));
     insert_building(&mut world, 1003, p1, "proc", (2, 6));
     insert_building(&mut world, 1004, p1, "dome", (2, 10));
-    insert_building(&mut world, 1005, p1, "spen", (7, 6));
+    insert_building(&mut world, 1005, p1, "syrd", (7, 6));
 
     if let Some(player_actor) = world.actor_mut(p1) {
         player_actor.set_cash(5000);
@@ -281,7 +281,7 @@ fn built_dd_finds_water_at_ring_two() {
     insert_building(&mut world, 1002, p1, "powr", (6, 2));
     insert_building(&mut world, 1003, p1, "proc", (2, 6));
     insert_building(&mut world, 1004, p1, "dome", (2, 10));
-    insert_building(&mut world, 1005, p1, "spen", (7, 6));
+    insert_building(&mut world, 1005, p1, "syrd", (7, 6));
 
     if let Some(player_actor) = world.actor_mut(p1) {
         player_actor.set_cash(5000);

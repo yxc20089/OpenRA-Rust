@@ -121,13 +121,41 @@ fn termination_block_inline_flow_form_parses() {
 
 #[test]
 fn termination_block_with_only_max_ticks_keeps_defaults() {
-    // `max_ticks:` is handled bench-side (the env wrapper passes a
-    // separate cap). A `termination:` block containing only `max_ticks`
-    // must leave the kill-gate flags at their defaults.
+    // `max_ticks:` now surfaces on `MapDef` (the env layer honours it
+    // exactly when constructing the Env — see
+    // openra-train/tests/test_max_ticks_unbounded.rs). A `termination:`
+    // block that ONLY sets `max_ticks` must leave the kill-gate flags
+    // at their defaults.
     let yaml = format!("{BODY}termination:\n  max_ticks: 6000\n");
     let map = load_scenario(&yaml);
     assert!(map.terminate_on_agent_units_killed);
     assert!(map.terminate_on_enemy_units_killed);
+    assert_eq!(map.max_ticks, Some(6000));
+}
+
+#[test]
+fn termination_max_ticks_block_form_long_horizon() {
+    // F11 long-horizon packs declare budgets well above the old
+    // DEFAULT_MAX_TICKS=10000 cap. The parser must accept any
+    // positive u32 — no clamp at the data-layer either.
+    let yaml = format!("{BODY}termination:\n  max_ticks: 16500\n");
+    let map = load_scenario(&yaml);
+    assert_eq!(map.max_ticks, Some(16500));
+}
+
+#[test]
+fn termination_max_ticks_inline_form() {
+    let yaml = format!("{BODY}termination: {{max_ticks: 8000}}\n");
+    let map = load_scenario(&yaml);
+    assert_eq!(map.max_ticks, Some(8000));
+}
+
+#[test]
+fn termination_omitted_means_max_ticks_none() {
+    // No termination block at all ⇒ MapDef.max_ticks is None; the env
+    // layer will fall back to DEFAULT_MAX_TICKS in that case.
+    let map = load_scenario(BODY);
+    assert_eq!(map.max_ticks, None);
 }
 
 #[test]

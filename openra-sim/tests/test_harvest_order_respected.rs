@@ -18,7 +18,7 @@ use openra_sim::world::{
 };
 
 fn build_arena(seed: i32) -> World {
-    let rules = GameRules::defaults();
+    let rules = GameRules::vendor_cached();
     let map = OraMap {
         title: "harv-order-test".into(),
         tileset: "TEMPERAT".into(),
