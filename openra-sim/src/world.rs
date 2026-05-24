@@ -3826,9 +3826,14 @@ impl World {
             let defense_kind = match crate::traits::classify_defense(actor_type) {
                 Some(crate::traits::DefenseKind::GroundTurret) => "turret",
                 Some(crate::traits::DefenseKind::Tesla) => "tesla",
-                _ => continue, // AA-only / inert / cosmetic — never auto-fire
+                // AA-only (sam/agun) defenses auto-fire too — but at
+                // AIRCRAFT only. The candidate-filter below honours
+                // `is_anti_air` to include `ActorKind::Aircraft` in
+                // the scan and exclude ground targets.
+                Some(crate::traits::DefenseKind::AntiAirOnly) => "antiair",
+                _ => continue, // inert / cosmetic — never auto-fire
             };
-            let _ = defense_kind; // currently both behave identically
+            let is_anti_air = defense_kind == "antiair";
             let owner = match actor.owner_id {
                 Some(o) => o,
                 None => continue,
@@ -3865,13 +3870,25 @@ impl World {
                 if cand_owner == owner {
                     continue;
                 }
-                if !matches!(
-                    cand.kind,
-                    ActorKind::Infantry
-                        | ActorKind::Vehicle
-                        | ActorKind::Mcv
-                        | ActorKind::Building
-                ) {
+                // AA-only defenses target ONLY aircraft. Ground
+                // defenses target everything except aircraft (heli /
+                // mig / yak / hind fly above ground armament arcs in
+                // RA; the engine MVP mirrors the discrimination by
+                // excluding ActorKind::Aircraft from ground-defense
+                // scans). A future SAM-equivalent stance could allow
+                // SAM-fires-on-ground; not needed for F11.
+                let cand_ok = if is_anti_air {
+                    cand.kind == ActorKind::Aircraft
+                } else {
+                    matches!(
+                        cand.kind,
+                        ActorKind::Infantry
+                            | ActorKind::Vehicle
+                            | ActorKind::Mcv
+                            | ActorKind::Building
+                    )
+                };
+                if !cand_ok {
                     continue;
                 }
                 // Skip dead actors (defensive).
