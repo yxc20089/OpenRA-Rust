@@ -22,3 +22,6 @@ pyo3 = { version = "0.22", features = ["abi3-py39"], optional = true }
 # (which adds `extension-module` + the cdylib hookup).
 default = []
 python = ["dep:pyo3", "pyo3/extension-module"]
+
+[dev-dependencies]
+tempfile = "3"

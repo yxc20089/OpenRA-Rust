@@ -11,23 +11,74 @@
 //! still true). This is what packs like
 //! `combat-suicide-charge-mission` rely on so a within_ticks fail
 //! clause can fire after the strike package dies.
+//!
+//! Each test builds its scenario YAML in a process-local tempdir and
+//! copies the `rush-hour-arena.oramap` base map alongside it, so the
+//! test is self-contained and exercises the engine even on a fresh
+//! checkout. The base map is located by walking the same fallback
+//! chain `oramap::load_rush_hour_map_with_spawn` itself walks, so a
+//! checkout that has the engine wheel working will also run these
+//! tests. If no candidate base map is found we panic loudly (rather
+//! than silently skipping, which was the pre-fix degeneracy).
 
 use openra_train::{Command, Env};
-use std::io::Write;
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
+use tempfile::TempDir;
 
-fn write_scenario(name: &str, body: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    let dir = PathBuf::from(&home).join("Projects/OpenRA-RL-Training/scenarios/discovery");
-    if !dir.join("rush-hour.yaml").exists() {
-        return None;
+/// Locate `rush-hour-arena.oramap` somewhere on disk. Mirrors the
+/// fallback chain inside `openra-data/src/oramap.rs` so that any
+/// machine that can run the engine wheel can also run these tests.
+fn locate_base_map() -> PathBuf {
+    let mut tried: Vec<PathBuf> = Vec::new();
+    // 1. In-repo fixture (preferred if a future patch checks it in).
+    let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("openra-data")
+        .join("tests")
+        .join("fixtures")
+        .join("rush-hour-arena.oramap");
+    if fixture.exists() {
+        return fixture;
     }
-    let p = dir.join(name);
-    std::fs::File::create(&p)
-        .ok()?
-        .write_all(body.as_bytes())
-        .ok()?;
-    Some(p)
+    tried.push(fixture);
+
+    if let Ok(home) = std::env::var("HOME") {
+        for candidate in [
+            "Projects/openra-rl/maps/rush-hour-arena.oramap",
+            "Projects/OpenRA-RL-Training/scenarios/maps/rush-hour-arena.oramap",
+        ] {
+            let p = PathBuf::from(&home).join(candidate);
+            if p.exists() {
+                return p;
+            }
+            tried.push(p);
+        }
+    }
+
+    panic!(
+        "rush-hour-arena.oramap not found — looked at {:?}. Either \
+         check a fixture into openra-data/tests/fixtures/, or restore \
+         the OpenRA-RL-Training scenarios tree under $HOME/Projects/.",
+        tried
+    );
+}
+
+/// Build a scenario tempdir containing the YAML body + a copy of the
+/// base map alongside it (so `base_map: rush-hour-arena.oramap`
+/// resolves at scenario_dir-relative path 1, no $HOME lookup needed).
+/// Returns `(tmpdir, scenario_yaml_path)` — keep `tmpdir` alive for
+/// the duration of the test so the on-disk files stick around.
+fn write_scenario(name: &str, body: &str) -> (TempDir, PathBuf) {
+    let tmpdir = tempfile::tempdir().expect("tempdir");
+    let scenario_path = tmpdir.path().join(name);
+    fs::write(&scenario_path, body).expect("write scenario yaml");
+
+    let src = locate_base_map();
+    let dest = tmpdir.path().join("rush-hour-arena.oramap");
+    fs::copy(&src, &dest).expect("copy rush-hour-arena.oramap into tempdir");
+
+    (tmpdir, scenario_path)
 }
 
 /// A single fragile agent infantry adjacent to a much stronger enemy
@@ -36,7 +87,7 @@ fn write_scenario(name: &str, body: &str) -> Option<PathBuf> {
 fn agent_wipe_body(agent_units_killed: &str) -> String {
     format!(
         r#"name: TerminationAgentWipe
-base_map: ../maps/rush-hour-arena.oramap
+base_map: rush-hour-arena.oramap
 spawn_mcvs: false
 starting_cash: 0
 agent:
@@ -68,7 +119,7 @@ termination:
 fn enemy_wipe_body(enemy_units_killed: &str) -> String {
     format!(
         r#"name: TerminationEnemyWipe
-base_map: ../maps/rush-hour-arena.oramap
+base_map: rush-hour-arena.oramap
 spawn_mcvs: false
 starting_cash: 0
 agent:
@@ -107,33 +158,28 @@ fn run_until_done(env: &mut Env, max_steps: usize) -> (Option<usize>, i32) {
     (None, env.last_observation().game_tick)
 }
 
+fn open_env(scenario_path: &Path) -> Env {
+    Env::new(scenario_path.to_str().unwrap(), 7)
+        .expect("Env::new")
+        .with_max_ticks(40000)
+}
+
 #[test]
 fn default_agent_wipe_ends_run() {
-    let Some(path) = write_scenario("_term_agent_default.yaml", &agent_wipe_body("true")) else {
-        eprintln!("skip: RL-Training scenarios not present");
-        return;
-    };
-    let mut env = Env::new(path.to_str().unwrap(), 7)
-        .unwrap()
-        .with_max_ticks(40000);
+    let (_tmp, path) = write_scenario("_term_agent_default.yaml", &agent_wipe_body("true"));
+    let mut env = open_env(&path);
     let _ = env.reset();
     let (done_at, _tick) = run_until_done(&mut env, 200);
     assert!(
         done_at.is_some(),
         "default agent_units_killed:true must auto-`done` on agent wipe"
     );
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn agent_units_killed_false_keeps_run_alive_past_agent_wipe() {
-    let Some(path) = write_scenario("_term_agent_false.yaml", &agent_wipe_body("false")) else {
-        eprintln!("skip: RL-Training scenarios not present");
-        return;
-    };
-    let mut env = Env::new(path.to_str().unwrap(), 7)
-        .unwrap()
-        .with_max_ticks(40000);
+    let (_tmp, path) = write_scenario("_term_agent_false.yaml", &agent_wipe_body("false"));
+    let mut env = open_env(&path);
     let _ = env.reset();
     // Run far past the point at which the agent e1 would be dead vs.
     // an adjacent 4tnk (a few volleys, well under 50 steps × 30 t/step).
@@ -168,36 +214,24 @@ fn agent_units_killed_false_keeps_run_alive_past_agent_wipe() {
          (otherwise the test isn't actually exercising the opt-out)",
         snap.tick
     );
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn default_enemy_wipe_ends_run() {
-    let Some(path) = write_scenario("_term_enemy_default.yaml", &enemy_wipe_body("true")) else {
-        eprintln!("skip: RL-Training scenarios not present");
-        return;
-    };
-    let mut env = Env::new(path.to_str().unwrap(), 7)
-        .unwrap()
-        .with_max_ticks(40000);
+    let (_tmp, path) = write_scenario("_term_enemy_default.yaml", &enemy_wipe_body("true"));
+    let mut env = open_env(&path);
     let _ = env.reset();
     let (done_at, _tick) = run_until_done(&mut env, 300);
     assert!(
         done_at.is_some(),
         "default enemy_units_killed:true must auto-`done` on enemy wipe"
     );
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn enemy_units_killed_false_keeps_run_alive_past_enemy_wipe() {
-    let Some(path) = write_scenario("_term_enemy_false.yaml", &enemy_wipe_body("false")) else {
-        eprintln!("skip: RL-Training scenarios not present");
-        return;
-    };
-    let mut env = Env::new(path.to_str().unwrap(), 7)
-        .unwrap()
-        .with_max_ticks(40000);
+    let (_tmp, path) = write_scenario("_term_enemy_false.yaml", &enemy_wipe_body("false"));
+    let mut env = open_env(&path);
     let _ = env.reset();
     // Many steps — the 4tnk obliterates the stance:0 e1 quickly.
     for i in 0..150 {
@@ -222,5 +256,4 @@ fn enemy_units_killed_false_keeps_run_alive_past_enemy_wipe() {
         "the enemy unit should have been wiped (otherwise the test isn't \
          actually exercising the opt-out)"
     );
-    let _ = std::fs::remove_file(&path);
 }
