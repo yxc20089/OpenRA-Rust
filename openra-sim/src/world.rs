@@ -4175,7 +4175,56 @@ impl World {
                         }
                     }
                 } else {
-                    // Out of range: chase the target
+                    // Out of range: chase the target — but ONLY when
+                    // the engagement was player-issued (explicit
+                    // attack-unit) OR the attacker is stance:3
+                    // (AttackAnything: the only "advance on visible
+                    // enemies" stance). An auto-acquired engagement
+                    // from the idle stance scan with stance:1
+                    // (ReturnFire) or stance:2 (Defend) is bound by
+                    // stance semantics: those stances explicitly do
+                    // NOT pursue past current range. Without this
+                    // gate, an idle stance:2 defender that briefly
+                    // auto-acquired a passing enemy would convert
+                    // into a hunter the moment the enemy rolled past
+                    // weapon range — collapsing the bait/decoy
+                    // perimeter idioms and the flank-vs-frontal
+                    // geometry guarantee (`combat-flanking-attack`).
+                    //
+                    // The key distinction vs. simply dropping the
+                    // activity: we KEEP the Attack alive so the
+                    // attacker keeps re-checking range on its
+                    // reload cycle — if the target wanders BACK
+                    // into range, it fires again without needing
+                    // the idle scan to re-acquire. The cost is the
+                    // attacker stays "locked on" to a target that
+                    // may never return; the next-tick stance scan
+                    // is gated on `actor.activity.is_some() == false`
+                    // so it won't switch targets. To unstick, the
+                    // attacker's Attack times out after
+                    // `STANCE_DEFEND_HOLD_TICKS` of no-fire and
+                    // returns to idle so the stance scan can pick
+                    // a different target. Pinned by
+                    // `test_stance_2_no_chase.rs`.
+                    if auto_acquired {
+                        let stance = self.stances.get(&attacker_id).copied().unwrap_or(2);
+                        if stance != 3 {
+                            // Keep the activity so subsequent ticks
+                            // re-check range; pretend the cycle
+                            // completed so the reload runs again
+                            // and the next opportunity is taken.
+                            if let Some(actor) = self.actors.get_mut(&attacker_id) {
+                                if let Some(Activity::Attack {
+                                    ref mut reload_remaining, reload_delay, ..
+                                }) = actor.activity {
+                                    // Re-arm the reload so we don't
+                                    // spin every tick checking range.
+                                    *reload_remaining = reload_delay;
+                                }
+                            }
+                            continue;
+                        }
+                    }
                     chase_targets.push((attacker_id, tloc));
                 }
             }

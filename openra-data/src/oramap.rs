@@ -346,6 +346,7 @@ impl ScenarioActor {
                 | "e4"
                 | "e6"
                 | "e7"
+                | "tanya"
                 | "medi"
                 | "mech"
                 | "shok"
