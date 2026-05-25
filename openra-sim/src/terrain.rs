@@ -302,6 +302,20 @@ impl TerrainMap {
     }
 
     /// Find the nearest cell with resources within a search radius.
+    ///
+    /// Ore cells whose underlying terrain is impassable (because a
+    /// building footprint or a cliff covers them) are SKIPPED — a
+    /// harvester can never stand on such a cell, so picking it would
+    /// jam the harvester FSM in FindingOre and freeze it forever (the
+    /// pathfinder would fail every tick, the FSM never falls back, and
+    /// the harvester never moves). This was the load-bearing source of
+    /// the slot-2 economy bias in `adversarial-1v1-macro`: the agent's
+    /// tent (2×3, bib row included) extended INTO its safe ore patch
+    /// toward the harvester, so the lex-first nearest-ore cell sat
+    /// under the tent; the enemy's mirrored layout had the bib pointing
+    /// AWAY from the patch so its lex-first cell was free. After the
+    /// fix both harvesters lock onto a passable ore cell of the same
+    /// Manhattan distance and the per-tick economy is symmetric.
     pub fn find_nearest_resource(&self, cx: i32, cy: i32, radius: i32) -> Option<(i32, i32)> {
         let mut best: Option<(i32, i32)> = None;
         let mut best_dist = i32::MAX;
@@ -309,7 +323,7 @@ impl TerrainMap {
             for dx in -radius..=radius {
                 let x = cx + dx;
                 let y = cy + dy;
-                if self.has_resource(x, y) {
+                if self.has_resource(x, y) && self.is_terrain_passable(x, y) {
                     let dist = dx.abs() + dy.abs(); // Manhattan distance
                     if dist < best_dist {
                         best_dist = dist;
