@@ -920,6 +920,11 @@ impl Env {
             0,
             self.map_def.spawn_mcvs,
         );
+        // Per-scenario production-tick multiplier. Default 1.0 ⇒ no
+        // change for every existing pack. `adversarial-1v1-macro`
+        // declares 4.0 so 1v1 episodes have ~4× faster production
+        // without modifying every other pack's tuning.
+        world.build_speed_multiplier = self.map_def.build_speed_multiplier;
 
         // Naval-MVP overlay: stamp scenario-declared `water_cells:` into
         // the live terrain. Each cell becomes ground-impassable and
@@ -2613,6 +2618,7 @@ pub fn build_test_env_with_no_enemies(map_size: (i32, i32), seed: u64) -> Env {
         terminate_on_agent_units_killed: true,
         terminate_on_enemy_units_killed: true,
         max_ticks: None,
+        build_speed_multiplier: 1.0,
     };
     let mut env = Env {
         scenario_path: PathBuf::from("<test>"),

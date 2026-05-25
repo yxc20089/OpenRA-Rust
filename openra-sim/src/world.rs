@@ -422,6 +422,24 @@ pub struct World {
     /// visibility — a spy scan is a one-shot reveal that survives the
     /// shroud-recompute each tick. Keyed by the VIEWING player id.
     pub infiltration_revealed_buildings: BTreeMap<u32, std::collections::BTreeSet<u32>>,
+    /// Per-scenario multiplier on production tick advancement. Default
+    /// `1.0` (every existing pack inherits this and therefore behaves
+    /// identically to the pre-multiplier engine). A scenario declaring
+    /// `build_speed_multiplier: 4.0` makes production ~4× faster (e.g.
+    /// an e1 normally finishing in ~90 ticks finishes in ~22 ticks).
+    /// Applied per-(player, queue) inside `tick_production` via a
+    /// fractional accumulator so non-integer multipliers (1.5, 2.5)
+    /// are honoured exactly over time. The default base advance per
+    /// queue is `production_building_count` (parallel-production
+    /// throughput); the multiplier scales THAT count.
+    pub build_speed_multiplier: f32,
+    /// Per-(player, queue) fractional remainder for the production
+    /// speed multiplier. Lets `multiplier * advances` be applied
+    /// exactly over time when the product is non-integer (e.g. a 1.5×
+    /// multiplier on a single-factory queue advances 1 tick on odd
+    /// world-ticks and 2 ticks on even). Reset implicitly by world
+    /// rebuild; cleared lazily when a queue empties.
+    production_speed_accumulator: HashMap<(u32, PqType), f32>,
 }
 
 /// Typed components attached to a single actor. Lookup is via
@@ -4724,14 +4742,37 @@ impl World {
                         .collect()
                 })
                 .unwrap_or_default();
+            let build_speed_multiplier = self.build_speed_multiplier.max(0.0);
             if let Some(queues) = self.production.get_mut(&pid) {
                 // Tick each queue type independently
                 for (pq, items) in queues.iter_mut() {
-                    let advances = pq_factory_count.get(pq).copied().unwrap_or(1).max(1);
+                    let base_advances =
+                        pq_factory_count.get(pq).copied().unwrap_or(1).max(1) as f32;
+                    // Scenario-declared production-speed multiplier
+                    // (default 1.0). Tracked through a fractional
+                    // accumulator so non-integer multipliers (e.g. 1.5)
+                    // are honoured exactly over time. The accumulator
+                    // stores remainder ticks carried across world
+                    // frames; the integer part is consumed this frame.
+                    let scaled = base_advances * build_speed_multiplier;
+                    let acc_key = (pid, *pq);
+                    let accumulated = *self
+                        .production_speed_accumulator
+                        .get(&acc_key)
+                        .unwrap_or(&0.0)
+                        + scaled;
+                    let advances = accumulated.floor() as u32;
+                    self.production_speed_accumulator
+                        .insert(acc_key, accumulated - advances as f32);
+                    if advances == 0 {
+                        continue;
+                    }
                     // Advance the queue `advances` times this tick: N
                     // factories of this category each contribute one
-                    // tick of build progress. Completions mid-loop let
-                    // a later factory pick up the next queued item.
+                    // tick of build progress (then scaled by the
+                    // per-scenario `build_speed_multiplier`).
+                    // Completions mid-loop let a later factory pick up
+                    // the next queued item.
                     for _ in 0..advances {
                         // Find first item that isn't a completed building
                         // waiting for placement.
@@ -6730,6 +6771,8 @@ pub fn build_world(
         pending_move_destinations: HashSet::new(),
         move_fire_cooldown: HashMap::new(),
         infiltration_revealed_buildings: BTreeMap::new(),
+        build_speed_multiplier: 1.0,
+        production_speed_accumulator: HashMap::new(),
     };
 
     // Initial shroud reveal around starting units

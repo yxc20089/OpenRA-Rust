@@ -464,6 +464,17 @@ pub struct MapDef {
     /// budget their capability requires. The env layer applies this in
     /// `Env::new_with_spawn_point`.
     pub max_ticks: Option<u32>,
+    /// Per-scenario multiplier on production tick advancement. Default
+    /// `1.0` (no change — every existing pack inherits this and
+    /// therefore behaves identically). Values > 1.0 speed production
+    /// up (`build_speed_multiplier: 4.0` ⇒ ~4× faster, an e1 costing
+    /// 100 finishes in ~22 ticks instead of ~90); values < 1.0 slow
+    /// production down. Applied per-tick to the queue-advance count in
+    /// `World::tick_production` via a fractional accumulator (so
+    /// non-integer multipliers like 1.5 are honoured exactly over
+    /// time). Set in `adversarial-1v1-macro` to keep 1v1 episodes
+    /// snappy without changing every other pack's tuning.
+    pub build_speed_multiplier: f32,
 }
 
 /// A scenario-declared ore patch. Materialised by the env layer at
@@ -761,6 +772,7 @@ pub fn load_rush_hour_map_with_spawn(
             .terminate_on_enemy_units_killed
             .unwrap_or(true),
         max_ticks: scenario.max_ticks,
+        build_speed_multiplier: scenario.build_speed_multiplier.unwrap_or(1.0),
     })
 }
 
@@ -820,6 +832,10 @@ struct ScenarioYaml {
     /// `DEFAULT_MAX_TICKS`. When set, the value is honoured exactly
     /// (no clamp): long-horizon packs may declare any budget.
     max_ticks: Option<u32>,
+    /// Top-level `build_speed_multiplier:` — production-tick scaling.
+    /// None ⇒ engine default (1.0, no change). Set > 1.0 to speed up
+    /// production (1v1 macro), < 1.0 to slow it down.
+    build_speed_multiplier: Option<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -912,6 +928,15 @@ fn parse_scenario_yaml(text: &str) -> io::Result<ScenarioYaml> {
                         .trim()
                         .trim_matches(|c: char| c == '"' || c == '\'')
                         .parse()
+                        .ok();
+                    i += 1;
+                    continue;
+                }
+                "build_speed_multiplier" => {
+                    out.build_speed_multiplier = v
+                        .trim()
+                        .trim_matches(|c: char| c == '"' || c == '\'')
+                        .parse::<f32>()
                         .ok();
                     i += 1;
                     continue;
