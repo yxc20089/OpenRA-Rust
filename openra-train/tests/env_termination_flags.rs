@@ -145,6 +145,63 @@ termination:
     )
 }
 
+/// MBD-building variant: the enemy roster is a single `fact`
+/// (MustBeDestroyed) plus a stance:0 e1 used only to bootstrap
+/// `enemy_started_with_buildings == true` ⇒ enemy aliveness is checked
+/// via `has_must_be_destroyed_buildings`, not `has_combat_units`. The
+/// agent (4× 4tnk swarm + adjacent to the fact) razes the fact in a
+/// handful of ticks. This is the path the qwen-9B-sweep DRAW witnesses
+/// asked about — confirms `enemy_units_killed: false` ALSO gates the
+/// MBD-removal auto-`done`, not only the units-killed auto-`done`.
+fn enemy_mbd_wipe_body(enemy_units_killed: &str) -> String {
+    format!(
+        r#"name: TerminationEnemyMbdWipe
+base_map: rush-hour-arena.oramap
+spawn_mcvs: false
+starting_cash: 0
+agent:
+  faction: allies
+enemy:
+  faction: soviet
+actors:
+- type: 4tnk
+  owner: agent
+  position:
+  - 18
+  - 20
+- type: 4tnk
+  owner: agent
+  position:
+  - 18
+  - 21
+- type: 4tnk
+  owner: agent
+  position:
+  - 18
+  - 22
+- type: 4tnk
+  owner: agent
+  position:
+  - 18
+  - 23
+- type: fact
+  owner: enemy
+  position:
+  - 22
+  - 20
+- type: e1
+  owner: enemy
+  position:
+  - 60
+  - 20
+  stance: 0
+termination:
+  max_ticks: 40000
+  enemy_units_killed: {enemy_units_killed}
+"#
+    )
+}
+
 /// Helper: run up to `max_steps` and return the (step_idx_when_done,
 /// final_observation_tick). `step_idx_when_done` is `None` if the run
 /// never terminated.
@@ -255,5 +312,67 @@ fn enemy_units_killed_false_keeps_run_alive_past_enemy_wipe() {
         !enemy_combat_alive,
         "the enemy unit should have been wiped (otherwise the test isn't \
          actually exercising the opt-out)"
+    );
+}
+
+// ---- MBD-building wipe coverage --------------------------------------------
+// The two tests above use an enemy `e1` (combat unit), exercising
+// `has_combat_units(enemy)` — the `enemy_started_with_buildings == false`
+// branch. The qwen-9B-sweep DRAW investigation (2026-05-25) asked
+// whether the `enemy_units_killed` flag ALSO governs the
+// `enemy_started_with_buildings == true` branch, where enemy aliveness
+// is checked via `has_must_be_destroyed_buildings`. The two tests below
+// PIN that yes — it does. Without the gate, a pack that places a
+// killable enemy `fact` marker (to defeat the auto-done) re-introduces
+// the very DRAW race the marker was meant to prevent.
+
+#[test]
+fn default_enemy_mbd_wipe_ends_run() {
+    let (_tmp, path) = write_scenario(
+        "_term_enemy_mbd_default.yaml",
+        &enemy_mbd_wipe_body("true"),
+    );
+    let mut env = open_env(&path);
+    let _ = env.reset();
+    let (done_at, _tick) = run_until_done(&mut env, 600);
+    assert!(
+        done_at.is_some(),
+        "default enemy_units_killed:true must auto-`done` on enemy MBD-building wipe"
+    );
+}
+
+#[test]
+fn enemy_units_killed_false_keeps_run_alive_past_mbd_wipe() {
+    let (_tmp, path) = write_scenario(
+        "_term_enemy_mbd_false.yaml",
+        &enemy_mbd_wipe_body("false"),
+    );
+    let mut env = open_env(&path);
+    let _ = env.reset();
+    // 4× 4tnk pummel an adjacent `fact` — it's razed in ~a few hundred
+    // ticks. Run well past that and assert the run is still live.
+    for i in 0..400 {
+        let r = env.step(&[Command::Observe]);
+        if r.done {
+            panic!(
+                "enemy_units_killed:false must NOT auto-done on enemy MBD-building wipe \
+                 (terminated at step {i}, tick {})",
+                r.obs.game_tick
+            );
+        }
+    }
+    // Confirm the fact actually died — otherwise the test isn't
+    // exercising the opt-out.
+    let enemy_pid = env.enemy_player_id();
+    let world = env.world().expect("world");
+    let snap = world.snapshot();
+    let enemy_fact_alive = snap
+        .actors
+        .iter()
+        .any(|a| a.owner == enemy_pid && a.actor_type == "fact" && a.hp > 0);
+    assert!(
+        !enemy_fact_alive,
+        "the enemy fact should have been razed by 400 steps \
+         (otherwise the test isn't actually exercising the MBD opt-out)"
     );
 }
