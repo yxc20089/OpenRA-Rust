@@ -1814,6 +1814,7 @@ impl Env {
                     game_tick: 0,
                     explored_percent: 0.0,
                     explored_cells: Vec::new(),
+                    visible_cells: Vec::new(),
                     economy: crate::observation::EconomyObs::default(),
                     own_buildings: Vec::new(),
                     production: Vec::new(),
@@ -1923,6 +1924,44 @@ impl Env {
         let explored_cells: Vec<(i32, i32)> =
             explored.iter().copied().collect();
 
+        // Snapshot the per-tick visible mask from the viewer's typed
+        // shroud. Strict subset of `explored_cells`: a cell stays
+        // explored after a unit moves away (sticky), but only the
+        // cells currently in active sight of at least one live
+        // viewer-owned actor show up here.
+        //
+        // `reveal_map: true` (no-fog perception cells) opts the AGENT
+        // viewer out of fog entirely — every playable cell counts as
+        // visible. Other viewers (e.g. the 1v1 opponent) keep their
+        // own shroud regardless of the flag, matching `is_visible_to`.
+        let visible_cells: Vec<(i32, i32)> = {
+            let reveal = self.map_def.reveal_map && viewer == self.agent_player_id;
+            let (bx, by, bw, bh) = self.map_def.bounds;
+            let (mw, mh) = self.map_def.map_size;
+            let (x_lo, x_hi, y_lo, y_hi) = if bw > 0 && bh > 0 {
+                (bx, bx + bw, by, by + bh)
+            } else {
+                (0, mw, 0, mh)
+            };
+            let mut out: Vec<(i32, i32)> = Vec::new();
+            if reveal {
+                for y in y_lo..y_hi {
+                    for x in x_lo..x_hi {
+                        out.push((x, y));
+                    }
+                }
+            } else if let Some(shroud) = world.typed_shroud(viewer) {
+                for y in y_lo..y_hi {
+                    for x in x_lo..x_hi {
+                        if shroud.is_visible(x, y) {
+                            out.push((x, y));
+                        }
+                    }
+                }
+            }
+            out
+        };
+
         // S9 — economy / own buildings / production for the agent.
         let mut economy = crate::observation::EconomyObs::default();
         let mut production: Vec<crate::observation::ProductionObs> = Vec::new();
@@ -1984,6 +2023,7 @@ impl Env {
             game_tick: world.world_tick as i32,
             explored_percent,
             explored_cells,
+            visible_cells,
             economy,
             own_buildings,
             production,
