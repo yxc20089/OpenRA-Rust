@@ -149,6 +149,19 @@ pub struct Observation {
     /// briefings (which a position-snapshot-based reveal mask would
     /// miss). Used by the minimap renderer to draw fog correctly.
     pub explored_cells: Vec<(i32, i32)>,
+    /// Cells (x, y) where the agent player's typed shroud
+    /// `visible` flag is currently true — i.e. cells in active
+    /// sight of at least one live agent actor THIS tick. Strict
+    /// subset of `explored_cells` (a cell can be explored-but-
+    /// fogged after a unit moves away). Sourced directly from
+    /// `World::typed_shroud(agent_player_id).visible`, the per-
+    /// tick recompute that drives RA-style fog. Surfaces the
+    /// fogged-vs-visible split so the bench minimap can draw
+    /// dim (explored) vs bright (visible) tints without a
+    /// bench-side Chebyshev approximation. A `reveal_map: true`
+    /// scenario reports the full playable rectangle here for
+    /// the agent (matches `explored_cells` semantics).
+    pub visible_cells: Vec<(i32, i32)>,
     /// S9 — agent economy (cash/power/harvesters).
     pub economy: EconomyObs,
     /// S9 — agent-owned buildings.
@@ -277,6 +290,12 @@ impl Observation {
             bytes_of_i32(*x, &mut h);
             bytes_of_i32(*y, &mut h);
             bytes_of_i32(*a, &mut h);
+        }
+        mix(&mut h, b'|');
+        bytes_of_i32(self.visible_cells.len() as i32, &mut h);
+        for (x, y) in &self.visible_cells {
+            bytes_of_i32(*x, &mut h);
+            bytes_of_i32(*y, &mut h);
         }
         h
     }
@@ -423,6 +442,21 @@ mod py {
                 cells.append(pair)?;
             }
             d.set_item("explored_cells", cells)?;
+
+            // visible_cells: list[(x, y)] — cells with the agent's
+            // typed-shroud `visible` flag set this tick. Strict
+            // subset of `explored_cells`. Drives the bright-vs-dim
+            // fog tint on the minimap; lets a downstream renderer
+            // distinguish "currently in sight" from "explored but
+            // fogged" without a bench-side approximation.
+            let vis = PyList::empty_bound(py);
+            for &(x, y) in &self.visible_cells {
+                let pair = PyList::empty_bound(py);
+                pair.append(x)?;
+                pair.append(y)?;
+                vis.append(pair)?;
+            }
+            d.set_item("visible_cells", vis)?;
 
             // ore_cells: list[{cell_x, cell_y, amount}] — per-cell ore
             // inventory. Surfaced so a structured-only observation can
